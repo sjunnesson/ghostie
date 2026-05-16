@@ -220,10 +220,10 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
     }
     private func row(_ labelText: String, _ control: NSView) -> NSView {
         let l = NSTextField(labelWithString: labelText)
-        l.alignment = .right
+        l.alignment = .left
         l.font = .systemFont(ofSize: 12)
         l.translatesAutoresizingMaskIntoConstraints = false
-        l.widthAnchor.constraint(equalToConstant: 165).isActive = true
+        l.widthAnchor.constraint(equalToConstant: 130).isActive = true
         l.setContentHuggingPriority(.required, for: .horizontal)
         let h = NSStackView(views: [l, control])
         h.orientation = .horizontal
