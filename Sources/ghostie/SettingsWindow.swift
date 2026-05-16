@@ -105,7 +105,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         let tabs = NSTabView()
         tabs.translatesAutoresizingMaskIntoConstraints = false
         tabs.addTabViewItem(tab("General", [
-            row("Notes folder", pathPicker(notesField, chooseDir: true)),
+            pathRow("Notes folder", notesField, chooseDir: true),
             keepAudio,
             saveTranscript,
             caption("Summaries are written here as markdown after each call.")
@@ -117,16 +117,16 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
             caption("A call is detected from microphone use; it ends after the mic is idle for the grace period.")
         ]))
         tabs.addTabViewItem(tab("Transcription", [
-            row("Whisper model", pathPicker(whisperModelField, chooseDir: false)),
+            pathRow("Whisper model", whisperModelField, chooseDir: false),
             row("Language", sized(languageBox, 120)),
             cleanTranscript,
             label("Initial prompt (biases whisper toward clean, punctuated speech)"),
             promptBox(cfg.initialPrompt),
-            row("Silero VAD model", pathPicker(vadField, chooseDir: false)),
+            pathRow("Silero VAD model", vadField, chooseDir: false),
             caption("VAD is optional. Run  ./scripts/setup.sh --vad  to fetch it; Ghostie auto-uses it when present.")
         ]))
         tabs.addTabViewItem(tab("Summary", [
-            row("Claude CLI", pathPicker(claudeField, chooseDir: false)),
+            pathRow("Claude CLI", claudeField, chooseDir: false),
             caption("Summaries use the Claude Code CLI (`claude -p`) with your existing login — no API key needed. Run `claude` once in a terminal to sign in. Only the text transcript is sent; audio never leaves your Mac."),
             row("Model", sized(summaryBox, 260))
         ]))
@@ -185,7 +185,12 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         stack.alignment = .leading
         stack.spacing = 12
         stack.translatesAutoresizingMaskIntoConstraints = false
-        rows.forEach { stack.addArrangedSubview($0) }
+        rows.forEach {
+            stack.addArrangedSubview($0)
+            // Every row spans the full content width so fields can stretch.
+            $0.leadingAnchor.constraint(equalTo: stack.leadingAnchor).isActive = true
+            $0.trailingAnchor.constraint(equalTo: stack.trailingAnchor).isActive = true
+        }
 
         let container = NSView()
         container.addSubview(stack)
@@ -248,22 +253,48 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         h.alignment = .firstBaseline
         return h
     }
-    private func pathPicker(_ field: NSTextField, chooseDir: Bool) -> NSView {
-        field.widthAnchor.constraint(greaterThanOrEqualToConstant: 280).isActive = true
-        field.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        field.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+    /// Full-width row: fixed label, a field that stretches to fill the gap,
+    /// and a trailing "Choose…" button.
+    private func pathRow(_ labelText: String, _ field: NSTextField,
+                         chooseDir: Bool) -> NSView {
+        let container = NSView()
+        container.translatesAutoresizingMaskIntoConstraints = false
+
+        let l = NSTextField(labelWithString: labelText)
+        l.alignment = .left
+        l.font = .systemFont(ofSize: 12)
+        l.translatesAutoresizingMaskIntoConstraints = false
+        l.setContentHuggingPriority(.required, for: .horizontal)
+
         let btn = NSButton(title: "Choose…",
                            target: self,
                            action: chooseDir ? #selector(chooseFolder(_:)) : #selector(chooseFile(_:)))
         btn.bezelStyle = .rounded
-        btn.tag = chooseDir ? 1 : 2
+        btn.translatesAutoresizingMaskIntoConstraints = false
         btn.setContentHuggingPriority(.required, for: .horizontal)
+        btn.setContentCompressionResistancePriority(.required, for: .horizontal)
         objc_setAssociatedObject(btn, &Self.fieldKey, field, .OBJC_ASSOCIATION_RETAIN)
-        let h = NSStackView(views: [field, btn])
-        h.orientation = .horizontal
-        h.spacing = 8
-        h.distribution = .fill   // field stretches, button keeps its size
-        return h
+
+        field.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        field.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        container.addSubview(l)
+        container.addSubview(field)
+        container.addSubview(btn)
+        NSLayoutConstraint.activate([
+            l.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            l.widthAnchor.constraint(equalToConstant: 130),
+            l.centerYAnchor.constraint(equalTo: field.centerYAnchor),
+
+            field.leadingAnchor.constraint(equalTo: l.trailingAnchor, constant: 10),
+            field.trailingAnchor.constraint(equalTo: btn.leadingAnchor, constant: -8),
+            field.topAnchor.constraint(equalTo: container.topAnchor),
+            field.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+
+            btn.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            btn.centerYAnchor.constraint(equalTo: field.centerYAnchor)
+        ])
+        return container
     }
     private static var fieldKey: UInt8 = 0
     private func promptBox(_ text: String) -> NSView {
