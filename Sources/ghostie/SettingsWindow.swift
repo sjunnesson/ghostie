@@ -38,31 +38,16 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         let cfg = Config.loadRaw()
         let content = buildForm(cfg)
 
-        let scroll = NSScrollView()
-        scroll.hasVerticalScroller = true
-        scroll.drawsBackground = false
-        scroll.documentView = content
-        scroll.translatesAutoresizingMaskIntoConstraints = false
-
         let win = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 580, height: 660),
+            contentRect: NSRect(x: 0, y: 0, width: 640, height: 470),
             styleMask: [.titled, .closable, .miniaturizable],
             backing: .buffered, defer: false)
         win.title = "Ghostie Settings"
         win.delegate = self
         win.isReleasedWhenClosed = false
-        win.contentView = scroll
+        win.contentView = content
         win.center()
 
-        // Document view fills the scroll view's width, grows vertically.
-        if let doc = scroll.documentView {
-            NSLayoutConstraint.activate([
-                doc.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor),
-                doc.trailingAnchor.constraint(equalTo: scroll.contentView.trailingAnchor),
-                doc.topAnchor.constraint(equalTo: scroll.contentView.topAnchor),
-                doc.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor)
-            ])
-        }
         self.window = win
         NSApp.activate(ignoringOtherApps: true)
         win.makeKeyAndOrderFront(nil)
@@ -104,41 +89,37 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         endGrace.alignment = .right
         minCall.alignment = .right
 
-        let stack = NSStackView()
-        stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.spacing = 10
-        stack.edgeInsets = NSEdgeInsets(top: 20, left: 22, bottom: 20, right: 22)
-        stack.translatesAutoresizingMaskIntoConstraints = false
+        // ---- Tabs --------------------------------------------------------
+        let tabs = NSTabView()
+        tabs.translatesAutoresizingMaskIntoConstraints = false
+        tabs.addTabViewItem(tab("General", [
+            row("Notes folder", pathPicker(notesField, chooseDir: true)),
+            keepAudio,
+            saveTranscript,
+            caption("Summaries are written here as markdown after each call.")
+        ]))
+        tabs.addTabViewItem(tab("Detection", [
+            requireTeams,
+            row("End call after mic idle", suffixed(endGrace, "seconds", width: 70)),
+            row("Ignore calls shorter than", suffixed(minCall, "seconds", width: 70)),
+            caption("A call is detected from microphone use; it ends after the mic is idle for the grace period.")
+        ]))
+        tabs.addTabViewItem(tab("Transcription", [
+            row("Whisper model", pathPicker(whisperModelField, chooseDir: false)),
+            row("Language", sized(languageBox, 120)),
+            cleanTranscript,
+            label("Initial prompt (biases whisper toward clean, punctuated speech)"),
+            promptBox(cfg.initialPrompt),
+            row("Silero VAD model", pathPicker(vadField, chooseDir: false)),
+            caption("VAD is optional. Run  ./scripts/setup.sh --vad  to fetch it; Ghostie auto-uses it when present.")
+        ]))
+        tabs.addTabViewItem(tab("Summary", [
+            row("API key", sized(apiKeyField, 340)),
+            caption("Only the text transcript is sent to Anthropic, and only if a key is set. Audio never leaves your Mac."),
+            row("Model", sized(summaryBox, 260))
+        ]))
 
-        stack.addArrangedSubview(title("Ghostie Settings", size: 17, bold: true))
-        stack.addArrangedSubview(caption("Audio and transcription always stay 100% local. Changes apply to your next call immediately."))
-
-        stack.addArrangedSubview(section("General"))
-        stack.addArrangedSubview(row("Notes folder", pathPicker(notesField, chooseDir: true)))
-        stack.addArrangedSubview(keepAudio)
-        stack.addArrangedSubview(saveTranscript)
-
-        stack.addArrangedSubview(section("Detection"))
-        stack.addArrangedSubview(requireTeams)
-        stack.addArrangedSubview(row("End call after mic idle", suffixed(endGrace, "seconds", width: 70)))
-        stack.addArrangedSubview(row("Ignore calls shorter than", suffixed(minCall, "seconds", width: 70)))
-
-        stack.addArrangedSubview(section("Transcription"))
-        stack.addArrangedSubview(row("Whisper model", pathPicker(whisperModelField, chooseDir: false)))
-        stack.addArrangedSubview(row("Language", sized(languageBox, 120)))
-        stack.addArrangedSubview(cleanTranscript)
-        stack.addArrangedSubview(label("Initial prompt (biases whisper toward clean, punctuated speech)"))
-        stack.addArrangedSubview(promptBox(cfg.initialPrompt))
-        stack.addArrangedSubview(row("Silero VAD model", pathPicker(vadField, chooseDir: false)))
-        stack.addArrangedSubview(caption("Optional. Run  ./scripts/setup.sh --vad  to fetch it; Ghostie auto-uses it when present."))
-
-        stack.addArrangedSubview(section("Summary (Anthropic)"))
-        stack.addArrangedSubview(row("API key", sized(apiKeyField, 320)))
-        stack.addArrangedSubview(caption("Only the text transcript is sent to Anthropic, and only if a key is set."))
-        stack.addArrangedSubview(row("Model", sized(summaryBox, 240)))
-
-        // Buttons
+        // ---- Buttons -----------------------------------------------------
         let openJSON = NSButton(title: "Open config.json", target: self, action: #selector(openJSON))
         openJSON.bezelStyle = .rounded
         let cancel = NSButton(title: "Cancel", target: self, action: #selector(cancel))
@@ -153,51 +134,63 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         buttons.orientation = .horizontal
         buttons.spacing = 10
         buttons.translatesAutoresizingMaskIntoConstraints = false
-        let bar = NSView()
-        bar.translatesAutoresizingMaskIntoConstraints = false
-        bar.addSubview(buttons)
-        NSLayoutConstraint.activate([
-            buttons.leadingAnchor.constraint(equalTo: bar.leadingAnchor),
-            buttons.trailingAnchor.constraint(equalTo: bar.trailingAnchor),
-            buttons.topAnchor.constraint(equalTo: bar.topAnchor, constant: 8),
-            buttons.bottomAnchor.constraint(equalTo: bar.bottomAnchor)
-        ])
-        stack.addArrangedSubview(separatorLine())
-        stack.addArrangedSubview(bar)
 
-        // Make full-width arranged subviews actually span the stack width.
-        let doc = NSView()
-        doc.translatesAutoresizingMaskIntoConstraints = false
-        doc.addSubview(stack)
+        let header = caption("Audio and transcription always stay 100% local. Changes apply to your next call immediately.")
+        header.translatesAutoresizingMaskIntoConstraints = false
+        let sep = separatorLine()
+        sep.translatesAutoresizingMaskIntoConstraints = false
+
+        let root = NSView()
+        root.addSubview(header)
+        root.addSubview(tabs)
+        root.addSubview(sep)
+        root.addSubview(buttons)
         NSLayoutConstraint.activate([
-            stack.leadingAnchor.constraint(equalTo: doc.leadingAnchor),
-            stack.trailingAnchor.constraint(equalTo: doc.trailingAnchor),
-            stack.topAnchor.constraint(equalTo: doc.topAnchor),
-            stack.bottomAnchor.constraint(equalTo: doc.bottomAnchor)
+            header.topAnchor.constraint(equalTo: root.topAnchor, constant: 14),
+            header.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 18),
+            header.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -18),
+
+            tabs.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 12),
+            tabs.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 16),
+            tabs.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -16),
+
+            sep.topAnchor.constraint(equalTo: tabs.bottomAnchor, constant: 12),
+            sep.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 16),
+            sep.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -16),
+
+            buttons.topAnchor.constraint(equalTo: sep.bottomAnchor, constant: 12),
+            buttons.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 18),
+            buttons.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -18),
+            buttons.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -16)
         ])
-        for v in [bar, buttons] {
-            v.widthAnchor.constraint(equalTo: stack.widthAnchor,
-                                     constant: -44).isActive = true
-        }
-        return doc
+        return root
+    }
+
+    /// One tab: a top-aligned vertical stack of rows inside a container.
+    private func tab(_ label: String, _ rows: [NSView]) -> NSTabViewItem {
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 12
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        rows.forEach { stack.addArrangedSubview($0) }
+
+        let container = NSView()
+        container.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.topAnchor.constraint(equalTo: container.topAnchor, constant: 20),
+            stack.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 22),
+            stack.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -22),
+            stack.bottomAnchor.constraint(lessThanOrEqualTo: container.bottomAnchor, constant: -18)
+        ])
+        let item = NSTabViewItem(identifier: label)
+        item.label = label
+        item.view = container
+        return item
     }
 
     // MARK: Builders
 
-    private func title(_ s: String, size: CGFloat, bold: Bool) -> NSTextField {
-        let t = NSTextField(labelWithString: s)
-        t.font = bold ? .boldSystemFont(ofSize: size) : .systemFont(ofSize: size)
-        return t
-    }
-    private func section(_ s: String) -> NSView {
-        let t = NSTextField(labelWithString: s.uppercased())
-        t.font = .boldSystemFont(ofSize: 11)
-        t.textColor = .secondaryLabelColor
-        let box = NSStackView(views: [t])
-        box.orientation = .vertical
-        box.edgeInsets = NSEdgeInsets(top: 12, left: 0, bottom: 2, right: 0)
-        return box
-    }
     private func label(_ s: String) -> NSTextField {
         let t = NSTextField(labelWithString: s)
         t.font = .systemFont(ofSize: 12)
