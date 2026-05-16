@@ -39,7 +39,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         let content = buildForm(cfg)
 
         let win = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 640, height: 470),
+            contentRect: NSRect(x: 0, y: 0, width: 660, height: 430),
             styleMask: [.titled, .closable, .miniaturizable],
             backing: .buffered, defer: false)
         win.title = "Ghostie Settings"
@@ -82,9 +82,18 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         apiKeyField.stringValue = cfg.anthropicApiKey
         apiKeyField.placeholderString = "sk-ant-…"
 
-        for f in [notesField, endGrace, minCall, whisperModelField, vadField] {
+        for f in [notesField, endGrace, minCall, whisperModelField, vadField, apiKeyField] {
             f.translatesAutoresizingMaskIntoConstraints = false
             f.controlSize = .regular
+            f.usesSingleLineMode = true
+            f.lineBreakMode = .byTruncatingMiddle
+            f.cell?.wraps = false
+            f.cell?.isScrollable = true
+        }
+        // Long paths: keep the meaningful end (filename) visible, full path on hover.
+        for f in [notesField, whisperModelField, vadField] {
+            f.lineBreakMode = .byTruncatingHead
+            f.toolTip = f.stringValue
         }
         endGrace.alignment = .right
         minCall.alignment = .right
