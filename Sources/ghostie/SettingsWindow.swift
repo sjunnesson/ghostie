@@ -86,13 +86,15 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
             f.translatesAutoresizingMaskIntoConstraints = false
             f.controlSize = .regular
             f.usesSingleLineMode = true
-            f.lineBreakMode = .byTruncatingMiddle
+            f.alignment = .left
+            f.lineBreakMode = .byTruncatingTail
             f.cell?.wraps = false
             f.cell?.isScrollable = true
+            f.cell?.alignment = .left
         }
-        // Long paths: keep the meaningful end (filename) visible, full path on hover.
+        // Long paths start flush-left like every other control; the truncated
+        // tail is shown with the full path available on hover.
         for f in [notesField, whisperModelField, vadField] {
-            f.lineBreakMode = .byTruncatingHead
             f.toolTip = f.stringValue
         }
         endGrace.alignment = .right
@@ -247,15 +249,19 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
     }
     private func pathPicker(_ field: NSTextField, chooseDir: Bool) -> NSView {
         field.widthAnchor.constraint(greaterThanOrEqualToConstant: 280).isActive = true
+        field.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        field.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         let btn = NSButton(title: "Choose…",
                            target: self,
                            action: chooseDir ? #selector(chooseFolder(_:)) : #selector(chooseFile(_:)))
         btn.bezelStyle = .rounded
         btn.tag = chooseDir ? 1 : 2
+        btn.setContentHuggingPriority(.required, for: .horizontal)
         objc_setAssociatedObject(btn, &Self.fieldKey, field, .OBJC_ASSOCIATION_RETAIN)
         let h = NSStackView(views: [field, btn])
         h.orientation = .horizontal
         h.spacing = 8
+        h.distribution = .fill   // field stretches, button keeps its size
         return h
     }
     private static var fieldKey: UInt8 = 0
