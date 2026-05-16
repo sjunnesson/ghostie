@@ -157,6 +157,20 @@ func launchMenuBar(_ config: Config) {
     app.run()
 }
 
+/// Opens just the Settings window (used by `ghostie settings`, and a handy
+/// way to edit config without the menu bar running).
+func launchSettingsOnly() {
+    let app = NSApplication.shared
+    app.setActivationPolicy(.regular)
+    let win = SettingsWindow { newCfg in
+        Log.ok("Settings saved → \(Config.configPath)")
+        _ = newCfg
+    }
+    win.onClose = { NSApp.terminate(nil) }
+    win.show()
+    app.run()
+}
+
 /// Built-in regression check for the hallucination guard, over the patterns
 /// it targets (whisper emits these as separate short segments on bad audio).
 func runTranscriptCleanerSelfTest() -> Bool {
@@ -272,6 +286,8 @@ case "icon":
     exit(GhostIcon.writeAppIconPNG(to: out) ? 0 : 1)
 case "selftest":
     exit(runTranscriptCleanerSelfTest() ? 0 : 1)
+case "settings":
+    launchSettingsOnly()
 case "install-service":
     cmdInstallService(config)
 case "uninstall-service":

@@ -19,8 +19,8 @@ enum EngineState: Equatable {
 /// The detect → record → transcribe → summarize loop, decoupled from any UI so
 /// it can drive both the headless `run` daemon and the menu bar app.
 final class Engine {
-    let config: Config
-    private let detector: CallDetector
+    private(set) var config: Config
+    private var detector: CallDetector
     private var recorder: AudioRecorder?
     private var recordingStartedAt = Date()
     private let work = DispatchQueue(label: "ghostie.pipeline")
@@ -45,6 +45,20 @@ final class Engine {
     }
 
     var isListening: Bool { listening }
+
+    /// Swap in a new configuration at runtime (from the Settings window).
+    /// Recording/transcription/summary already reload `Config.load()` per call;
+    /// the detector is rebuilt here so detection settings take effect too.
+    func applyConfig(_ newConfig: Config) {
+        let wasListening = listening
+        if wasListening { detector.stop() }
+        config = newConfig
+        detector = CallDetector(config: newConfig)
+        detector.onCallStart = { [weak self] in self?.handleStart() }
+        detector.onCallStop  = { [weak self] in self?.handleStop() }
+        if wasListening { detector.start() }
+        Log.info("Settings updated\(wasListening ? " — detector restarted" : "").")
+    }
 
     func startListening() {
         guard !listening else { return }

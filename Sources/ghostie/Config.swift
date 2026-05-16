@@ -78,12 +78,31 @@ struct Config: Codable {
 
     static let configPath = "\(NSHomeDirectory())/.ghostie/config.json"
 
-    static func load() -> Config {
+    /// The on-disk config (or defaults) WITHOUT env / runtime overlays — the
+    /// baseline the Settings window edits and saves, so env-derived values
+    /// never get baked into the file.
+    static func loadRaw() -> Config {
         var cfg = Config()
         if let data = FileManager.default.contents(atPath: configPath),
            let parsed = try? JSONDecoder().decode(Config.self, from: data) {
             cfg = parsed
         }
+        return cfg
+    }
+
+    /// Persist this config to disk (pretty-printed, stable key order).
+    @discardableResult
+    func save() -> Bool {
+        let enc = JSONEncoder()
+        enc.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let dir = (Config.configPath as NSString).deletingLastPathComponent
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        guard let data = try? enc.encode(self) else { return false }
+        return (try? data.write(to: URL(fileURLWithPath: Config.configPath))) != nil
+    }
+
+    static func load() -> Config {
+        var cfg = loadRaw()
         // Environment overrides win (handy for launchd / one-off runs).
         let env = ProcessInfo.processInfo.environment
         if let k = env["ANTHROPIC_API_KEY"], !k.isEmpty { cfg.anthropicApiKey = k }

@@ -49,8 +49,11 @@ and its menu gives quick access to everything:
 - **Pause / Resume Listening**
 - **Open Notes Folder** · **Open Last Summary**
 - **Run 15-Second Test** (verifies the whole pipeline)
-- **Set Anthropic API Key…** (stored in config; no restart needed)
-- **Edit Configuration** · **Diagnostics**
+- **Settings…** (`⌘,`) — a real settings window for the notes folder, audio
+  options, detection timing, whisper model/language/prompt, VAD, hallucination
+  guard, and the Anthropic API key & model. Saving applies immediately (no
+  restart) and an *Open config.json* button remains for power users.
+- **Diagnostics**
 - **Start at Login** (registers a launch item via `SMAppService`)
 - **Quit** (finishes any in-progress summary first)
 

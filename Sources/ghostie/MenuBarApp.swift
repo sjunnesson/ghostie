@@ -4,8 +4,9 @@ import ServiceManagement
 /// The menu bar (status bar) application. No Dock icon — it lives entirely in
 /// the macOS menu header for quick access.
 final class MenuBarApp: NSObject, NSApplicationDelegate {
-    private let config: Config
     private let engine: Engine
+    /// Always the engine's live config, so menu actions reflect Settings edits.
+    private var config: Config { engine.config }
     private var statusItem: NSStatusItem!
     private let menu = NSMenu()
     private var statusMenuItem: NSMenuItem!
@@ -13,9 +14,9 @@ final class MenuBarApp: NSObject, NSApplicationDelegate {
     private var lastNoteItem: NSMenuItem!
     private var loginItem: NSMenuItem!
     private var tick: Timer?
+    private var settings: SettingsWindow?
 
     init(config: Config) {
-        self.config = config
         self.engine = Engine(config: config)
         super.init()
     }
@@ -67,8 +68,7 @@ final class MenuBarApp: NSObject, NSApplicationDelegate {
         menu.addItem(item("Run 15-Second Test", #selector(runTest)))
         menu.addItem(.separator())
 
-        menu.addItem(item("Set Anthropic API Key…", #selector(setApiKey)))
-        menu.addItem(item("Edit Configuration", #selector(editConfig)))
+        menu.addItem(item("Settings…", #selector(openSettings), key: ","))
         menu.addItem(item("Diagnostics", #selector(showDiagnostics)))
         loginItem = item("Start at Login", #selector(toggleLogin))
         menu.addItem(loginItem)
@@ -152,42 +152,17 @@ final class MenuBarApp: NSObject, NSApplicationDelegate {
         }
     }
 
-    @objc private func setApiKey() {
-        let alert = NSAlert()
-        alert.messageText = "Anthropic API Key"
-        alert.informativeText = "Used only to summarize the transcript. Stored in ~/.ghostie/config.json. Audio and transcription stay 100% local."
-        alert.addButton(withTitle: "Save")
-        alert.addButton(withTitle: "Cancel")
-        let field = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
-        field.placeholderString = "sk-ant-…"
-        field.stringValue = config.anthropicApiKey
-        alert.accessoryView = field
-        NSApp.activate(ignoringOtherApps: true)
-        if alert.runModal() == .alertFirstButtonReturn {
-            let key = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-            saveApiKey(key)
-            notify("Ghostie", key.isEmpty ? "API key cleared." : "API key saved. Summaries enabled.")
+    @objc private func openSettings() {
+        if settings == nil {
+            settings = SettingsWindow { [weak self] newConfig in
+                guard let self else { return }
+                self.engine.applyConfig(newConfig)
+                self.render(self.engine.state)
+                self.refreshLastNote()
+                self.notify("Ghostie", "Settings saved.")
+            }
         }
-    }
-
-    private func saveApiKey(_ key: String) {
-        var cfg = config
-        cfg.anthropicApiKey = key
-        let enc = JSONEncoder()
-        enc.outputFormatting = [.prettyPrinted, .sortedKeys]
-        if let data = try? enc.encode(cfg) {
-            try? data.write(to: URL(fileURLWithPath: Config.configPath))
-        }
-        // Apply without restart for the next call.
-        runtimeConfigOverrideKey = key
-    }
-
-    @objc private func editConfig() {
-        let url = URL(fileURLWithPath: Config.configPath)
-        if !FileManager.default.fileExists(atPath: url.path) {
-            config.writeExampleIfMissing()
-        }
-        NSWorkspace.shared.open(url)
+        settings?.show()
     }
 
     @objc private func showDiagnostics() {
