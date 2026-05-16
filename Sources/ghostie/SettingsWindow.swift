@@ -39,7 +39,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         let content = buildForm(cfg)
 
         let win = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 660, height: 430),
+            contentRect: NSRect(x: 0, y: 0, width: 640, height: 540),
             styleMask: [.titled, .closable, .miniaturizable],
             backing: .buffered, defer: false)
         win.title = "Ghostie Settings"
@@ -105,30 +105,30 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         let tabs = NSTabView()
         tabs.translatesAutoresizingMaskIntoConstraints = false
         tabs.addTabViewItem(tab("General", [
-            pathRow("Notes folder", notesField, chooseDir: true),
+            field("Notes folder", pathControl(notesField, chooseDir: true)),
             keepAudio,
             saveTranscript,
             caption("Summaries are written here as markdown after each call.")
         ]))
         tabs.addTabViewItem(tab("Detection", [
             requireTeams,
-            row("End call after mic idle", suffixed(endGrace, "seconds", width: 70)),
-            row("Ignore calls shorter than", suffixed(minCall, "seconds", width: 70)),
+            field("End call after mic idle", leftWrap(suffixed(endGrace, "seconds", width: 70))),
+            field("Ignore calls shorter than", leftWrap(suffixed(minCall, "seconds", width: 70))),
             caption("A call is detected from microphone use; it ends after the mic is idle for the grace period.")
         ]))
         tabs.addTabViewItem(tab("Transcription", [
-            pathRow("Whisper model", whisperModelField, chooseDir: false),
-            row("Language", sized(languageBox, 120)),
+            field("Whisper model", pathControl(whisperModelField, chooseDir: false)),
+            field("Language", leftWrap(sized(languageBox, 120))),
             cleanTranscript,
-            label("Initial prompt (biases whisper toward clean, punctuated speech)"),
-            promptBox(cfg.initialPrompt),
-            pathRow("Silero VAD model", vadField, chooseDir: false),
+            field("Initial prompt (biases whisper toward clean, punctuated speech)",
+                  promptBox(cfg.initialPrompt)),
+            field("Silero VAD model", pathControl(vadField, chooseDir: false)),
             caption("VAD is optional. Run  ./scripts/setup.sh --vad  to fetch it; Ghostie auto-uses it when present.")
         ]))
         tabs.addTabViewItem(tab("Summary", [
-            pathRow("Claude CLI", claudeField, chooseDir: false),
+            field("Claude CLI", pathControl(claudeField, chooseDir: false)),
             caption("Summaries use the Claude Code CLI (`claude -p`) with your existing login — no API key needed. Run `claude` once in a terminal to sign in. Only the text transcript is sent; audio never leaves your Mac."),
-            row("Model", sized(summaryBox, 260))
+            field("Model", leftWrap(sized(summaryBox, 260)))
         ]))
 
         // ---- Buttons -----------------------------------------------------
@@ -208,11 +208,47 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
 
     // MARK: Builders
 
-    private func label(_ s: String) -> NSTextField {
-        let t = NSTextField(labelWithString: s)
-        t.font = .systemFont(ofSize: 12)
-        return t
+    /// A label on its own line above a full-width control.
+    private func field(_ labelText: String, _ control: NSView) -> NSView {
+        let l = NSTextField(labelWithString: labelText)
+        l.alignment = .left
+        l.font = .systemFont(ofSize: 12)
+        l.lineBreakMode = .byTruncatingTail
+        l.translatesAutoresizingMaskIntoConstraints = false
+        control.translatesAutoresizingMaskIntoConstraints = false
+
+        let v = NSView()
+        v.translatesAutoresizingMaskIntoConstraints = false
+        v.addSubview(l)
+        v.addSubview(control)
+        NSLayoutConstraint.activate([
+            l.topAnchor.constraint(equalTo: v.topAnchor),
+            l.leadingAnchor.constraint(equalTo: v.leadingAnchor),
+            l.trailingAnchor.constraint(equalTo: v.trailingAnchor),
+            control.topAnchor.constraint(equalTo: l.bottomAnchor, constant: 5),
+            control.leadingAnchor.constraint(equalTo: v.leadingAnchor),
+            control.trailingAnchor.constraint(equalTo: v.trailingAnchor),
+            control.bottomAnchor.constraint(equalTo: v.bottomAnchor)
+        ])
+        return v
     }
+
+    /// Wrap a fixed-size control so it sits left-aligned inside a full-width
+    /// row without being stretched (combos, numeric fields).
+    private func leftWrap(_ inner: NSView) -> NSView {
+        inner.translatesAutoresizingMaskIntoConstraints = false
+        let v = NSView()
+        v.translatesAutoresizingMaskIntoConstraints = false
+        v.addSubview(inner)
+        NSLayoutConstraint.activate([
+            inner.leadingAnchor.constraint(equalTo: v.leadingAnchor),
+            inner.topAnchor.constraint(equalTo: v.topAnchor),
+            inner.bottomAnchor.constraint(equalTo: v.bottomAnchor),
+            inner.trailingAnchor.constraint(lessThanOrEqualTo: v.trailingAnchor)
+        ])
+        return v
+    }
+
     private func caption(_ s: String) -> NSTextField {
         let t = NSTextField(wrappingLabelWithString: s)
         t.font = .systemFont(ofSize: 11)
@@ -222,19 +258,6 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
     private func separatorLine() -> NSView {
         let v = NSBox(); v.boxType = .separator
         return v
-    }
-    private func row(_ labelText: String, _ control: NSView) -> NSView {
-        let l = NSTextField(labelWithString: labelText)
-        l.alignment = .left
-        l.font = .systemFont(ofSize: 12)
-        l.translatesAutoresizingMaskIntoConstraints = false
-        l.widthAnchor.constraint(equalToConstant: 130).isActive = true
-        l.setContentHuggingPriority(.required, for: .horizontal)
-        let h = NSStackView(views: [l, control])
-        h.orientation = .horizontal
-        h.spacing = 10
-        h.alignment = .firstBaseline
-        return h
     }
     private func sized(_ v: NSView, _ w: CGFloat) -> NSView {
         v.translatesAutoresizingMaskIntoConstraints = false
@@ -253,18 +276,11 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         h.alignment = .firstBaseline
         return h
     }
-    /// Full-width row: fixed label, a field that stretches to fill the gap,
-    /// and a trailing "Choose…" button.
-    private func pathRow(_ labelText: String, _ field: NSTextField,
-                         chooseDir: Bool) -> NSView {
+    /// A full-width text field that stretches up to a trailing "Choose…"
+    /// button (no label — `field(_:_:)` supplies the label above it).
+    private func pathControl(_ textField: NSTextField, chooseDir: Bool) -> NSView {
         let container = NSView()
         container.translatesAutoresizingMaskIntoConstraints = false
-
-        let l = NSTextField(labelWithString: labelText)
-        l.alignment = .left
-        l.font = .systemFont(ofSize: 12)
-        l.translatesAutoresizingMaskIntoConstraints = false
-        l.setContentHuggingPriority(.required, for: .horizontal)
 
         let btn = NSButton(title: "Choose…",
                            target: self,
@@ -273,26 +289,22 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         btn.translatesAutoresizingMaskIntoConstraints = false
         btn.setContentHuggingPriority(.required, for: .horizontal)
         btn.setContentCompressionResistancePriority(.required, for: .horizontal)
-        objc_setAssociatedObject(btn, &Self.fieldKey, field, .OBJC_ASSOCIATION_RETAIN)
+        objc_setAssociatedObject(btn, &Self.fieldKey, textField, .OBJC_ASSOCIATION_RETAIN)
 
-        field.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        field.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        textField.translatesAutoresizingMaskIntoConstraints = false
+        textField.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        textField.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
-        container.addSubview(l)
-        container.addSubview(field)
+        container.addSubview(textField)
         container.addSubview(btn)
         NSLayoutConstraint.activate([
-            l.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            l.widthAnchor.constraint(equalToConstant: 130),
-            l.centerYAnchor.constraint(equalTo: field.centerYAnchor),
-
-            field.leadingAnchor.constraint(equalTo: l.trailingAnchor, constant: 10),
-            field.trailingAnchor.constraint(equalTo: btn.leadingAnchor, constant: -8),
-            field.topAnchor.constraint(equalTo: container.topAnchor),
-            field.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            textField.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            textField.trailingAnchor.constraint(equalTo: btn.leadingAnchor, constant: -8),
+            textField.topAnchor.constraint(equalTo: container.topAnchor),
+            textField.bottomAnchor.constraint(equalTo: container.bottomAnchor),
 
             btn.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            btn.centerYAnchor.constraint(equalTo: field.centerYAnchor)
+            btn.centerYAnchor.constraint(equalTo: textField.centerYAnchor)
         ])
         return container
     }
