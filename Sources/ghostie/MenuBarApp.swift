@@ -170,7 +170,7 @@ final class MenuBarApp: NSObject, NSApplicationDelegate {
         let s = Summarizer(config: config)
         let lines = [
             "Transcription: \(t.isAvailable ? "ready (local whisper.cpp)" : "NOT set up — run scripts/setup.sh")",
-            "Summaries: \(s.isConfigured || !(runtimeConfigOverrideKey ?? "").isEmpty ? "Anthropic \(config.summaryModel)" : "no API key set")",
+            "Summaries: \(s.isConfigured ? "claude -p (\(config.summaryModel))" : "Claude Code CLI not found — run `claude` once to log in")",
             "Whisper model: \(config.whisperModel)",
             "Notes folder: \(config.notesFolder)",
             "Config: \(Config.configPath)",
@@ -253,7 +253,3 @@ final class MenuBarApp: NSObject, NSApplicationDelegate {
     }
 
 }
-
-/// Set when the user enters a key via the menu, so the running process picks it
-/// up for the next call without a restart.
-var runtimeConfigOverrideKey: String?

@@ -76,7 +76,7 @@ struct Pipeline {
                 Log.error("Summarization failed: \(error.localizedDescription)")
             }
         } else {
-            summary = "> ℹ️ No Anthropic API key configured, so no AI analysis was produced.\n> Set `ANTHROPIC_API_KEY` (or add it to `~/.ghostie/config.json`) to enable the Context / Decisions / Action Items analysis.\n>\n> The full transcript is below."
+            summary = "> ℹ️ The Claude Code CLI (`claude`) was not found, so no AI analysis was produced.\n> Install Claude Code and run `claude` once to log in (no API key needed), then it works automatically.\n>\n> The full transcript is below."
         }
 
         let noteURL = writeNote(meta: meta, summary: summary,

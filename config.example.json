@@ -12,9 +12,12 @@
   "whisperBinary": "",
   "whisperModel": "/Users/YOU/.ghostie/models/ggml-base.en.bin",
   "language": "en",
+  "initialPrompt": "",
+  "vadModel": "/Users/YOU/.ghostie/models/ggml-silero-v5.1.2.bin",
+  "cleanTranscript": true,
 
   "summaryModel": "claude-sonnet-4-6",
-  "anthropicApiKey": "",
+  "claudeBinary": "",
 
   "workDir": "/Users/YOU/.ghostie/recordings"
 }

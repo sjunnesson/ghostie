@@ -18,9 +18,10 @@ meeting** — automatically transcribes each call and writes a markdown summary
    uses hallucination-resistant settings and a per-track **hallucination
    guard** (see below). The two tracks are merged by timestamp and labelled
    **Me** vs **Participants**.
-4. **Summarize** — the transcript is sent to the Anthropic API and turned into a
-   structured markdown note: Context · Participants · Discussion · Decisions ·
-   Action Items · Open Questions · Summary.
+4. **Summarize** — the transcript is sent through the **Claude Code CLI**
+   (`claude -p`) using your existing Claude Code login (**no API key**) and
+   turned into a structured markdown note: Context · Participants · Discussion ·
+   Decisions · Action Items · Open Questions · Summary.
 5. **Save** — `~/Documents/Teams Call Notes/2026-05-16_14-03_Teams-Call.md`
    (plus a transcript file). Audio is deleted afterwards by default.
 
@@ -51,7 +52,7 @@ and its menu gives quick access to everything:
 - **Run 15-Second Test** (verifies the whole pipeline)
 - **Settings…** (`⌘,`) — a real settings window for the notes folder, audio
   options, detection timing, whisper model/language/prompt, VAD, hallucination
-  guard, and the Anthropic API key & model. Saving applies immediately (no
+  guard, and the Claude CLI path & model. Saving applies immediately (no
   restart) and an *Open config.json* button remains for power users.
 - **Diagnostics**
 - **Start at Login** (registers a launch item via `SMAppService`)
@@ -116,17 +117,23 @@ Edit `~/.ghostie/config.json` (created on first run). Notable keys:
 | `cleanTranscript` | `true` | Run the hallucination guard |
 | `initialPrompt` | business-call primer | Biases whisper punctuation; `""` to disable |
 | `vadModel` | `…/ggml-silero-v5.1.2.bin` | Auto-used if present (`setup.sh --vad`) |
-| `summaryModel` | `claude-sonnet-4-6` | Anthropic model for the analysis |
+| `summaryModel` | `claude-sonnet-4-6` | Model for `claude -p` (alias or full id) |
+| `claudeBinary` | _(auto-detected)_ | Path to the `claude` CLI |
 
-Environment overrides: `ANTHROPIC_API_KEY`, `GHOSTIE_NOTES_FOLDER`,
-`GHOSTIE_WHISPER_MODEL`, `GHOSTIE_SUMMARY_MODEL`.
+Environment overrides: `GHOSTIE_NOTES_FOLDER`, `GHOSTIE_WHISPER_MODEL`,
+`GHOSTIE_SUMMARY_MODEL`.
+
+Summaries use the **Claude Code CLI** (`claude -p`) with your existing Claude
+Code login — no Anthropic API key. Run `claude` once in a terminal to sign in;
+`ghostie doctor` confirms it's detected.
 
 ## Privacy
 
 - Audio capture and transcription are 100% local.
-- Only the **text transcript** is sent to Anthropic for summarization, and only
-  if you set an API key. With no key, you still get the full local transcript;
-  no AI analysis is produced and nothing leaves the machine.
+- Only the **text transcript** is sent to Anthropic for summarization (via the
+  Claude Code CLI under your own account). Without Claude Code installed/logged
+  in you still get the full local transcript; no AI analysis is produced and
+  nothing leaves the machine.
 - Recordings live in `~/.ghostie/recordings` only while processing and are
   deleted unless `keepAudio` is true.
 - **Be mindful of consent laws and your employer's policy before recording

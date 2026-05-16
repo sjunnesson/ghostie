@@ -14,7 +14,7 @@ final class HeadlessRunner {
     func run() {
         let t = Transcriber(config: engine.config)
         Log.info("Transcription: \(t.isAvailable ? "local whisper.cpp ✓" : "NOT set up — run scripts/setup.sh")")
-        Log.info("Summaries: \(Summarizer(config: engine.config).isConfigured ? "Anthropic ✓" : "disabled (set ANTHROPIC_API_KEY)")")
+        Log.info("Summaries: \(Summarizer(config: engine.config).isConfigured ? "claude -p ✓" : "disabled (Claude Code CLI not found — run `claude` once to log in)")")
         engine.startListening()
 
         signal(SIGINT, SIG_IGN)
@@ -85,7 +85,8 @@ func cmdDoctor(_ config: Config) {
         config.cleanTranscript ? "on (run `ghostie selftest` to verify)" : "disabled in config")
     let vadOn = !config.vadModel.isEmpty && FileManager.default.fileExists(atPath: config.vadModel)
     row(vadOn, "Silero VAD model", vadOn ? config.vadModel : "optional — ./scripts/setup.sh --vad")
-    row(s.isConfigured, "Anthropic API key", s.isConfigured ? "set" : "set ANTHROPIC_API_KEY or use the menu")
+    row(s.isConfigured, "Claude Code CLI (`claude -p`)",
+        s.isConfigured ? s.claudeBinary : "not found — install Claude Code and run `claude` once to log in")
     let teams = NSWorkspace.shared.runningApplications.contains {
         ($0.bundleIdentifier?.lowercased().hasPrefix("com.microsoft.teams") ?? false)
     }
@@ -119,7 +120,7 @@ func cmdInstallService(_ config: Config) {
       <key>StandardOutPath</key><string>\(NSHomeDirectory())/.ghostie/service.out.log</string>
       <key>StandardErrorPath</key><string>\(NSHomeDirectory())/.ghostie/service.err.log</string>
       <key>EnvironmentVariables</key>
-      <dict><key>ANTHROPIC_API_KEY</key><string>\(config.anthropicApiKey)</string></dict>
+      <dict><key>PATH</key><string>\(NSHomeDirectory())/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string></dict>
     </dict>
     </plist>
     """

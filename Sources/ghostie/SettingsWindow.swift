@@ -19,7 +19,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
     private let cleanTranscript = NSButton(checkboxWithTitle: "Clean transcript (remove whisper hallucinations)", target: nil, action: nil)
     private let promptView = NSTextView()
     private let vadField = NSTextField()
-    private let apiKeyField = NSSecureTextField()
+    private let claudeField = NSTextField()
     private let summaryBox = NSComboBox()
 
     init(onSave: @escaping (Config) -> Void) {
@@ -79,10 +79,11 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         summaryBox.stringValue = cfg.summaryModel
         summaryBox.completes = true
 
-        apiKeyField.stringValue = cfg.anthropicApiKey
-        apiKeyField.placeholderString = "sk-ant-…"
+        claudeField.stringValue = cfg.claudeBinary.isEmpty
+            ? Config.findClaudeBinary() : cfg.claudeBinary
+        claudeField.placeholderString = "auto-detected"
 
-        for f in [notesField, endGrace, minCall, whisperModelField, vadField, apiKeyField] {
+        for f in [notesField, endGrace, minCall, whisperModelField, vadField, claudeField] {
             f.translatesAutoresizingMaskIntoConstraints = false
             f.controlSize = .regular
             f.usesSingleLineMode = true
@@ -94,7 +95,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         }
         // Long paths start flush-left like every other control; the truncated
         // tail is shown with the full path available on hover.
-        for f in [notesField, whisperModelField, vadField] {
+        for f in [notesField, whisperModelField, vadField, claudeField] {
             f.toolTip = f.stringValue
         }
         endGrace.alignment = .right
@@ -125,8 +126,8 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
             caption("VAD is optional. Run  ./scripts/setup.sh --vad  to fetch it; Ghostie auto-uses it when present.")
         ]))
         tabs.addTabViewItem(tab("Summary", [
-            row("API key", sized(apiKeyField, 340)),
-            caption("Only the text transcript is sent to Anthropic, and only if a key is set. Audio never leaves your Mac."),
+            row("Claude CLI", pathPicker(claudeField, chooseDir: false)),
+            caption("Summaries use the Claude Code CLI (`claude -p`) with your existing login — no API key needed. Run `claude` once in a terminal to sign in. Only the text transcript is sent; audio never leaves your Mac."),
             row("Model", sized(summaryBox, 260))
         ]))
 
@@ -326,11 +327,9 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         cfg.initialPrompt = promptView.string
         cfg.vadModel = vadField.stringValue.trimmingCharacters(in: .whitespaces)
         cfg.summaryModel = summaryBox.stringValue.trimmingCharacters(in: .whitespaces)
-        cfg.anthropicApiKey = apiKeyField.stringValue.trimmingCharacters(in: .whitespaces)
+        cfg.claudeBinary = claudeField.stringValue.trimmingCharacters(in: .whitespaces)
 
         if cfg.save() {
-            // Make the key live this session without a restart.
-            runtimeConfigOverrideKey = cfg.anthropicApiKey
             onSave(Config.load())
         }
         window?.close()

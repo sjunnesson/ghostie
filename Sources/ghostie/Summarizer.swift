@@ -1,11 +1,20 @@
 import Foundation
 
-/// Sends the merged transcript to the Anthropic Messages API and asks for a
-/// structured markdown analysis (context, decisions, actions).
+/// Produces a structured markdown analysis of the transcript by shelling out
+/// to the Claude Code CLI in print mode (`claude -p`). This uses the user's
+/// existing Claude Code login — no Anthropic API key required.
 struct Summarizer {
     let config: Config
 
-    var isConfigured: Bool { !config.anthropicApiKey.isEmpty }
+    /// Resolved path to the `claude` binary ("" if not found).
+    var claudeBinary: String {
+        config.claudeBinary.isEmpty ? Config.findClaudeBinary() : config.claudeBinary
+    }
+
+    var isConfigured: Bool {
+        let b = claudeBinary
+        return !b.isEmpty && FileManager.default.isExecutableFile(atPath: b)
+    }
 
     private static let systemPrompt = """
     You are an expert meeting analyst. You receive a timestamped transcript of a \
@@ -14,7 +23,8 @@ struct Summarizer {
     and may contain minor errors — infer intent sensibly and never invent facts \
     that are not supported by the transcript.
 
-    Produce a clear, skimmable markdown document with EXACTLY these sections:
+    Produce ONLY a clear, skimmable markdown document with EXACTLY these sections \
+    (no preamble, no tool use, no questions — just the document):
 
     ## Context
     2-4 sentences: what this call was about and why it happened.
@@ -40,17 +50,22 @@ struct Summarizer {
     ## One-Paragraph Summary
     A tight executive summary (3-5 sentences).
 
-    Do not add a top-level title or any preamble — start directly with "## Context".
+    Start directly with "## Context".
     """
 
     func summarize(transcript: String, meta: String) throws -> String {
-        guard isConfigured else {
+        let binary = claudeBinary
+        guard !binary.isEmpty,
+              FileManager.default.isExecutableFile(atPath: binary) else {
             throw NSError(domain: "ghostie", code: 4, userInfo: [
-                NSLocalizedDescriptionKey: "No Anthropic API key configured."
+                NSLocalizedDescriptionKey:
+                    "Claude Code CLI not found. Install it and run `claude` once to log in, or set claudeBinary in Settings."
             ])
         }
 
         let userContent = """
+        Analyze the following Microsoft Teams call.
+
         Call metadata:
         \(meta)
 
@@ -58,52 +73,66 @@ struct Summarizer {
         \(transcript)
         """
 
-        let body: [String: Any] = [
-            "model": config.summaryModel,
-            "max_tokens": 4096,
-            "system": Self.systemPrompt,
-            "messages": [
-                ["role": "user", "content": userContent]
-            ]
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: binary)
+        proc.arguments = [
+            "-p",
+            "--output-format", "text",
+            "--model", config.summaryModel,
+            // Replace Claude Code's agentic system prompt with our analyst one.
+            "--system-prompt", Self.systemPrompt
         ]
+        // Neutral cwd so no unrelated project CLAUDE.md is picked up.
+        proc.currentDirectoryURL = URL(fileURLWithPath: NSTemporaryDirectory())
 
-        var req = URLRequest(url: URL(string: "https://api.anthropic.com/v1/messages")!)
-        req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.setValue(config.anthropicApiKey, forHTTPHeaderField: "x-api-key")
-        req.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
-        req.httpBody = try JSONSerialization.data(withJSONObject: body)
-        req.timeoutInterval = 180
+        let stdinPipe = Pipe()
+        let outPipe = Pipe()
+        let errPipe = Pipe()
+        proc.standardInput = stdinPipe
+        proc.standardOutput = outPipe
+        proc.standardError = errPipe
 
-        let sem = DispatchSemaphore(value: 0)
-        var resultText: String?
-        var failure: String?
-
-        let task = URLSession.shared.dataTask(with: req) { data, response, error in
-            defer { sem.signal() }
-            if let error { failure = error.localizedDescription; return }
-            guard let data else { failure = "No response data."; return }
-            let code = (response as? HTTPURLResponse)?.statusCode ?? 0
-            guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-            else { failure = "Unparseable response (HTTP \(code))."; return }
-            if code != 200 {
-                let err = (json["error"] as? [String: Any])?["message"] as? String
-                failure = "Anthropic API HTTP \(code): \(err ?? String(data: data, encoding: .utf8) ?? "unknown")"
-                return
-            }
-            if let content = json["content"] as? [[String: Any]],
-               let first = content.first, let text = first["text"] as? String {
-                resultText = text
-            } else {
-                failure = "Unexpected response shape."
-            }
+        Log.info("Summarizing via `claude -p` (\(config.summaryModel))…")
+        do {
+            try proc.run()
+        } catch {
+            throw NSError(domain: "ghostie", code: 5, userInfo: [
+                NSLocalizedDescriptionKey: "Could not launch claude: \(error.localizedDescription)"
+            ])
         }
-        task.resume()
-        sem.wait()
 
-        if let resultText { return resultText }
-        throw NSError(domain: "ghostie", code: 5, userInfo: [
-            NSLocalizedDescriptionKey: failure ?? "Unknown summarization error."
-        ])
+        // Feed the transcript on stdin, then close it.
+        if let data = userContent.data(using: .utf8) {
+            stdinPipe.fileHandleForWriting.write(data)
+        }
+        try? stdinPipe.fileHandleForWriting.close()
+
+        // Read fully before waiting (avoids pipe-buffer deadlock on long output).
+        let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
+        let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+
+        // Watchdog: don't hang forever if the CLI stalls.
+        let deadline = DispatchTime.now() + 300
+        let waiter = DispatchQueue(label: "ghostie.claude.wait")
+        let sem = DispatchSemaphore(value: 0)
+        waiter.async { proc.waitUntilExit(); sem.signal() }
+        if sem.wait(timeout: deadline) == .timedOut {
+            proc.terminate()
+            throw NSError(domain: "ghostie", code: 6, userInfo: [
+                NSLocalizedDescriptionKey: "claude timed out after 5 minutes."
+            ])
+        }
+
+        let out = String(data: outData, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard proc.terminationStatus == 0, !out.isEmpty else {
+            let err = String(data: errData, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            throw NSError(domain: "ghostie", code: 7, userInfo: [
+                NSLocalizedDescriptionKey:
+                    "claude exited \(proc.terminationStatus). \(err.isEmpty ? "Are you logged in? Run `claude` once interactively." : err)"
+            ])
+        }
+        return out
     }
 }

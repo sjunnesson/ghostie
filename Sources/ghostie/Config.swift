@@ -61,13 +61,15 @@ struct Config: Codable {
     /// markers, training-data-leak phrases). Strongly recommended.
     var cleanTranscript: Bool = true
 
-    // MARK: Summarization
+    // MARK: Summarization (via the Claude Code CLI — no API key needed)
 
-    /// Anthropic model used to analyse the transcript.
+    /// Model passed to `claude -p --model`. An alias ("sonnet", "opus",
+    /// "haiku") or a full id ("claude-sonnet-4-6").
     var summaryModel: String = "claude-sonnet-4-6"
 
-    /// API key. Prefer the ANTHROPIC_API_KEY environment variable.
-    var anthropicApiKey: String = ""
+    /// Path to the `claude` binary. Auto-detected if empty. Summarization uses
+    /// your existing Claude Code login (subscription/OAuth) — no API key.
+    var claudeBinary: String = ""
 
     // MARK: Internal paths
 
@@ -105,14 +107,38 @@ struct Config: Codable {
         var cfg = loadRaw()
         // Environment overrides win (handy for launchd / one-off runs).
         let env = ProcessInfo.processInfo.environment
-        if let k = env["ANTHROPIC_API_KEY"], !k.isEmpty { cfg.anthropicApiKey = k }
         if let f = env["GHOSTIE_NOTES_FOLDER"], !f.isEmpty { cfg.notesFolder = f }
         if let m = env["GHOSTIE_WHISPER_MODEL"], !m.isEmpty { cfg.whisperModel = m }
         if let s = env["GHOSTIE_SUMMARY_MODEL"], !s.isEmpty { cfg.summaryModel = s }
-        // Key entered via the menu bar this session wins (no restart needed).
-        if let k = runtimeConfigOverrideKey, !k.isEmpty { cfg.anthropicApiKey = k }
         if cfg.whisperBinary.isEmpty { cfg.whisperBinary = Config.findWhisperBinary() }
+        if cfg.claudeBinary.isEmpty { cfg.claudeBinary = Config.findClaudeBinary() }
         return cfg
+    }
+
+    static func findClaudeBinary() -> String {
+        let home = NSHomeDirectory()
+        let candidates = [
+            "\(home)/.local/bin/claude",
+            "\(home)/.claude/local/claude",
+            "/opt/homebrew/bin/claude",
+            "/usr/local/bin/claude",
+            "/usr/bin/claude"
+        ]
+        for c in candidates where FileManager.default.isExecutableFile(atPath: c) {
+            return c
+        }
+        // Fall back to a login-shell PATH lookup.
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        p.arguments = ["-lc", "command -v claude"]
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = FileHandle.nullDevice
+        try? p.run()
+        p.waitUntilExit()
+        let path = String(data: pipe.fileHandleForReading.readDataToEndOfFile(),
+                          encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return FileManager.default.isExecutableFile(atPath: path) ? path : ""
     }
 
     static func findWhisperBinary() -> String {
