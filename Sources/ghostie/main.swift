@@ -92,6 +92,9 @@ func cmdDoctor(_ config: Config) {
     }
     row(teams, "Microsoft Teams running", teams ? "" : "(only needed during a call)")
     row(CallDetector.defaultInputDevice() != nil, "default input device detected")
+    let pending = Backlog.pendingCount
+    row(pending == 0, "backlog",
+        pending == 0 ? "empty" : "\(pending) pending — auto-retried; `ghostie process-backlog` to force")
     print("\n  Notes folder: \(config.notesFolder)")
     print("  Config file:  \(Config.configPath)")
     print("\n  Screen Recording + Microphone permissions are requested on first")
@@ -248,6 +251,7 @@ func printHelp() {
       test-record [secs]  Record N seconds (default 15) → full pipeline.
       process <dir>       Re-run transcription+summary on a recording dir.
       doctor              Check dependencies & permissions.
+      process-backlog     Process recordings queued while deps were unavailable.
       selftest            Verify the transcript hallucination guard.
       install-service     Headless background service via launchd.
       uninstall-service   Remove the headless service.
@@ -281,6 +285,9 @@ case "process":
     cmdProcess(config, dir: args[1])
 case "doctor":
     cmdDoctor(config)
+case "process-backlog":
+    let n = Pipeline.drain(config: config)
+    print("Backlog: completed \(n); \(Backlog.pendingCount) still pending.")
 case "icon":
     // Hidden: render the app icon PNG (used by scripts/build-app.sh).
     let out = args.count > 1 ? args[1] : "icon.png"

@@ -102,6 +102,23 @@ layer behind the *minutes* project):
 `ghostie selftest` runs the guard over representative hallucination patterns
 and asserts clean speech is left untouched.
 
+## Never loses a call (backlog)
+
+If a call can't be fully processed — whisper isn't set up, Claude Code isn't
+logged in, you're offline — the recording is **not** discarded. It's queued to
+a durable backlog at `~/.ghostie/backlog/`:
+
+- Transcription failed → the **audio** is kept and re-tried later.
+- Transcription OK but summary failed → the **transcript** is saved (audio
+  dropped, so it's never re-transcribed) and only the summary is re-tried.
+
+The note is still written immediately with a "⏳ queued" banner and the full
+transcript, then **upgraded in place** once processing succeeds. The backlog
+drains automatically: on launch, after every successful call, when settings
+change, and every 10 minutes. The menu shows **Process Backlog (N pending)**
+and `ghostie process-backlog` forces a drain. Entries that keep failing are
+given up after a few attempts with a best-effort note (never an endless queue).
+
 ## Configuration
 
 Edit `~/.ghostie/config.json` (created on first run). Notable keys:

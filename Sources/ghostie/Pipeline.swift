@@ -3,8 +3,14 @@ import Foundation
 /// Turns a finished recording into a markdown note:
 /// transcribe both tracks → merge by timestamp with speaker labels →
 /// summarize → write `<notesFolder>/<date>_Teams-Call.md` (+ transcript).
+///
+/// If transcription or summarization can't run (whisper missing, Claude Code
+/// not logged in, offline, …) the work is queued to the [Backlog] and the
+/// recording is kept, so nothing is lost. `drain(config:)` retries the queue
+/// whenever Ghostie can process again.
 struct Pipeline {
     let config: Config
+    static let maxAttempts = 6
 
     private struct Line {
         let startMs: Int
@@ -12,17 +18,166 @@ struct Pipeline {
         let text: String
     }
 
+    // MARK: Live processing
+
     @discardableResult
     func process(_ rec: AudioRecorder.Result, startedAt: Date) -> URL? {
-        let mins = String(format: "%.1f", rec.duration / 60.0)
-        Log.info("Processing recording (\(mins) min) at \(rec.sessionDir.lastPathComponent)…")
+        let durationMins = String(format: "%.1f", rec.duration / 60.0)
+        Log.info("Processing recording (\(durationMins) min) at \(rec.sessionDir.lastPathComponent)…")
 
+        let lines: [Line]
+        do {
+            lines = try transcribeMerge(mic: rec.micWav, sys: rec.systemWav)
+        } catch {
+            Log.error("Transcription failed: \(error.localizedDescription) — queued to backlog")
+            Backlog.enqueueAudio(micWav: rec.micWav, systemWav: rec.systemWav,
+                                 startedAt: startedAt, durationMins: durationMins)
+            let url = writeNote(meta: metaBlock(startedAt, durationMins),
+                summary: "> ⏳ **Queued.** Transcription wasn't available (\(error.localizedDescription)). Ghostie will process this recording automatically once it can run again.",
+                transcript: "_(Pending transcription.)_", startedAt: startedAt)
+            try? FileManager.default.removeItem(at: rec.sessionDir)
+            return url
+        }
+
+        let transcript = render(lines)
+        let meta = metaBlock(startedAt, durationMins)
+
+        if lines.isEmpty {
+            let url = writeNote(meta: meta,
+                summary: "_No speech detected on either track, so there is nothing to summarize._",
+                transcript: transcript, startedAt: startedAt)
+            cleanup(rec.sessionDir)
+            return url
+        }
+
+        let url = finishWithSummary(startedAt: startedAt, durationMins: durationMins,
+                                    meta: meta, transcript: transcript)
+        cleanup(rec.sessionDir)
+        return url
+    }
+
+    /// Summarize and write the note; on failure queue a summary-only backlog
+    /// entry and write the transcript now with a "summary queued" banner.
+    @discardableResult
+    private func finishWithSummary(startedAt: Date, durationMins: String,
+                                   meta: String, transcript: String) -> URL? {
+        let summarizer = Summarizer(config: config)
+        do {
+            guard summarizer.isConfigured else {
+                throw NSError(domain: "ghostie", code: 8, userInfo: [
+                    NSLocalizedDescriptionKey: "Claude Code CLI not found / not logged in"])
+            }
+            let summary = try summarizer.summarize(transcript: transcript, meta: meta)
+            Log.ok("Summary generated.")
+            return writeNote(meta: meta, summary: summary,
+                             transcript: transcript, startedAt: startedAt)
+        } catch {
+            Log.error("Summary unavailable: \(error.localizedDescription) — queued to backlog")
+            Backlog.enqueueTranscript(startedAt: startedAt,
+                                      durationMins: durationMins, transcript: transcript)
+            let banner = "> ⏳ **Summary queued.** Claude Code wasn't available (\(error.localizedDescription)). Ghostie will add the analysis automatically once it can run again — the full transcript below is already complete."
+            return writeNote(meta: meta, summary: banner,
+                             transcript: transcript, startedAt: startedAt)
+        }
+    }
+
+    // MARK: Backlog draining
+
+    /// Try to complete every queued entry. Returns how many were finished.
+    /// Safe to call repeatedly; entries that still can't run stay queued.
+    @discardableResult
+    static func drain(config: Config) -> Int {
+        let entries = Backlog.entries()
+        guard !entries.isEmpty else { return 0 }
+        let p = Pipeline(config: config)
+        Log.info("Backlog: \(entries.count) pending — attempting to process…")
+        var completed = 0
+
+        for entry in entries {
+            let startedAt = entry.startedAtDate
+            let meta = p.metaBlock(startedAt, entry.meta.durationMins)
+
+            if entry.meta.attempts >= maxAttempts {
+                p.finalizeGivenUp(entry, meta: meta)
+                Backlog.remove(entry)
+                completed += 1
+                continue
+            }
+
+            switch entry.meta.stage {
+            case "transcribe":
+                guard let lines = try? p.transcribeMerge(mic: entry.micWav,
+                                                         sys: entry.systemWav) else {
+                    Backlog.bump(entry)            // whisper still unavailable
+                    continue
+                }
+                let transcript = p.render(lines)
+                if lines.isEmpty {
+                    _ = p.writeNote(meta: meta,
+                        summary: "_No speech detected on either track._",
+                        transcript: transcript, startedAt: startedAt)
+                    Backlog.remove(entry); completed += 1
+                    continue
+                }
+                if let summary = p.trySummary(transcript: transcript, meta: meta) {
+                    _ = p.writeNote(meta: meta, summary: summary,
+                                    transcript: transcript, startedAt: startedAt)
+                    Backlog.remove(entry); completed += 1
+                } else {
+                    // Transcribed OK but summary still down: keep the
+                    // transcript so we never re-transcribe this one again.
+                    Backlog.convertToSummarize(entry, transcript: transcript)
+                    _ = p.writeNote(meta: meta,
+                        summary: "> ⏳ **Summary queued.** Transcript is ready; the AI analysis will be added automatically when Claude Code is available.",
+                        transcript: transcript, startedAt: startedAt)
+                }
+
+            case "summarize":
+                let transcript = (try? String(contentsOf: entry.transcriptFile,
+                                              encoding: .utf8)) ?? ""
+                if let summary = p.trySummary(transcript: transcript, meta: meta) {
+                    _ = p.writeNote(meta: meta, summary: summary,
+                                    transcript: transcript, startedAt: startedAt)
+                    Backlog.remove(entry); completed += 1
+                } else {
+                    Backlog.bump(entry)
+                }
+
+            default:
+                Backlog.remove(entry)
+            }
+        }
+        if completed > 0 { Log.ok("Backlog: completed \(completed) recording(s).") }
+        return completed
+    }
+
+    private func trySummary(transcript: String, meta: String) -> String? {
+        let s = Summarizer(config: config)
+        guard s.isConfigured else { return nil }
+        return try? s.summarize(transcript: transcript, meta: meta)
+    }
+
+    /// After too many attempts, salvage what we have and stop retrying.
+    private func finalizeGivenUp(_ entry: Backlog.Entry, meta: String) {
+        if entry.meta.stage == "summarize",
+           let transcript = try? String(contentsOf: entry.transcriptFile, encoding: .utf8) {
+            _ = writeNote(meta: meta,
+                summary: "> ⚠️ Summary could not be generated after several retries. The full transcript below is complete; run `claude` once to log in and future calls will summarize automatically.",
+                transcript: transcript, startedAt: entry.startedAtDate)
+        } else {
+            _ = writeNote(meta: meta,
+                summary: "> ⚠️ This recording could not be transcribed after several retries (check `ghostie doctor`).",
+                transcript: "_(Transcription failed.)_", startedAt: entry.startedAtDate)
+        }
+        Log.warn("Backlog: gave up on \(entry.dir.lastPathComponent) after \(entry.meta.attempts) attempts.")
+    }
+
+    // MARK: Shared steps
+
+    /// Transcribe both tracks, clean per track, merge by timestamp.
+    private func transcribeMerge(mic: URL, sys: URL) throws -> [Line] {
         let transcriber = Transcriber(config: config)
         var lines: [Line] = []
-        var transcriptError: String?
-
-        // Clean each track independently before merging — hallucination
-        // loops are per-track, so guarding pre-merge is more accurate.
         func collect(_ wav: URL, _ speaker: String) throws {
             let raw = try transcriber.transcribe(wav, speaker: speaker)
             let segments: [(startMs: Int, text: String)]
@@ -38,58 +193,35 @@ struct Pipeline {
                 lines.append(Line(startMs: s.startMs, speaker: speaker, text: s.text))
             }
         }
+        try collect(mic, "Me")
+        try collect(sys, "Participants")
+        return lines.sorted { $0.startMs < $1.startMs }
+    }
 
-        do {
-            try collect(rec.micWav, "Me")
-            try collect(rec.systemWav, "Participants")
-        } catch {
-            transcriptError = error.localizedDescription
-            Log.error("Transcription failed: \(error.localizedDescription)")
-        }
-
-        lines.sort { $0.startMs < $1.startMs }
-        let transcript = lines.isEmpty
+    private func render(_ lines: [Line]) -> String {
+        lines.isEmpty
             ? "_(No speech was transcribed.)_"
             : lines.map { "**[\(Self.clock($0.startMs))] \($0.speaker):** \($0.text)" }
                    .joined(separator: "\n\n")
-
-        let started = Self.human.string(from: startedAt)
-        let meta = """
-        - Date: \(started)
-        - Duration: \(mins) minutes
-        - Captured locally via ScreenCaptureKit (no bot joined the call)
-        """
-
-        // Summarize (best-effort — never lose the transcript if this fails).
-        var summary: String
-        let summarizer = Summarizer(config: config)
-        if let transcriptError {
-            summary = "> ⚠️ Transcription unavailable: \(transcriptError)\n>\n> Run `scripts/setup.sh` to install whisper.cpp and a model."
-        } else if lines.isEmpty {
-            summary = "_No speech detected on either track, so there is nothing to summarize._"
-        } else if summarizer.isConfigured {
-            do {
-                summary = try summarizer.summarize(transcript: transcript, meta: meta)
-                Log.ok("Summary generated.")
-            } catch {
-                summary = "> ⚠️ Summary generation failed: \(error.localizedDescription)\n>\n> The full transcript below is still complete."
-                Log.error("Summarization failed: \(error.localizedDescription)")
-            }
-        } else {
-            summary = "> ℹ️ The Claude Code CLI (`claude`) was not found, so no AI analysis was produced.\n> Install Claude Code and run `claude` once to log in (no API key needed), then it works automatically.\n>\n> The full transcript is below."
-        }
-
-        let noteURL = writeNote(meta: meta, summary: summary,
-                                transcript: transcript, startedAt: startedAt)
-
-        if !config.keepAudio {
-            try? FileManager.default.removeItem(at: rec.sessionDir)
-        } else {
-            Log.info("Audio kept at \(rec.sessionDir.path)")
-        }
-        return noteURL
     }
 
+    private func metaBlock(_ startedAt: Date, _ durationMins: String) -> String {
+        """
+        - Date: \(Self.human.string(from: startedAt))
+        - Duration: \(durationMins) minutes
+        - Captured locally via ScreenCaptureKit (no bot joined the call)
+        """
+    }
+
+    private func cleanup(_ sessionDir: URL) {
+        if config.keepAudio {
+            Log.info("Audio kept at \(sessionDir.path)")
+        } else {
+            try? FileManager.default.removeItem(at: sessionDir)
+        }
+    }
+
+    @discardableResult
     private func writeNote(meta: String, summary: String,
                            transcript: String, startedAt: Date) -> URL? {
         let folder = URL(fileURLWithPath: config.notesFolder)

@@ -30,6 +30,9 @@ final class Engine {
     /// Called (on an arbitrary queue) whenever state changes; UI must hop to main.
     var onStateChange: ((EngineState) -> Void)?
     var onNote: ((URL) -> Void)?
+    /// Fires after a backlog drain with the remaining pending count.
+    var onBacklogChange: ((Int) -> Void)?
+    private var backlogTimer: DispatchSourceTimer?
 
     private(set) var state: EngineState = .paused {
         didSet { if state != oldValue { onStateChange?(state) } }
@@ -58,6 +61,7 @@ final class Engine {
         detector.onCallStop  = { [weak self] in self?.handleStop() }
         if wasListening { detector.start() }
         Log.info("Settings updated\(wasListening ? " — detector restarted" : "").")
+        drainBacklog()   // settings may have fixed whisper / Claude Code
     }
 
     func startListening() {
@@ -66,15 +70,32 @@ final class Engine {
         detector.start()
         state = .watching
         Log.ok("Listening for Teams calls (no bot joins your meetings).")
+        drainBacklog()   // catch up on anything queued while we were away
+        let t = DispatchSource.makeTimerSource(queue: gate)
+        t.schedule(deadline: .now() + 600, repeating: 600)   // retry every 10 min
+        t.setEventHandler { [weak self] in self?.drainBacklog() }
+        t.resume()
+        backlogTimer = t
     }
 
     func stopListening() {
         guard listening else { return }
         listening = false
         detector.stop()
+        backlogTimer?.cancel(); backlogTimer = nil
         if recorder != nil { handleStop() } // finalize an in-progress call
         state = .paused
         Log.info("Listening paused.")
+    }
+
+    /// Try to process anything sitting in the backlog. Cheap when empty.
+    func drainBacklog() {
+        work.async {
+            let done = Pipeline.drain(config: Config.load())
+            let pending = Backlog.pendingCount
+            if done > 0 { self.callsProcessed += done }
+            self.onBacklogChange?(pending)
+        }
     }
 
     private func handleStart() {
@@ -122,6 +143,10 @@ final class Engine {
                         self.onNote?(note)
                     }
                     self.state = self.listening ? .watching : .paused
+                    // Dependencies are clearly healthy now — clear any backlog.
+                    let done = Pipeline.drain(config: Config.load())
+                    if done > 0 { self.callsProcessed += done }
+                    self.onBacklogChange?(Backlog.pendingCount)
                 }
             }
         }

@@ -12,6 +12,7 @@ final class MenuBarApp: NSObject, NSApplicationDelegate {
     private var statusMenuItem: NSMenuItem!
     private var toggleItem: NSMenuItem!
     private var lastNoteItem: NSMenuItem!
+    private var backlogItem: NSMenuItem!
     private var loginItem: NSMenuItem!
     private var tick: Timer?
     private var settings: SettingsWindow?
@@ -38,6 +39,9 @@ final class MenuBarApp: NSObject, NSApplicationDelegate {
                 self?.notify("Call summarized", note.lastPathComponent)
                 self?.refreshLastNote()
             }
+        }
+        engine.onBacklogChange = { [weak self] pending in
+            DispatchQueue.main.async { self?.refreshBacklog(pending) }
         }
 
         engine.startListening()
@@ -66,6 +70,9 @@ final class MenuBarApp: NSObject, NSApplicationDelegate {
         lastNoteItem.isEnabled = false
         menu.addItem(lastNoteItem)
         menu.addItem(item("Run 15-Second Test", #selector(runTest)))
+        backlogItem = item("Backlog: none", #selector(processBacklog))
+        backlogItem.isEnabled = false
+        menu.addItem(backlogItem)
         menu.addItem(.separator())
 
         menu.addItem(item("Settings…", #selector(openSettings), key: ","))
@@ -79,6 +86,23 @@ final class MenuBarApp: NSObject, NSApplicationDelegate {
 
         refreshLastNote()
         refreshLoginState()
+        refreshBacklog(Backlog.pendingCount)
+    }
+
+    private func refreshBacklog(_ pending: Int) {
+        if pending > 0 {
+            backlogItem.title = "Process Backlog (\(pending) pending)"
+            backlogItem.isEnabled = true
+        } else {
+            backlogItem.title = "Backlog: none"
+            backlogItem.isEnabled = false
+        }
+        refreshLastNote()
+    }
+
+    @objc private func processBacklog() {
+        notify("Ghostie", "Processing backlog…")
+        engine.drainBacklog()
     }
 
     private func item(_ title: String, _ sel: Selector, key: String = "") -> NSMenuItem {
@@ -171,6 +195,7 @@ final class MenuBarApp: NSObject, NSApplicationDelegate {
         let lines = [
             "Transcription: \(t.isAvailable ? "ready (local whisper.cpp)" : "NOT set up — run scripts/setup.sh")",
             "Summaries: \(s.isConfigured ? "claude -p (\(config.summaryModel))" : "Claude Code CLI not found — run `claude` once to log in")",
+            "Backlog: \(Backlog.pendingCount) pending (auto-retried; processed on next call too)",
             "Whisper model: \(config.whisperModel)",
             "Notes folder: \(config.notesFolder)",
             "Config: \(Config.configPath)",
