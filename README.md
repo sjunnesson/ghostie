@@ -14,8 +14,10 @@ meeting** — automatically transcribes each call and writes a markdown summary
    system audio (everyone else) and your microphone (you), as two 16 kHz mono
    WAV files. No virtual audio driver, no bot participant.
 3. **Transcribe** — [whisper.cpp](https://github.com/ggerganov/whisper.cpp) runs
-   **entirely on your machine**. Call audio never leaves your Mac. The two
-   tracks are merged by timestamp and labelled **Me** vs **Participants**.
+   **entirely on your machine**. Call audio never leaves your Mac. Decoding
+   uses hallucination-resistant settings and a per-track **hallucination
+   guard** (see below). The two tracks are merged by timestamp and labelled
+   **Me** vs **Participants**.
 4. **Summarize** — the transcript is sent to the Anthropic API and turned into a
    structured markdown note: Context · Participants · Discussion · Decisions ·
    Action Items · Open Questions · Summary.
@@ -66,7 +68,35 @@ ghostie test-record 15     # 15s smoke test through the full pipeline
 ghostie process <dir>      # re-summarize a saved recording folder
 ghostie install-service    # headless launchd service
 ghostie doctor             # diagnostics
+ghostie selftest           # verify the transcript hallucination guard
 ```
+
+## Transcript quality
+
+Whisper is excellent at recognition but notorious for **hallucinating** on
+quiet/noisy audio — looping a phrase ("Thank you." ×30), emitting
+`[BLANK_AUDIO]` / `[music]` runs, or pasting YouTube-subtitle training leaks
+("Thanks for watching!", "Subtitles by the Amara.org community", URLs). A call
+recording has lots of silence (mute, listening), so this matters a lot.
+
+Ghostie adopts the practices proven in production by
+[`whisper-guard`](https://github.com/silverstein/minutes) (the post-processing
+layer behind the *minutes* project):
+
+- **Hardened decoding** — explicit `best-of 5`, entropy/logprob/no-speech
+  thresholds, temperature fallback, and `--suppress-nst` (suppress non-speech
+  tokens), plus a business-call **initial prompt** that biases punctuation.
+- **Per-track hallucination guard** (`TranscriptCleaner`) — collapses silence
+  loops (with an audit annotation), drops noise-marker runs, strips known
+  training-leak phrases / credit lines / bare URLs, and trims trailing
+  noise/filler. It is deliberately conservative: a single closing "Okay." or
+  legitimate backchannel survives. Cleaning runs per track *before* the merge.
+- **Optional Silero VAD** — `./scripts/setup.sh --vad` fetches the model;
+  Ghostie auto-uses it. VAD is the single biggest reducer of silence-driven
+  hallucination.
+
+`ghostie selftest` runs the guard over representative hallucination patterns
+and asserts clean speech is left untouched.
 
 ## Configuration
 
@@ -80,6 +110,9 @@ Edit `~/.ghostie/config.json` (created on first run). Notable keys:
 | `minCallSeconds` | `20` | Ignore calls shorter than this |
 | `whisperModel` | `…/ggml-base.en.bin` | Bigger model = better accuracy, slower |
 | `language` | `en` | `auto` for automatic detection |
+| `cleanTranscript` | `true` | Run the hallucination guard |
+| `initialPrompt` | business-call primer | Biases whisper punctuation; `""` to disable |
+| `vadModel` | `…/ggml-silero-v5.1.2.bin` | Auto-used if present (`setup.sh --vad`) |
 | `summaryModel` | `claude-sonnet-4-6` | Anthropic model for the analysis |
 
 Environment overrides: `ANTHROPIC_API_KEY`, `GHOSTIE_NOTES_FOLDER`,

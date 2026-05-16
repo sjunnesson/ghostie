@@ -37,15 +37,32 @@ struct Transcriber {
         let prefix = wav.deletingPathExtension().path
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: config.whisperBinary)
-        proc.arguments = [
+        // Hallucination-resistant decoding. whisper-cli's defaults already
+        // match the production-tuned values (best-of 5, entropy 2.4, logprob
+        // -1.0, no-speech 0.6); we set them explicitly so a future default
+        // change can't silently regress quality, and add the two flags that
+        // are OFF by default but matter most: non-speech-token suppression and
+        // (when a model is available) Voice Activity Detection.
+        var args = [
             "-m", config.whisperModel,
             "-f", wav.path,
             "-l", config.language,
+            "-bo", "5", "-bs", "5",
+            "-et", "2.40", "-lpt", "-1.00", "-nth", "0.60",
+            "-sns",                // suppress non-speech tokens ([music] etc.)
             "-oj",                 // write <prefix>.json
             "-of", prefix,
             "-np",                 // no progress prints
             "-nt"                  // no inline timestamps in text
         ]
+        if !config.initialPrompt.isEmpty {
+            args += ["--prompt", config.initialPrompt]
+        }
+        if !config.vadModel.isEmpty,
+           FileManager.default.fileExists(atPath: config.vadModel) {
+            args += ["--vad", "--vad-model", config.vadModel]
+        }
+        proc.arguments = args
         let pipe = Pipe()
         proc.standardOutput = pipe
         proc.standardError = pipe

@@ -21,13 +21,27 @@ struct Pipeline {
         var lines: [Line] = []
         var transcriptError: String?
 
+        // Clean each track independently before merging — hallucination
+        // loops are per-track, so guarding pre-merge is more accurate.
+        func collect(_ wav: URL, _ speaker: String) throws {
+            let raw = try transcriber.transcribe(wav, speaker: speaker)
+            let segments: [(startMs: Int, text: String)]
+            if config.cleanTranscript {
+                let (cleaned, stats) = TranscriptCleaner.clean(
+                    raw.map { (startMs: $0.startMs, text: $0.text) })
+                if stats.removed > 0 { Log.info("\(speaker): \(stats.summary)") }
+                segments = cleaned.map { (startMs: $0.startMs, text: $0.text) }
+            } else {
+                segments = raw.map { (startMs: $0.startMs, text: $0.text) }
+            }
+            for s in segments {
+                lines.append(Line(startMs: s.startMs, speaker: speaker, text: s.text))
+            }
+        }
+
         do {
-            for seg in try transcriber.transcribe(rec.micWav, speaker: "Me") {
-                lines.append(Line(startMs: seg.startMs, speaker: "Me", text: seg.text))
-            }
-            for seg in try transcriber.transcribe(rec.systemWav, speaker: "Participants") {
-                lines.append(Line(startMs: seg.startMs, speaker: "Participants", text: seg.text))
-            }
+            try collect(rec.micWav, "Me")
+            try collect(rec.systemWav, "Participants")
         } catch {
             transcriptError = error.localizedDescription
             Log.error("Transcription failed: \(error.localizedDescription)")

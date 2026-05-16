@@ -81,6 +81,10 @@ func cmdDoctor(_ config: Config) {
     row(!config.whisperBinary.isEmpty, "whisper.cpp binary", config.whisperBinary.isEmpty ? "brew install whisper-cpp" : config.whisperBinary)
     row(FileManager.default.fileExists(atPath: config.whisperModel), "whisper model", config.whisperModel)
     row(t.isAvailable, "transcription ready")
+    row(config.cleanTranscript, "hallucination guard",
+        config.cleanTranscript ? "on (run `ghostie selftest` to verify)" : "disabled in config")
+    let vadOn = !config.vadModel.isEmpty && FileManager.default.fileExists(atPath: config.vadModel)
+    row(vadOn, "Silero VAD model", vadOn ? config.vadModel : "optional — ./scripts/setup.sh --vad")
     row(s.isConfigured, "Anthropic API key", s.isConfigured ? "set" : "set ANTHROPIC_API_KEY or use the menu")
     let teams = NSWorkspace.shared.runningApplications.contains {
         ($0.bundleIdentifier?.lowercased().hasPrefix("com.microsoft.teams") ?? false)
@@ -153,6 +157,70 @@ func launchMenuBar(_ config: Config) {
     app.run()
 }
 
+/// Built-in regression check for the hallucination guard, over the patterns
+/// it targets (whisper emits these as separate short segments on bad audio).
+func runTranscriptCleanerSelfTest() -> Bool {
+    func seg(_ texts: [String]) -> [(startMs: Int, text: String)] {
+        texts.enumerated().map { (startMs: $0.offset * 1000, text: $0.element) }
+    }
+    var passed = 0, failed = 0
+    func check(_ name: String, _ input: [String], _ predicate: ([String]) -> Bool) {
+        let (out, stats) = TranscriptCleaner.clean(seg(input))
+        let texts = out.map { $0.text }
+        if predicate(texts) {
+            passed += 1; print("  ✓ \(name)  (\(stats.summary))")
+        } else {
+            failed += 1
+            print("  ✗ \(name)\n      in:  \(input)\n      out: \(texts)")
+        }
+    }
+
+    // Silence loop → collapses to one + an annotation.
+    check("silence loop collapses", Array(repeating: "Thank you.", count: 12)
+          + ["What is the Q3 budget?"]) { out in
+        out.contains { $0.contains("repeated audio removed") }
+        && out.contains { $0.contains("Q3 budget") }
+        && out.filter { $0 == "Thank you." }.count <= 1
+    }
+    // YouTube / Amara training-data leaks dropped; real content kept.
+    check("known hallucinations dropped",
+          ["Thanks for watching!", "Please subscribe to our channel",
+           "Subtitles by the Amara.org community", "www.amara.org",
+           "Let's approve the migration plan."]) { out in
+        out == ["Let's approve the migration plan."]
+    }
+    // Noise-marker run collapses; trailing noise trimmed.
+    check("noise markers + trailing trim",
+          ["Decision: ship Friday.", "[BLANK_AUDIO]", "[BLANK_AUDIO]",
+           "[BLANK_AUDIO]", "[ Silence ]", "[music]"]) { out in
+        out == ["Decision: ship Friday."]
+    }
+    // A dominant hallucinated *content* phrase interleaved with junk
+    // collapses to one occurrence; pure filler backchannel is intentionally
+    // preserved, so the dominant phrase here is real-looking content.
+    check("interleaved drift collapses",
+          ["The meeting is being recorded.", "uh",
+           "The meeting is being recorded.", "um",
+           "The meeting is being recorded.", "hmm",
+           "The meeting is being recorded.", "okay",
+           "The meeting is being recorded.", "right",
+           "The meeting is being recorded.", "Decision: launch next week."]) { out in
+        out.filter { $0 == "The meeting is being recorded." }.count == 1
+        && out.contains { $0.contains("Decision: launch next week.") }
+        && out.count < 12
+    }
+    // Clean speech is untouched (no false positives).
+    check("clean speech untouched",
+          ["Hi everyone.", "We shipped the feature.", "Next steps are clear.",
+           "Thanks, talk soon."]) { out in
+        out == ["Hi everyone.", "We shipped the feature.",
+                "Next steps are clear.", "Thanks, talk soon."]
+    }
+
+    print("\ntranscript-cleaner self-test: \(passed) passed, \(failed) failed")
+    return failed == 0
+}
+
 func printHelp() {
     print("""
     Ghostie — local Teams call transcriber & summarizer (no bot joins).
@@ -165,6 +233,7 @@ func printHelp() {
       test-record [secs]  Record N seconds (default 15) → full pipeline.
       process <dir>       Re-run transcription+summary on a recording dir.
       doctor              Check dependencies & permissions.
+      selftest            Verify the transcript hallucination guard.
       install-service     Headless background service via launchd.
       uninstall-service   Remove the headless service.
       help                Show this help.
@@ -201,6 +270,8 @@ case "icon":
     // Hidden: render the app icon PNG (used by scripts/build-app.sh).
     let out = args.count > 1 ? args[1] : "icon.png"
     exit(GhostIcon.writeAppIconPNG(to: out) ? 0 : 1)
+case "selftest":
+    exit(runTranscriptCleanerSelfTest() ? 0 : 1)
 case "install-service":
     cmdInstallService(config)
 case "uninstall-service":

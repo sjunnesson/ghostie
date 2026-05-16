@@ -47,6 +47,20 @@ struct Config: Codable {
     /// Spoken language. "auto" lets whisper detect it.
     var language: String = "en"
 
+    /// Initial prompt biasing whisper toward clean, punctuated business
+    /// speech (also nudges it away from silence hallucinations). Empty = none.
+    var initialPrompt: String =
+        "The following is a professional Microsoft Teams business call with clear punctuation and capitalization."
+
+    /// Optional ggml Silero VAD model path. When set and present, whisper runs
+    /// with Voice Activity Detection — the single biggest reducer of
+    /// silence-driven hallucination. Empty = disabled. See scripts/setup.sh.
+    var vadModel: String = "\(NSHomeDirectory())/.ghostie/models/ggml-silero-v5.1.2.bin"
+
+    /// Run the post-transcription hallucination guard (dedup loops, noise
+    /// markers, training-data-leak phrases). Strongly recommended.
+    var cleanTranscript: Bool = true
+
     // MARK: Summarization
 
     /// Anthropic model used to analyse the transcript.
