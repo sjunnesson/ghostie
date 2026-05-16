@@ -1,0 +1,217 @@
+import Foundation
+import AppKit
+import ScreenCaptureKit
+import AVFoundation
+
+// MARK: - Headless daemon (launchd / no GUI session)
+
+final class HeadlessRunner {
+    private let engine: Engine
+    private var signalSources: [DispatchSourceSignal] = []
+
+    init(config: Config) { engine = Engine(config: config) }
+
+    func run() {
+        let t = Transcriber(config: engine.config)
+        Log.info("Transcription: \(t.isAvailable ? "local whisper.cpp ✓" : "NOT set up — run scripts/setup.sh")")
+        Log.info("Summaries: \(Summarizer(config: engine.config).isConfigured ? "Anthropic ✓" : "disabled (set ANTHROPIC_API_KEY)")")
+        engine.startListening()
+
+        signal(SIGINT, SIG_IGN)
+        signal(SIGTERM, SIG_IGN)
+        for sig in [SIGINT, SIGTERM] {
+            let src = DispatchSource.makeSignalSource(signal: sig, queue: .main)
+            src.setEventHandler {
+                Log.info("Shutting down…")
+                self.engine.shutdown { exit(0) }
+            }
+            src.resume()
+            signalSources.append(src)
+        }
+        RunLoop.main.run()
+    }
+}
+
+// MARK: - One-shot CLI helpers
+
+func runBlocking(_ body: @escaping () async -> Void) {
+    let sem = DispatchSemaphore(value: 0)
+    Task { await body(); sem.signal() }
+    sem.wait()
+}
+
+func cmdTestRecord(_ config: Config, seconds: Double) {
+    Log.info("Test recording for \(Int(seconds))s — speak into your mic and play some audio…")
+    let rec = AudioRecorder(config: config)
+    let started = Date()
+    runBlocking {
+        do {
+            try await rec.start()
+            try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+            guard let result = await rec.stop() else { Log.error("No result."); return }
+            Log.ok("Captured \(String(format: "%.1f", result.duration))s. Running pipeline…")
+            Pipeline(config: config).process(result, startedAt: started)
+        } catch {
+            Log.error("Test failed: \(error.localizedDescription)")
+            Log.error("Grant Screen Recording + Microphone in System Settings ▸ Privacy & Security.")
+        }
+    }
+}
+
+func cmdProcess(_ config: Config, dir: String) {
+    let url = URL(fileURLWithPath: dir)
+    let mic = url.appendingPathComponent("me.wav")
+    let sys = url.appendingPathComponent("participants.wav")
+    guard FileManager.default.fileExists(atPath: mic.path) ||
+          FileManager.default.fileExists(atPath: sys.path) else {
+        Log.error("No me.wav / participants.wav found in \(dir)"); return
+    }
+    let result = AudioRecorder.Result(sessionDir: url, micWav: mic,
+                                      systemWav: sys, duration: 0)
+    Pipeline(config: config).process(result, startedAt: Date())
+}
+
+func cmdDoctor(_ config: Config) {
+    print("Ghostie doctor\n==================")
+    let t = Transcriber(config: config)
+    let s = Summarizer(config: config)
+    func row(_ ok: Bool, _ label: String, _ detail: String = "") {
+        print("  \(ok ? "✓" : "✗") \(label)\(detail.isEmpty ? "" : "  — \(detail)")")
+    }
+    row(!config.whisperBinary.isEmpty, "whisper.cpp binary", config.whisperBinary.isEmpty ? "brew install whisper-cpp" : config.whisperBinary)
+    row(FileManager.default.fileExists(atPath: config.whisperModel), "whisper model", config.whisperModel)
+    row(t.isAvailable, "transcription ready")
+    row(s.isConfigured, "Anthropic API key", s.isConfigured ? "set" : "set ANTHROPIC_API_KEY or use the menu")
+    let teams = NSWorkspace.shared.runningApplications.contains {
+        ($0.bundleIdentifier?.lowercased().hasPrefix("com.microsoft.teams") ?? false)
+    }
+    row(teams, "Microsoft Teams running", teams ? "" : "(only needed during a call)")
+    row(CallDetector.defaultInputDevice() != nil, "default input device detected")
+    print("\n  Notes folder: \(config.notesFolder)")
+    print("  Config file:  \(Config.configPath)")
+    print("\n  Screen Recording + Microphone permissions are requested on first")
+    print("  capture. Grant them to the app in System Settings ▸ Privacy & Security.")
+}
+
+func serviceLabel() -> String { "com.davidsjunnesson.ghostie" }
+func servicePlistPath() -> String {
+    "\(NSHomeDirectory())/Library/LaunchAgents/\(serviceLabel()).plist"
+}
+
+func cmdInstallService(_ config: Config) {
+    let binary = CommandLine.arguments[0]
+    let abs = (binary as NSString).isAbsolutePath
+        ? binary : FileManager.default.currentDirectoryPath + "/" + binary
+    let plist = """
+    <?xml version="1.0" encoding="UTF-8"?>
+    <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+    <plist version="1.0">
+    <dict>
+      <key>Label</key><string>\(serviceLabel())</string>
+      <key>ProgramArguments</key>
+      <array><string>\(abs)</string><string>run</string></array>
+      <key>RunAtLoad</key><true/>
+      <key>KeepAlive</key><true/>
+      <key>StandardOutPath</key><string>\(NSHomeDirectory())/.ghostie/service.out.log</string>
+      <key>StandardErrorPath</key><string>\(NSHomeDirectory())/.ghostie/service.err.log</string>
+      <key>EnvironmentVariables</key>
+      <dict><key>ANTHROPIC_API_KEY</key><string>\(config.anthropicApiKey)</string></dict>
+    </dict>
+    </plist>
+    """
+    let dir = "\(NSHomeDirectory())/Library/LaunchAgents"
+    try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    try? plist.write(toFile: servicePlistPath(), atomically: true, encoding: .utf8)
+    _ = shell("/bin/launchctl", ["unload", servicePlistPath()])
+    _ = shell("/bin/launchctl", ["load", servicePlistPath()])
+    Log.ok("Headless service installed: \(serviceLabel())")
+    print("Tip: for quick access, use the menu bar app instead (open Ghostie.app).")
+}
+
+func cmdUninstallService() {
+    _ = shell("/bin/launchctl", ["unload", servicePlistPath()])
+    try? FileManager.default.removeItem(atPath: servicePlistPath())
+    Log.ok("Service uninstalled.")
+}
+
+@discardableResult
+func shell(_ path: String, _ args: [String]) -> String {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: path)
+    p.arguments = args
+    let pipe = Pipe()
+    p.standardOutput = pipe; p.standardError = pipe
+    try? p.run(); p.waitUntilExit()
+    return String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+}
+
+func launchMenuBar(_ config: Config) {
+    let app = NSApplication.shared
+    let delegate = MenuBarApp(config: config)
+    app.delegate = delegate
+    app.setActivationPolicy(.accessory)
+    app.run()
+}
+
+func printHelp() {
+    print("""
+    Ghostie — local Teams call transcriber & summarizer (no bot joins).
+
+    USAGE: ghostie <command>
+
+      menubar             Run as a macOS menu bar app (default when launched
+                          as Ghostie.app).
+      run                 Headless watch loop (launchd / servers).
+      test-record [secs]  Record N seconds (default 15) → full pipeline.
+      process <dir>       Re-run transcription+summary on a recording dir.
+      doctor              Check dependencies & permissions.
+      install-service     Headless background service via launchd.
+      uninstall-service   Remove the headless service.
+      help                Show this help.
+
+    Build the menu bar app:  ./scripts/build-app.sh
+    Config: \(Config.configPath)
+    """)
+}
+
+// MARK: - Entry
+
+let config = Config.load()
+config.writeExampleIfMissing()
+
+let args = Array(CommandLine.arguments.dropFirst())
+let command = args.first
+// Running inside a packaged .app bundle → default to the menu bar UI.
+let isAppBundle = Bundle.main.bundleIdentifier != nil
+    || Bundle.main.bundlePath.hasSuffix(".app")
+
+switch command {
+case "menubar":
+    launchMenuBar(config)
+case "run":
+    HeadlessRunner(config: config).run()
+case "test-record":
+    cmdTestRecord(config, seconds: Double(args.count > 1 ? args[1] : "") ?? 15)
+case "process":
+    guard args.count > 1 else { Log.error("Usage: ghostie process <dir>"); exit(1) }
+    cmdProcess(config, dir: args[1])
+case "doctor":
+    cmdDoctor(config)
+case "icon":
+    // Hidden: render the app icon PNG (used by scripts/build-app.sh).
+    let out = args.count > 1 ? args[1] : "icon.png"
+    exit(GhostIcon.writeAppIconPNG(to: out) ? 0 : 1)
+case "install-service":
+    cmdInstallService(config)
+case "uninstall-service":
+    cmdUninstallService()
+case "help", "-h", "--help":
+    printHelp()
+case nil:
+    // No arguments: menu bar app when bundled, otherwise headless.
+    if isAppBundle { launchMenuBar(config) } else { HeadlessRunner(config: config).run() }
+default:
+    Log.error("Unknown command: \(command ?? "")")
+    printHelp()
+    exit(1)
+}

@@ -1,0 +1,9 @@
+.build/
+build/
+.swiftpm/
+*.xcodeproj
+.DS_Store
+# never commit recordings, notes or secrets
+recordings/
+*.wav
+config.json

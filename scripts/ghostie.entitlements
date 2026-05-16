@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Microphone capture (ScreenCaptureKit .microphone tap). Screen
+         Recording is governed by TCC at runtime, not by an entitlement.
+         The app is intentionally NOT sandboxed: it is a local menu bar
+         utility distributed outside the App Store. -->
+    <key>com.apple.security.device.audio-input</key>
+    <true/>
+</dict>
+</plist>
