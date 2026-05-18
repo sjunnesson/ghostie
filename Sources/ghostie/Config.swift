@@ -110,8 +110,31 @@ struct Config: Codable {
         if let f = env["GHOSTIE_NOTES_FOLDER"], !f.isEmpty { cfg.notesFolder = f }
         if let m = env["GHOSTIE_WHISPER_MODEL"], !m.isEmpty { cfg.whisperModel = m }
         if let s = env["GHOSTIE_SUMMARY_MODEL"], !s.isEmpty { cfg.summaryModel = s }
-        if cfg.whisperBinary.isEmpty { cfg.whisperBinary = Config.findWhisperBinary() }
-        if cfg.claudeBinary.isEmpty { cfg.claudeBinary = Config.findClaudeBinary() }
+        // Whisper binary: a copy bundled in the .app (self-contained .dmg)
+        // always wins; then a still-valid explicit override; then detection.
+        // This also self-heals a config.json that pins a path which doesn't
+        // exist on this Mac (e.g. a Homebrew path on a fresh machine).
+        if let bundled = Config.bundledResource("whisper-cli"),
+           FileManager.default.isExecutableFile(atPath: bundled) {
+            cfg.whisperBinary = bundled
+        } else if cfg.whisperBinary.isEmpty
+               || !FileManager.default.isExecutableFile(atPath: cfg.whisperBinary) {
+            cfg.whisperBinary = Config.findWhisperBinary()
+        }
+        if cfg.claudeBinary.isEmpty
+           || !FileManager.default.isExecutableFile(atPath: cfg.claudeBinary) {
+            cfg.claudeBinary = Config.findClaudeBinary()
+        }
+        // Fall back to models bundled in the .app when the configured paths
+        // don't exist (fresh self-contained install with no Homebrew/setup).
+        if !FileManager.default.fileExists(atPath: cfg.whisperModel),
+           let m = Config.bundledResource("ggml-base.en.bin") {
+            cfg.whisperModel = m
+        }
+        if !FileManager.default.fileExists(atPath: cfg.vadModel),
+           let v = Config.bundledResource("ggml-silero-v5.1.2.bin") {
+            cfg.vadModel = v
+        }
         return cfg
     }
 
@@ -141,7 +164,20 @@ struct Config: Codable {
         return FileManager.default.isExecutableFile(atPath: path) ? path : ""
     }
 
+    /// A file shipped inside Ghostie.app/Contents/Resources (self-contained
+    /// `.dmg` build), or nil for a from-source build.
+    static func bundledResource(_ name: String) -> String? {
+        guard let res = Bundle.main.resourceURL else { return nil }
+        let p = res.appendingPathComponent(name).path
+        return FileManager.default.fileExists(atPath: p) ? p : nil
+    }
+
     static func findWhisperBinary() -> String {
+        // Prefer the binary bundled in the .app (notarized .dmg install).
+        if let bundled = bundledResource("whisper-cli"),
+           FileManager.default.isExecutableFile(atPath: bundled) {
+            return bundled
+        }
         let candidates = [
             "/opt/homebrew/bin/whisper-cli",
             "/usr/local/bin/whisper-cli",
@@ -162,7 +198,9 @@ struct Config: Codable {
         guard !FileManager.default.fileExists(atPath: Config.configPath) else { return }
         let enc = JSONEncoder()
         enc.outputFormatting = [.prettyPrinted, .sortedKeys]
-        if let data = try? enc.encode(self) {
+        // Write pristine defaults — never persist auto-detected binary paths,
+        // so resolution (incl. the bundled binary) re-runs on every machine.
+        if let data = try? enc.encode(Config()) {
             try? data.write(to: URL(fileURLWithPath: Config.configPath))
         }
     }

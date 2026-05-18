@@ -28,10 +28,36 @@ meeting** — automatically transcribes each call and writes a markdown summary
 The detect → record → process loop runs forever, so every call is captured
 automatically with zero interaction.
 
-## Menu bar app (recommended)
+## Install
 
-Ghostie runs as a **macOS menu bar app** — a 👻 ghost icon in the menu
-header, no Dock icon, always watching.
+### Option A — self-contained `.dmg` (no terminal on the target Mac)
+
+Build a distributable disk image once:
+
+```bash
+./scripts/build-app.sh --dmg              # → build/Ghostie.dmg
+./scripts/build-app.sh --dmg --notarize   # also notarized & stapled
+```
+
+`--dmg` bundles a statically-built `whisper-cli` **and** the speech model
+inside `Ghostie.app`, so the only requirement on the receiving Mac is
+**macOS 15+**. Copy `build/Ghostie.dmg` to the other Mac, open it, drag
+**Ghostie** to **Applications**, launch it. If you didn't notarize, the first
+launch is **right-click ▸ Open** (one time).
+
+> Summaries use *your* Claude Code login, which can't be bundled. Until you run
+> `claude` once on that Mac to sign in, calls still record + transcribe and are
+> held in the [backlog](#never-loses-a-call-backlog); summaries backfill
+> automatically once Claude Code is available. No Anthropic API key needed.
+
+Notarizing needs a one-time credential store on the build machine:
+
+```bash
+xcrun notarytool store-credentials ghostie-notary \
+  --apple-id <your-apple-id> --team-id 6V9RN6W28J --password <app-specific-pw>
+```
+
+### Option B — build from source
 
 ```bash
 ./scripts/setup.sh        # whisper.cpp + model + build
@@ -39,10 +65,14 @@ header, no Dock icon, always watching.
 open "/Applications/Ghostie.app"
 ```
 
-`build-app.sh` auto-detects your signing identity (it uses a **Developer ID
-Application** cert if present, so granted permissions persist across rebuilds).
-Add `--notarize` to also notarize & staple (one-time
-`xcrun notarytool store-credentials ghostie-notary …` first).
+`build-app.sh` auto-detects your signing identity (a **Developer ID
+Application** cert is used if present, so granted permissions persist across
+rebuilds; otherwise Apple Development or ad-hoc).
+
+## Menu bar app
+
+Ghostie runs as a **macOS menu bar app** — a 👻 ghost icon in the menu
+header, no Dock icon, always watching.
 
 The menu bar icon reflects state (watching · ● recording 02:13 · summarizing)
 and its menu gives quick access to everything:

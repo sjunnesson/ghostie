@@ -1,25 +1,36 @@
 #!/usr/bin/env bash
-# Builds Ghostie.app — a signed macOS menu bar app — and installs it.
+# Builds Ghostie.app and (optionally) a self-contained, notarizable .dmg.
 #
-#   ./scripts/build-app.sh              # build + sign (auto identity) + install
-#   ./scripts/build-app.sh --notarize   # also notarize & staple (Developer ID)
+#   ./scripts/build-app.sh                  # build + sign + install locally
+#   ./scripts/build-app.sh --dmg            # also bundle whisper+model and
+#                                           # produce build/Ghostie.dmg
+#   ./scripts/build-app.sh --dmg --notarize # notarize + staple the .dmg
 #
-# Signing identity is auto-detected:
-#   Developer ID Application  → hardened runtime, notarizable, permissions
-#                               persist across rebuilds  (best; needs your
-#                               Apple Developer account cert in the Keychain)
-#   Apple Development         → signed for local use
-#   (none)                    → ad-hoc signed (works; macOS may re-ask for
-#                               permissions after a rebuild)
+# --dmg makes the app self-contained: a statically-built whisper-cli and the
+# speech model are bundled inside Ghostie.app, so the target Mac needs nothing
+# but macOS 15+. (Summaries still use the user's own Claude Code login; until
+# they run `claude` once, calls transcribe and queue in the backlog.)
+#
+# Signing identity is auto-detected: Developer ID Application (notarizable,
+# permissions persist) → Apple Development → ad-hoc.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-NOTARIZE=0; [ "${1:-}" = "--notarize" ] && NOTARIZE=1
 APP_NAME="Ghostie"
 BUNDLE_ID="com.davidsjunnesson.ghostie"
 VERSION="1.0.0"
 BUILD_DIR="$ROOT/build"
 APP="$BUILD_DIR/$APP_NAME.app"
+WHISPER_TAG="v1.8.4"
+MODEL_CACHE="$HOME/.ghostie/models"
+
+NOTARIZE=0; SELFCONTAINED=0; MAKE_DMG=0
+for a in "$@"; do
+  case "$a" in
+    --notarize) NOTARIZE=1 ;;
+    --dmg)      SELFCONTAINED=1; MAKE_DMG=1 ;;
+  esac
+done
 
 echo "==> Building release binary"
 cd "$ROOT"
@@ -67,6 +78,42 @@ else
   echo "    icon generation skipped (app still works)"
 fi
 
+# ---- Self-contained: bundle a static whisper-cli + the model ----------------
+NESTED_BINS=()
+if [ "$SELFCONTAINED" = "1" ]; then
+  command -v cmake >/dev/null 2>&1 || brew install cmake
+  SRC="$HOME/.ghostie/cache/whisper.cpp"
+  if [ ! -d "$SRC" ]; then
+    echo "==> Cloning whisper.cpp $WHISPER_TAG"
+    git clone --depth 1 --branch "$WHISPER_TAG" \
+      https://github.com/ggerganov/whisper.cpp "$SRC"
+  fi
+  if [ ! -x "$SRC/build/bin/whisper-cli" ]; then
+    echo "==> Building static whisper-cli (Metal embedded)…"
+    cmake -S "$SRC" -B "$SRC/build" -DCMAKE_BUILD_TYPE=Release \
+      -DBUILD_SHARED_LIBS=OFF -DGGML_METAL_EMBED_LIBRARY=ON \
+      -DWHISPER_BUILD_EXAMPLES=ON -DWHISPER_BUILD_TESTS=OFF >/dev/null
+    cmake --build "$SRC/build" -j --config Release --target whisper-cli >/dev/null
+  fi
+  cp "$SRC/build/bin/whisper-cli" "$APP/Contents/Resources/whisper-cli"
+  echo "    bundled whisper-cli ($(otool -L "$APP/Contents/Resources/whisper-cli" | grep -c dylib) dynamic libs)"
+  NESTED_BINS+=("$APP/Contents/Resources/whisper-cli")
+
+  echo "==> Bundling speech model (ggml-base.en.bin)"
+  mkdir -p "$MODEL_CACHE"
+  if [ ! -f "$MODEL_CACHE/ggml-base.en.bin" ]; then
+    curl -fL --progress-bar \
+      "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin" \
+      -o "$MODEL_CACHE/ggml-base.en.bin"
+  fi
+  cp "$MODEL_CACHE/ggml-base.en.bin" "$APP/Contents/Resources/ggml-base.en.bin"
+  # Optional VAD model — only if it's already cached.
+  if [ -f "$MODEL_CACHE/ggml-silero-v5.1.2.bin" ]; then
+    cp "$MODEL_CACHE/ggml-silero-v5.1.2.bin" "$APP/Contents/Resources/"
+    echo "    bundled Silero VAD model"
+  fi
+fi
+
 # ---- Code signing -----------------------------------------------------------
 ids() { security find-identity -v -p codesigning 2>/dev/null; }
 hash_for() { ids | grep "$1" | head -1 | sed -E 's/^[[:space:]]*[0-9]+\)[[:space:]]+([0-9A-Fa-f]{40}).*/\1/'; }
@@ -76,25 +123,42 @@ APPLEDEV="$(hash_for 'Apple Development' || true)"
 ENT="$ROOT/scripts/ghostie.entitlements"
 
 if [ -n "$DEVID" ]; then
-  echo "==> Signing with Developer ID ($DEVID) + hardened runtime"
-  codesign --force --timestamp --options runtime \
-    --entitlements "$ENT" --sign "$DEVID" "$APP"
-  SIGNED="devid"
+  IDENTITY="$DEVID"; SIGNED="devid"
+  SIGN_OPTS=(--force --timestamp --options runtime)
 elif [ -n "$APPLEDEV" ]; then
-  echo "==> Signing with Apple Development ($APPLEDEV)"
-  codesign --force --entitlements "$ENT" --sign "$APPLEDEV" "$APP"
-  SIGNED="appledev"
+  IDENTITY="$APPLEDEV"; SIGNED="appledev"
+  SIGN_OPTS=(--force)
 else
+  IDENTITY="-"; SIGNED="adhoc"
+  SIGN_OPTS=(--force)
   echo "==> No Developer identity found — ad-hoc signing"
-  echo "    (works for personal use; macOS may re-ask for permissions after a rebuild."
-  echo "     For persistence, create a 'Developer ID Application' cert with your"
-  echo "     Apple Developer account in Xcode ▸ Settings ▸ Accounts.)"
-  codesign --force --entitlements "$ENT" --sign - "$APP"
-  SIGNED="adhoc"
 fi
-codesign --verify --strict "$APP" && echo "    signature verified"
 
-# ---- Notarization (optional, Developer ID only) -----------------------------
+# Sign nested executables first (whisper-cli), then seal the app.
+for b in "${NESTED_BINS[@]:-}"; do
+  [ -n "$b" ] || continue
+  echo "==> Signing nested $(basename "$b")"
+  codesign "${SIGN_OPTS[@]}" --sign "$IDENTITY" "$b"
+done
+echo "==> Signing $APP_NAME.app ($SIGNED)"
+codesign "${SIGN_OPTS[@]}" --entitlements "$ENT" --sign "$IDENTITY" "$APP"
+codesign --verify --deep --strict "$APP" && echo "    signature verified"
+
+# ---- DMG --------------------------------------------------------------------
+DMG="$BUILD_DIR/$APP_NAME.dmg"
+if [ "$MAKE_DMG" = "1" ]; then
+  echo "==> Creating $APP_NAME.dmg"
+  STAGE="$BUILD_DIR/dmg-stage"
+  rm -rf "$STAGE" "$DMG"; mkdir -p "$STAGE"
+  ditto "$APP" "$STAGE/$APP_NAME.app"
+  ln -s /Applications "$STAGE/Applications"
+  hdiutil create -volname "$APP_NAME" -srcfolder "$STAGE" \
+    -ov -format UDZO "$DMG" >/dev/null
+  [ "$SIGNED" = "devid" ] && codesign --force --sign "$DEVID" "$DMG"
+  echo "    $DMG ($(du -h "$DMG" | cut -f1))"
+fi
+
+# ---- Notarization -----------------------------------------------------------
 if [ "$NOTARIZE" = "1" ]; then
   if [ "$SIGNED" != "devid" ]; then
     echo "!! --notarize needs a Developer ID Application certificate. Skipping."
@@ -102,16 +166,17 @@ if [ "$NOTARIZE" = "1" ]; then
     PROFILE="${NOTARY_PROFILE:-ghostie-notary}"
     echo "==> Notarizing (keychain profile: $PROFILE)"
     echo "    One-time setup if needed:"
-    echo "    xcrun notarytool store-credentials $PROFILE --apple-id <id> --team-id <team> --password <app-specific-pw>"
-    ZIP="$BUILD_DIR/$APP_NAME.zip"
-    ditto -c -k --keepParent "$APP" "$ZIP"
-    xcrun notarytool submit "$ZIP" --keychain-profile "$PROFILE" --wait
-    xcrun stapler staple "$APP"
+    echo "    xcrun notarytool store-credentials $PROFILE --apple-id <id> --team-id 6V9RN6W28J --password <app-specific-pw>"
+    TARGET="$DMG"
+    [ "$MAKE_DMG" = "1" ] || { TARGET="$BUILD_DIR/$APP_NAME.zip"; ditto -c -k --keepParent "$APP" "$TARGET"; }
+    xcrun notarytool submit "$TARGET" --keychain-profile "$PROFILE" --wait
+    xcrun stapler staple "$TARGET"
+    [ "$MAKE_DMG" = "1" ] || xcrun stapler staple "$APP"
     echo "    notarized & stapled"
   fi
 fi
 
-# ---- Install ----------------------------------------------------------------
+# ---- Install locally --------------------------------------------------------
 DEST="/Applications"
 [ -w "$DEST" ] || DEST="$HOME/Applications"
 mkdir -p "$DEST"
@@ -120,9 +185,12 @@ ditto "$APP" "$DEST/$APP_NAME.app"
 
 echo
 echo "==> Installed: $DEST/$APP_NAME.app"
+[ "$MAKE_DMG" = "1" ] && echo "==> Distributable: $DMG"
 echo
-echo "Launch it:   open \"$DEST/$APP_NAME.app\""
-echo "It appears as a 👻 ghost icon in your menu bar (no Dock icon)."
-echo "First Teams call → macOS asks for Screen Recording + Microphone."
-echo "Grant both to \"$APP_NAME\" in System Settings ▸ Privacy & Security."
-echo "Use the menu's \"Start at Login\" to keep it always on."
+if [ "$MAKE_DMG" = "1" ]; then
+  echo "Share Ghostie.dmg → on the other Mac: open it, drag Ghostie to"
+  echo "Applications, launch it. Transcription is fully bundled (no setup)."
+  [ "$NOTARIZE" = "1" ] || echo "Not notarized: first open via right-click ▸ Open (or run --notarize)."
+fi
+echo "Menu-bar 👻 icon, no Dock icon. First Teams call → grant Screen"
+echo "Recording + Microphone in System Settings ▸ Privacy & Security."
