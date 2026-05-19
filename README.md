@@ -65,9 +65,10 @@ xcrun notarytool store-credentials ghostie-notary \
 open "/Applications/Ghostie.app"
 ```
 
-`build-app.sh` auto-detects your signing identity (a **Developer ID
-Application** cert is used if present, so granted permissions persist across
-rebuilds; otherwise Apple Development or ad-hoc).
+`build-app.sh` auto-detects your signing identity in order: **Developer ID
+Application** → **Apple Development** → a stable **self-signed** identity
+(`Ghostie Self-Signed`, see [below](#permissions-keep-re-prompting-on-every-rebuild))
+→ **ad-hoc**. Anything but ad-hoc keeps granted permissions across rebuilds.
 
 ## Menu bar app
 
@@ -89,8 +90,31 @@ and its menu gives quick access to everything:
 - **Quit** (finishes any in-progress summary first)
 
 On the **first call** macOS prompts for **Screen Recording** and **Microphone**
-for *Ghostie*. Grant both in *System Settings ▸ Privacy & Security*. Because
-the app is signed with a stable Developer ID, this is a one-time step.
+for *Ghostie*. Grant both in *System Settings ▸ Privacy & Security*. With a
+stable signing identity this is a one-time step.
+
+### Permissions keep re-prompting on every rebuild
+
+macOS ties the Microphone / Screen-Recording grant to the app's **code-signing
+identity**. Without an Apple Developer account `build-app.sh` falls back to
+**ad-hoc** signing, which has no stable identity — TCC then keys the grant to
+the binary's exact hash, so *every rebuild looks like a new app* and macOS
+asks again. (Check with `codesign -dvvv /Applications/Ghostie.app` — `Signature=adhoc`.)
+
+Fix it once with a stable **self-signed** identity (no Apple account, no sudo):
+
+```bash
+./scripts/make-signing-cert.sh          # creates "Ghostie Self-Signed" (1 password prompt)
+./scripts/build-app.sh --reset-perms    # rebuild signed with it + clear stale grants
+# launch Ghostie, approve Microphone + Screen Recording ONCE — it now sticks
+```
+
+`build-app.sh` auto-detects the `Ghostie Self-Signed` identity (or any name in
+`GHOSTIE_SIGN_IDENTITY`) and prefers it over ad-hoc. If the scripted cert
+misbehaves, create it via the GUI instead — **Keychain Access ▸ Certificate
+Assistant ▸ Create a Certificate**, name `Ghostie Self-Signed`, Identity Type
+*Self Signed Root*, Certificate Type **Code Signing** — then rerun
+`build-app.sh --reset-perms`.
 
 ## CLI (headless / servers)
 
@@ -147,10 +171,14 @@ Tracks are smoothed independently, then cross-track refined — when the other
 speaker just switched to Swedish, your next ambiguous segment is nudged toward
 Swedish too (past-only, so it respects who spoke when).
 
-```bash
-# fetch both models (~2 GB) + the VAD model:
-./scripts/setup.sh --codeswitch --kb-variant standard   # standard | strict
-```
+Get the models (~2 GB) either way:
+
+- **From Settings** (no terminal — best for the `.dmg`): *Settings ▸
+  Code-switching ▸ Download models*. Shows progress, skips anything already
+  present, and points the config at what it fetched.
+- **From the CLI**: `ghostie fetch-models standard` (same downloader), or the
+  build script `./scripts/setup.sh --codeswitch --kb-variant standard`
+  (`standard | strict`).
 
 `standard` (the default Stage-2 model, best for notes) and `strict` (verbatim,
 keeps filler) have prebuilt whisper.cpp GGMLs upstream. `subtitle` is published
