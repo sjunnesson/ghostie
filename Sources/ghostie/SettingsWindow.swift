@@ -22,6 +22,20 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
     private let claudeField = NSTextField()
     private let summaryBox = NSComboBox()
 
+    // Code-switching (sv ↔ en).
+    private let csEnable = NSButton(checkboxWithTitle: "Enable code-switching (Swedish ↔ English, dual model)", target: nil, action: nil)
+    private let csLanguages = NSTextField()
+    private let csDominant = NSComboBox()
+    private let csSvModel = NSTextField()
+    private let csEnModel = NSTextField()
+    private let csVariant = NSComboBox()
+    private let csPromptSv = NSTextField()
+    private let csPromptEn = NSTextField()
+    private let csPriorStrength = NSTextField()
+    private let csMinSwitch = NSTextField()
+    private let csWindowMe = NSTextField()
+    private let csWindowPart = NSTextField()
+
     init(onSave: @escaping (Config) -> Void) {
         self.onSave = onSave
         super.init()
@@ -39,7 +53,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         let content = buildForm(cfg)
 
         let win = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 640, height: 540),
+            contentRect: NSRect(x: 0, y: 0, width: 640, height: 620),
             styleMask: [.titled, .closable, .miniaturizable],
             backing: .buffered, defer: false)
         win.title = "Ghostie Settings"
@@ -83,7 +97,28 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
             ? Config.findClaudeBinary() : cfg.claudeBinary
         claudeField.placeholderString = "auto-detected"
 
-        for f in [notesField, endGrace, minCall, whisperModelField, vadField, claudeField] {
+        // ---- Code-switching ---------------------------------------------
+        let csc = cfg.codeSwitch
+        csEnable.state = csc.enabled ? .on : .off
+        csLanguages.stringValue = csc.languages.joined(separator: ", ")
+        csDominant.addItems(withObjectValues: ["en", "sv"])
+        csDominant.stringValue = csc.dominantLanguage
+        csDominant.completes = true
+        csSvModel.stringValue = csc.modelPerLanguage["sv"] ?? "kb-whisper-large"
+        csEnModel.stringValue = csc.modelPerLanguage["en"] ?? "whisper-large-v3"
+        csVariant.addItems(withObjectValues: ["standard", "subtitle", "strict"])
+        csVariant.stringValue = csc.kbWhisperVariant
+        csVariant.completes = true
+        csPromptSv.stringValue = csc.promptSv
+        csPromptEn.stringValue = csc.promptEn
+        csPriorStrength.stringValue = String(csc.crossTrackPriorStrength)
+        csMinSwitch.stringValue = String(csc.minSwitchSegments)
+        csWindowMe.stringValue = String(csc.smoothingWindowMe)
+        csWindowPart.stringValue = String(csc.smoothingWindowParticipants)
+
+        for f in [notesField, endGrace, minCall, whisperModelField, vadField, claudeField,
+                  csLanguages, csSvModel, csEnModel, csPromptSv, csPromptEn,
+                  csPriorStrength, csMinSwitch, csWindowMe, csWindowPart] {
             f.translatesAutoresizingMaskIntoConstraints = false
             f.controlSize = .regular
             f.usesSingleLineMode = true
@@ -100,6 +135,9 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         }
         endGrace.alignment = .right
         minCall.alignment = .right
+        for f in [csPriorStrength, csMinSwitch, csWindowMe, csWindowPart] {
+            f.alignment = .right
+        }
 
         // ---- Tabs --------------------------------------------------------
         let tabs = NSTabView()
@@ -124,6 +162,26 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
                   promptBox(cfg.initialPrompt)),
             field("Silero VAD model", pathControl(vadField, chooseDir: false)),
             caption("VAD is optional. Run  ./scripts/setup.sh --vad  to fetch it; Ghostie auto-uses it when present.")
+        ]))
+        tabs.addTabViewItem(tab("Code-switching", [
+            csEnable,
+            caption("For calls that mix Swedish and English. Each speech run is decoded by the best model for its language: KB-Whisper for Swedish, whisper-large-v3 for English. Fetch both with  ./scripts/setup.sh --codeswitch --kb-variant standard."),
+            field("Languages (comma-separated; first two are used)",
+                  leftWrap(sized(csLanguages, 160))),
+            field("Dominant language (tiebreaker)", leftWrap(sized(csDominant, 120))),
+            field("Swedish model", leftWrap(sized(csSvModel, 260))),
+            field("English model", leftWrap(sized(csEnModel, 260))),
+            field("Swedish transcription style", leftWrap(sized(csVariant, 160))),
+            caption("standard = balanced (best for notes) · subtitle = condensed · strict = verbatim, keeps filler."),
+            field("Swedish prompt", csPromptSv),
+            field("English prompt", csPromptEn),
+            field("Cross-track prior strength (0.5 disables · 1.0 absolute)",
+                  leftWrap(sized(csPriorStrength, 70))),
+            field("Min consecutive segments to switch language",
+                  leftWrap(sized(csMinSwitch, 70))),
+            field("Smoothing window — Me / Participants",
+                  leftWrap(pair(csWindowMe, csWindowPart))),
+            caption("Other advanced knobs (fill gap, run/silence padding, min detect ms, prior lookback) are in config.json.")
         ]))
         tabs.addTabViewItem(tab("Summary", [
             field("Claude CLI", pathControl(claudeField, chooseDir: false)),
@@ -264,6 +322,20 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         v.widthAnchor.constraint(equalToConstant: w).isActive = true
         return v
     }
+    /// Two small numeric fields side by side with a "/" between them.
+    private func pair(_ a: NSTextField, _ b: NSTextField) -> NSView {
+        for f in [a, b] {
+            f.translatesAutoresizingMaskIntoConstraints = false
+            f.widthAnchor.constraint(equalToConstant: 60).isActive = true
+        }
+        let slash = NSTextField(labelWithString: "/")
+        slash.textColor = .secondaryLabelColor
+        let h = NSStackView(views: [a, slash, b])
+        h.orientation = .horizontal
+        h.spacing = 8
+        h.alignment = .firstBaseline
+        return h
+    }
     private func suffixed(_ field: NSTextField, _ suffix: String, width: CGFloat) -> NSView {
         field.translatesAutoresizingMaskIntoConstraints = false
         field.widthAnchor.constraint(equalToConstant: width).isActive = true
@@ -371,6 +443,25 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         cfg.vadModel = vadField.stringValue.trimmingCharacters(in: .whitespaces)
         cfg.summaryModel = summaryBox.stringValue.trimmingCharacters(in: .whitespaces)
         cfg.claudeBinary = claudeField.stringValue.trimmingCharacters(in: .whitespaces)
+
+        // Code-switching (start from loadRaw so advanced keys are preserved).
+        cfg.codeSwitch.enabled = csEnable.state == .on
+        let langs = csLanguages.stringValue
+            .split(whereSeparator: { $0 == "," || $0 == " " })
+            .map { $0.lowercased() }.filter { !$0.isEmpty }
+        if langs.count >= 2 { cfg.codeSwitch.languages = langs }
+        cfg.codeSwitch.dominantLanguage = csDominant.stringValue.trimmingCharacters(in: .whitespaces)
+        cfg.codeSwitch.modelPerLanguage["sv"] = csSvModel.stringValue.trimmingCharacters(in: .whitespaces)
+        cfg.codeSwitch.modelPerLanguage["en"] = csEnModel.stringValue.trimmingCharacters(in: .whitespaces)
+        cfg.codeSwitch.kbWhisperVariant = csVariant.stringValue.trimmingCharacters(in: .whitespaces)
+        cfg.codeSwitch.promptSv = csPromptSv.stringValue
+        cfg.codeSwitch.promptEn = csPromptEn.stringValue
+        if let v = Double(csPriorStrength.stringValue) {
+            cfg.codeSwitch.crossTrackPriorStrength = min(1.0, max(0.5, v))
+        }
+        if let v = Int(csMinSwitch.stringValue) { cfg.codeSwitch.minSwitchSegments = max(1, v) }
+        if let v = Int(csWindowMe.stringValue) { cfg.codeSwitch.smoothingWindowMe = max(1, v) }
+        if let v = Int(csWindowPart.stringValue) { cfg.codeSwitch.smoothingWindowParticipants = max(1, v) }
 
         if cfg.save() {
             onSave(Config.load())

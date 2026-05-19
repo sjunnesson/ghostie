@@ -16,6 +16,26 @@
   "vadModel": "/Users/YOU/.ghostie/models/ggml-silero-v5.1.2.bin",
   "cleanTranscript": true,
 
+  "codeSwitch": {
+    "enabled": false,
+    "languages": ["sv", "en"],
+    "dominantLanguage": "en",
+    "modelPerLanguage": { "sv": "kb-whisper-large", "en": "whisper-large-v3" },
+    "kbWhisperVariant": "standard",
+    "smoothingWindowMe": 4,
+    "smoothingWindowParticipants": 4,
+    "minSwitchSegments": 2,
+    "minSwitchMs": 2500,
+    "maxFillGapMs": 4000,
+    "runPaddingMs": 200,
+    "silencePadMs": 500,
+    "minDetectMs": 1500,
+    "crossTrackPriorStrength": 0.75,
+    "priorLookbackMs": 8000,
+    "promptSv": "Affärssamtal på svenska. Termer: Ingka, Xplore, IKEA, IFB.",
+    "promptEn": "Business call in English. Terms: Ingka, Xplore, IKEA, IFB, MCP, ACP."
+  },
+
   "summaryModel": "claude-sonnet-4-6",
   "claudeBinary": "",
 

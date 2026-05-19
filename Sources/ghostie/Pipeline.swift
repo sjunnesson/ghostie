@@ -174,12 +174,13 @@ struct Pipeline {
 
     // MARK: Shared steps
 
-    /// Transcribe both tracks, clean per track, merge by timestamp.
+    /// Transcribe both tracks, clean per track, merge by timestamp. When
+    /// code-switching is enabled the dual-model pipeline replaces the single
+    /// whisper pass; per-track cleaning + the timestamp merge are unchanged so
+    /// the cleaner and summary see the same shape either way.
     private func transcribeMerge(mic: URL, sys: URL) throws -> [Line] {
-        let transcriber = Transcriber(config: config)
         var lines: [Line] = []
-        func collect(_ wav: URL, _ speaker: String) throws {
-            let raw = try transcriber.transcribe(wav, speaker: speaker)
+        func collect(_ raw: [Transcriber.Segment], _ speaker: String) {
             let segments: [(startMs: Int, text: String)]
             if config.cleanTranscript {
                 let (cleaned, stats) = TranscriptCleaner.clean(
@@ -193,8 +194,18 @@ struct Pipeline {
                 lines.append(Line(startMs: s.startMs, speaker: speaker, text: s.text))
             }
         }
-        try collect(mic, "Me")
-        try collect(sys, "Participants")
+
+        if config.codeSwitch.enabled {
+            Log.info("Code-switching transcription enabled (sv↔en, dual-model).")
+            let cst = CodeSwitchTranscriber(config: config)
+            let (meSegs, partSegs) = try cst.transcribeBoth(me: mic, participants: sys)
+            collect(meSegs, "Me")
+            collect(partSegs, "Participants")
+        } else {
+            let transcriber = Transcriber(config: config)
+            collect(try transcriber.transcribe(mic, speaker: "Me"), "Me")
+            collect(try transcriber.transcribe(sys, speaker: "Participants"), "Participants")
+        }
         return lines.sorted { $0.startMs < $1.startMs }
     }
 

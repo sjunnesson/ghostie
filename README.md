@@ -130,7 +130,42 @@ layer behind the *minutes* project):
   hallucination.
 
 `ghostie selftest` runs the guard over representative hallucination patterns
-and asserts clean speech is left untouched.
+and asserts clean speech is left untouched, **and** runs the code-switching
+smoother regression suite (below).
+
+## Code-switching (Swedish ↔ English)
+
+Whisper locks one language from the first ~30 s and applies it to the whole
+file. Calls that mix Swedish and English (Nordic 1:1s, side conversations,
+code-switched terms) get the minority language mistranslated or hallucinated.
+
+Enable **code-switching** and Ghostie instead segments each track with VAD,
+detects the language of every segment (encoder only — no decode), smooths the
+detections into language-consistent runs, and decodes each run with the *right*
+model: **KB-Whisper-large** for Swedish, **whisper-large-v3** for English.
+Tracks are smoothed independently, then cross-track refined — when the other
+speaker just switched to Swedish, your next ambiguous segment is nudged toward
+Swedish too (past-only, so it respects who spoke when).
+
+```bash
+# fetch both models (~2 GB) + the VAD model:
+./scripts/setup.sh --codeswitch --kb-variant standard   # standard | strict
+```
+
+`standard` (the default Stage-2 model, best for notes) and `strict` (verbatim,
+keeps filler) have prebuilt whisper.cpp GGMLs upstream. `subtitle` is published
+HF-format only — pick `standard`/`strict`, or convert the `subtitle` revision
+yourself and point `codeSwitch.modelPerLanguage.sv` at the file.
+
+Then turn it on in **Settings ▸ Code-switching** (or set
+`codeSwitch.enabled: true` in `config.json`). It applies on the next call with
+no restart, exactly like every other setting. When disabled, nothing changes —
+the single-model path is used. Everything still runs **100% locally**; the
+models just live in `~/.ghostie/models/` and are larger.
+
+`ghostie selftest` exercises the smoother (single-language collapse, mixed
+3-run split, cross-track flip vs. isolated fall-back) with synthetic
+detections — no audio or models required, so it stays green everywhere.
 
 ## Never loses a call (backlog)
 
@@ -166,6 +201,11 @@ Edit `~/.ghostie/config.json` (created on first run). Notable keys:
 | `vadModel` | `…/ggml-silero-v5.1.2.bin` | Auto-used if present (`setup.sh --vad`) |
 | `summaryModel` | `claude-sonnet-4-6` | Model for `claude -p` (alias or full id) |
 | `claudeBinary` | _(auto-detected)_ | Path to the `claude` CLI |
+| `codeSwitch.enabled` | `false` | Per-segment dual-model sv↔en pipeline |
+| `codeSwitch.kbWhisperVariant` | `standard` | Swedish style: `standard`/`subtitle`/`strict` |
+| `codeSwitch.dominantLanguage` | `en` | Tiebreaker for ambiguous segments |
+| `codeSwitch.crossTrackPriorStrength` | `0.75` | `0.5` disables cross-track refine; `1.0` absolute |
+| `codeSwitch.minSwitchMs` | `2500` | A run this long switches language even if VAD made it one segment |
 
 Environment overrides: `GHOSTIE_NOTES_FOLDER`, `GHOSTIE_WHISPER_MODEL`,
 `GHOSTIE_SUMMARY_MODEL`.

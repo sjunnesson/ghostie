@@ -61,6 +61,13 @@ struct Config: Codable {
     /// markers, training-data-leak phrases). Strongly recommended.
     var cleanTranscript: Bool = true
 
+    // MARK: Code-switching (sv ↔ en — see code-switching.md)
+
+    /// Per-segment, per-language transcription for mixed-language calls.
+    /// When `enabled` is false the single-language path above is used and
+    /// nothing changes.
+    var codeSwitch: CodeSwitchConfig = CodeSwitchConfig()
+
     // MARK: Summarization (via the Claude Code CLI — no API key needed)
 
     /// Model passed to `claude -p --model`. An alias ("sonnet", "opus",
@@ -75,6 +82,53 @@ struct Config: Codable {
 
     /// Working directory for in-progress recordings.
     var workDir: String = "\(NSHomeDirectory())/.ghostie/recordings"
+
+    // MARK: Codable
+    //
+    // Swift's *synthesized* Decodable throws `keyNotFound` for any absent key
+    // (property defaults are NOT consulted). With `loadRaw()`'s `try?` that
+    // would silently reset the ENTIRE config to defaults the moment one new
+    // key is added to a user's existing config.json. So decode every key with
+    // `decodeIfPresent`, falling back to the default value — old configs (and
+    // partial ones) load cleanly and only the missing keys take defaults.
+    // Encoding stays synthesized via these CodingKeys (Settings writes all).
+
+    init() {}
+
+    enum CodingKeys: String, CodingKey {
+        case notesFolder, keepAudio, saveTranscript, triggerBundlePrefixes
+        case requireTriggerApp, pollIntervalSeconds, endGraceSeconds, minCallSeconds
+        case whisperBinary, whisperModel, language, initialPrompt, vadModel
+        case cleanTranscript, codeSwitch, summaryModel, claudeBinary, workDir
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let d = Config()
+        func g<T: Decodable>(_ k: CodingKeys, _ fallback: T) -> T {
+            do { if let v = try c.decodeIfPresent(T.self, forKey: k) { return v } }
+            catch {}
+            return fallback
+        }
+        notesFolder = g(.notesFolder, d.notesFolder)
+        keepAudio = g(.keepAudio, d.keepAudio)
+        saveTranscript = g(.saveTranscript, d.saveTranscript)
+        triggerBundlePrefixes = g(.triggerBundlePrefixes, d.triggerBundlePrefixes)
+        requireTriggerApp = g(.requireTriggerApp, d.requireTriggerApp)
+        pollIntervalSeconds = g(.pollIntervalSeconds, d.pollIntervalSeconds)
+        endGraceSeconds = g(.endGraceSeconds, d.endGraceSeconds)
+        minCallSeconds = g(.minCallSeconds, d.minCallSeconds)
+        whisperBinary = g(.whisperBinary, d.whisperBinary)
+        whisperModel = g(.whisperModel, d.whisperModel)
+        language = g(.language, d.language)
+        initialPrompt = g(.initialPrompt, d.initialPrompt)
+        vadModel = g(.vadModel, d.vadModel)
+        cleanTranscript = g(.cleanTranscript, d.cleanTranscript)
+        codeSwitch = g(.codeSwitch, d.codeSwitch)
+        summaryModel = g(.summaryModel, d.summaryModel)
+        claudeBinary = g(.claudeBinary, d.claudeBinary)
+        workDir = g(.workDir, d.workDir)
+    }
 
     // MARK: Loading
 
@@ -192,6 +246,9 @@ struct Config: Codable {
         return ""
     }
 
+    /// Models directory shared by setup.sh and the code-switching resolver.
+    static var modelsDir: String { "\(NSHomeDirectory())/.ghostie/models" }
+
     func writeExampleIfMissing() {
         let dir = (Config.configPath as NSString).deletingLastPathComponent
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
@@ -203,5 +260,124 @@ struct Config: Codable {
         if let data = try? enc.encode(Config()) {
             try? data.write(to: URL(fileURLWithPath: Config.configPath))
         }
+    }
+}
+
+/// Tunables for the Swedish↔English code-switching pipeline. Every field has a
+/// safe default so an existing config.json (which has no `codeSwitch` key)
+/// decodes unchanged — Swift's synthesized Decodable falls back to the default
+/// when a key is absent, the same pattern the rest of Config relies on.
+struct CodeSwitchConfig: Codable {
+    /// When false the single-language transcribe path is used and nothing
+    /// about the pipeline changes.
+    var enabled: Bool = false
+
+    /// Labels the smoother is allowed to emit. Nordic look-alikes (`no`, `da`)
+    /// detected on short Swedish audio are mapped to `sv` (see Smoother).
+    var languages: [String] = ["sv", "en"]
+
+    /// Tiebreaker when neither the local detection nor the cross-track prior
+    /// is decisive.
+    var dominantLanguage: String = "en"
+
+    /// Logical model per language. Resolved to a GGML path by `modelPath(for:)`.
+    /// Point both at the same value for a disk-constrained single-model setup.
+    var modelPerLanguage: [String: String] = [
+        "sv": "kb-whisper-large",
+        "en": "whisper-large-v3"
+    ]
+
+    /// KB-Whisper Stage-2 variant used for Swedish: standard | subtitle | strict.
+    var kbWhisperVariant: String = "standard"
+
+    var smoothingWindowMe: Int = 4
+    var smoothingWindowParticipants: Int = 4
+    var minSwitchSegments: Int = 2
+
+    /// A run of the opposite language switches the timeline if it spans either
+    /// `minSwitchSegments` segments *or* this many milliseconds. The duration
+    /// floor catches a genuine long switch that VAD happened to return as one
+    /// segment (a real loanword is short in time, so it still won't switch).
+    var minSwitchMs: Int = 2500
+    var maxFillGapMs: Int = 4000
+    var runPaddingMs: Int = 200
+    var silencePadMs: Int = 500
+    var minDetectMs: Int = 1500
+
+    /// 0.5 disables cross-track refinement (Pass 2 becomes a no-op); 1.0 makes
+    /// the other track's recent language absolute. 0.75 flips ambiguous
+    /// segments without overruling a confident local detection.
+    var crossTrackPriorStrength: Double = 0.75
+    var priorLookbackMs: Int = 8000
+
+    var promptSv: String = "Affärssamtal på svenska. Termer: Ingka, Xplore, IKEA, IFB."
+    var promptEn: String = "Business call in English. Terms: Ingka, Xplore, IKEA, IFB, MCP, ACP."
+
+    // Same missing-key resilience as Config: a partial `codeSwitch` object
+    // (e.g. just `{"enabled": true}`) decodes, with the rest taking defaults.
+    init() {}
+
+    enum CodingKeys: String, CodingKey {
+        case enabled, languages, dominantLanguage, modelPerLanguage, kbWhisperVariant
+        case smoothingWindowMe, smoothingWindowParticipants, minSwitchSegments
+        case minSwitchMs, maxFillGapMs, runPaddingMs, silencePadMs, minDetectMs
+        case crossTrackPriorStrength, priorLookbackMs, promptSv, promptEn
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let d = CodeSwitchConfig()
+        func g<T: Decodable>(_ k: CodingKeys, _ fallback: T) -> T {
+            do { if let v = try c.decodeIfPresent(T.self, forKey: k) { return v } }
+            catch {}
+            return fallback
+        }
+        enabled = g(.enabled, d.enabled)
+        languages = g(.languages, d.languages)
+        dominantLanguage = g(.dominantLanguage, d.dominantLanguage)
+        modelPerLanguage = g(.modelPerLanguage, d.modelPerLanguage)
+        kbWhisperVariant = g(.kbWhisperVariant, d.kbWhisperVariant)
+        smoothingWindowMe = g(.smoothingWindowMe, d.smoothingWindowMe)
+        smoothingWindowParticipants = g(.smoothingWindowParticipants, d.smoothingWindowParticipants)
+        minSwitchSegments = g(.minSwitchSegments, d.minSwitchSegments)
+        minSwitchMs = g(.minSwitchMs, d.minSwitchMs)
+        maxFillGapMs = g(.maxFillGapMs, d.maxFillGapMs)
+        runPaddingMs = g(.runPaddingMs, d.runPaddingMs)
+        silencePadMs = g(.silencePadMs, d.silencePadMs)
+        minDetectMs = g(.minDetectMs, d.minDetectMs)
+        crossTrackPriorStrength = g(.crossTrackPriorStrength, d.crossTrackPriorStrength)
+        priorLookbackMs = g(.priorLookbackMs, d.priorLookbackMs)
+        promptSv = g(.promptSv, d.promptSv)
+        promptEn = g(.promptEn, d.promptEn)
+    }
+
+    /// Resolve the logical model name for `lang` to a GGML file path.
+    /// An absolute path is used verbatim (advanced users); the well-known
+    /// names map to setup.sh's on-disk filenames; a bare ggml name resolves
+    /// under `~/.ghostie/models/`.
+    func modelPath(for lang: String) -> String {
+        let raw = (modelPerLanguage[lang] ?? "").trimmingCharacters(in: .whitespaces)
+        if raw.hasPrefix("/") { return raw }
+        let dir = Config.modelsDir
+        switch raw {
+        case "kb-whisper-large":
+            return "\(dir)/ggml-kb-whisper-large-\(kbWhisperVariant)-q5_0.bin"
+        case "whisper-large-v3":
+            return "\(dir)/ggml-large-v3-q5_0.bin"
+        case "":
+            return ""
+        default:
+            return raw.hasSuffix(".bin") ? "\(dir)/\(raw)" : "\(dir)/ggml-\(raw).bin"
+        }
+    }
+
+    /// The model-fine-tuned prompt for `lang` (KB-Whisper expects Swedish).
+    func prompt(for lang: String) -> String {
+        lang == "sv" ? promptSv : promptEn
+    }
+
+    /// Distinct GGML model paths actually needed, for doctor / preflight.
+    var requiredModelPaths: [(lang: String, path: String)] {
+        languages.map { ($0, modelPath(for: $0)) }
     }
 }
