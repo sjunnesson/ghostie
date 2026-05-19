@@ -57,7 +57,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         let content = buildForm(cfg)
 
         let win = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 640, height: 700),
+            contentRect: NSRect(x: 0, y: 0, width: 640, height: 600),
             styleMask: [.titled, .closable, .miniaturizable],
             backing: .buffered, defer: false)
         win.title = "Ghostie Settings"
@@ -135,7 +135,8 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         }
         // Long paths start flush-left like every other control; the truncated
         // tail is shown with the full path available on hover.
-        for f in [notesField, whisperModelField, vadField, claudeField] {
+        for f in [notesField, whisperModelField, vadField, claudeField,
+                  csSvModel, csEnModel] {
             f.toolTip = f.stringValue
         }
         endGrace.alignment = .right
@@ -159,29 +160,39 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
             field("Ignore calls shorter than", leftWrap(suffixed(minCall, "seconds", width: 70))),
             caption("A call is detected from microphone use; it ends after the mic is idle for the grace period.")
         ]))
-        tabs.addTabViewItem(tab("Transcription", [
-            field("Whisper model", pathControl(whisperModelField, chooseDir: false)),
-            field("Language", leftWrap(sized(languageBox, 120))),
-            cleanTranscript,
-            field("Initial prompt (biases whisper toward clean, punctuated speech)",
-                  promptBox(cfg.initialPrompt)),
-            field("Silero VAD model", pathControl(vadField, chooseDir: false)),
-            caption("VAD is optional. Run  ./scripts/setup.sh --vad  to fetch it; Ghostie auto-uses it when present.")
-        ]))
         csDownloadStatus.font = .systemFont(ofSize: 11)
         csDownloadStatus.textColor = .secondaryLabelColor
         csDownloadBtn.bezelStyle = .rounded
         csDownloadBtn.target = self
         csDownloadBtn.action = #selector(downloadModels)
 
-        tabs.addTabViewItem(tab("Code-switching", [
+        // One tab. Single-language and code-switching are mutually exclusive
+        // (code-switching replaces the single-language pass when enabled), so
+        // they live together under clearly grouped headers; the two settings
+        // that apply to *both* modes are pulled out on top so they aren't
+        // hidden from code-switching users.
+        tabs.addTabViewItem(tab("Transcription", [
+            section("Applies to every transcription"),
+            cleanTranscript,
+            field("Silero VAD model", pathControl(vadField, chooseDir: false)),
+            caption("Required for code-switching; recommended otherwise (biggest reducer of silence hallucinations). ./scripts/setup.sh --vad fetches it."),
+
+            section("Single-language mode"),
+            caption("Used when code-switching (below) is OFF — one model for the whole call."),
+            field("Whisper model", pathControl(whisperModelField, chooseDir: false)),
+            field("Language", leftWrap(sized(languageBox, 120))),
+            field("Initial prompt (biases whisper toward clean, punctuated speech)",
+                  promptBox(cfg.initialPrompt)),
+
+            section("Code-switching (Swedish ↔ English)"),
             csEnable,
-            caption("For calls that mix Swedish and English. Each speech run is decoded by the best model for its language: KB-Whisper for Swedish, whisper-large-v3 for English."),
+            caption("When ON this REPLACES single-language mode: each speech run is decoded by the best model for its language — KB-Whisper for Swedish, whisper-large-v3 for English. The model/language/prompt above are then unused."),
             field("Languages (comma-separated; first two are used)",
                   leftWrap(sized(csLanguages, 160))),
             field("Dominant language (tiebreaker)", leftWrap(sized(csDominant, 120))),
-            field("Swedish model", leftWrap(sized(csSvModel, 260))),
-            field("English model", leftWrap(sized(csEnModel, 260))),
+            field("Swedish model", pathControl(csSvModel, chooseDir: false)),
+            field("English model", pathControl(csEnModel, chooseDir: false)),
+            caption("A known name (kb-whisper-large, whisper-large-v3) resolves under ~/.ghostie/models/, or Choose… a specific .bin file."),
             field("Swedish transcription style", leftWrap(sized(csVariant, 160))),
             caption("standard = balanced (best for notes) · subtitle = condensed · strict = verbatim, keeps filler. (‘subtitle’ has no downloadable model — use standard or strict.)"),
             leftWrap(csDownloadBtn),
@@ -250,7 +261,8 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         return root
     }
 
-    /// One tab: a top-aligned vertical stack of rows inside a container.
+    /// One tab: a top-aligned vertical stack of rows, vertically scrollable so
+    /// a long tab (the combined Transcription tab) never clips.
     private func tab(_ label: String, _ rows: [NSView]) -> NSTabViewItem {
         let stack = NSStackView()
         stack.orientation = .vertical
@@ -264,18 +276,53 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
             $0.trailingAnchor.constraint(equalTo: stack.trailingAnchor).isActive = true
         }
 
-        let container = NSView()
-        container.addSubview(stack)
+        // Flipped doc view → content starts at the top and scrolls down.
+        let doc = FlippedView()
+        doc.translatesAutoresizingMaskIntoConstraints = false
+        doc.addSubview(stack)
         NSLayoutConstraint.activate([
-            stack.topAnchor.constraint(equalTo: container.topAnchor, constant: 20),
-            stack.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 22),
-            stack.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -22),
-            stack.bottomAnchor.constraint(lessThanOrEqualTo: container.bottomAnchor, constant: -18)
+            stack.topAnchor.constraint(equalTo: doc.topAnchor, constant: 20),
+            stack.leadingAnchor.constraint(equalTo: doc.leadingAnchor, constant: 22),
+            stack.trailingAnchor.constraint(equalTo: doc.trailingAnchor, constant: -22),
+            stack.bottomAnchor.constraint(equalTo: doc.bottomAnchor, constant: -18)
+        ])
+
+        let scroll = NSScrollView()
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        scroll.drawsBackground = false
+        scroll.hasVerticalScroller = true
+        scroll.hasHorizontalScroller = false
+        scroll.autohidesScrollers = true
+        scroll.documentView = doc
+        // Match doc width to the viewport so it only scrolls vertically and
+        // full-width fields still stretch.
+        NSLayoutConstraint.activate([
+            doc.topAnchor.constraint(equalTo: scroll.contentView.topAnchor),
+            doc.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor),
+            doc.trailingAnchor.constraint(equalTo: scroll.contentView.trailingAnchor),
+            doc.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor)
+        ])
+
+        let container = NSView()
+        container.addSubview(scroll)
+        NSLayoutConstraint.activate([
+            scroll.topAnchor.constraint(equalTo: container.topAnchor),
+            scroll.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            scroll.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            scroll.trailingAnchor.constraint(equalTo: container.trailingAnchor)
         ])
         let item = NSTabViewItem(identifier: label)
         item.label = label
         item.view = container
         return item
+    }
+
+    /// Bold group header inside a tab.
+    private func section(_ s: String) -> NSView {
+        let t = NSTextField(labelWithString: s.uppercased())
+        t.font = .systemFont(ofSize: 11, weight: .semibold)
+        t.textColor = .secondaryLabelColor
+        return t
     }
 
     // MARK: Builders
@@ -537,4 +584,10 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         }
         window?.close()
     }
+}
+
+/// Document view for a scrollable tab — flipped so content is laid out from
+/// the top and the tab opens scrolled to the top, not the bottom.
+private final class FlippedView: NSView {
+    override var isFlipped: Bool { true }
 }
