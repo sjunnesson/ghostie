@@ -18,7 +18,11 @@ enum EngineState: Equatable {
 
 /// The detect → record → transcribe → summarize loop, decoupled from any UI so
 /// it can drive both the headless `run` daemon and the menu bar app.
-final class Engine {
+///
+/// State is synchronized through the private `gate` and `work` dispatch queues
+/// rather than the actor model, so the class manages its own thread safety and
+/// is declared `@unchecked Sendable` to allow it across `@Sendable` closures.
+final class Engine: @unchecked Sendable {
     private(set) var config: Config
     private var detector: CallDetector
     private var recorder: AudioRecorder?
