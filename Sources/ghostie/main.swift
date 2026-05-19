@@ -87,6 +87,21 @@ func cmdDoctor(_ config: Config) {
     row(vadOn, "Silero VAD model", vadOn ? config.vadModel : "optional — ./scripts/setup.sh --vad")
     row(s.isConfigured, "Claude Code CLI (`claude -p`)",
         s.isConfigured ? s.claudeBinary : "not found — install Claude Code and run `claude` once to log in")
+    let cs = config.codeSwitch
+    if cs.enabled {
+        row(true, "code-switching", "ENABLED — \(cs.languages.joined(separator: "+")), dominant \(cs.dominantLanguage), KB variant \(cs.kbWhisperVariant)")
+        for (lang, path) in cs.requiredModelPaths {
+            let ok = FileManager.default.fileExists(atPath: path)
+            row(ok, "  model[\(lang)]", ok ? path : "missing — run scripts/setup.sh --codeswitch")
+        }
+        let vadOK = !config.vadModel.isEmpty
+            && FileManager.default.fileExists(atPath: config.vadModel)
+        row(vadOK, "  Silero VAD (required by code-switching)",
+            vadOK ? config.vadModel : "missing — scripts/setup.sh --codeswitch fetches it")
+    } else {
+        row(true, "code-switching", "disabled (single-language path)")
+    }
+
     let teams = NSWorkspace.shared.runningApplications.contains {
         ($0.bundleIdentifier?.lowercased().hasPrefix("com.microsoft.teams") ?? false)
     }
@@ -239,6 +254,114 @@ func runTranscriptCleanerSelfTest() -> Bool {
     return failed == 0
 }
 
+/// Regression check for the code-switching Smoother — the algorithmically
+/// interesting, false-positive-prone part. Pure logic over synthetic
+/// detections, so it needs no audio, no model, and no whisper on disk
+/// (audio-fixture end-to-end checks live behind Tests/Fixtures and skip
+/// gracefully when absent — see runCodeSwitchFixtureSelfTest).
+func runCodeSwitchSelfTest() -> Bool {
+    let cfg = CodeSwitchConfig()                  // sv/en, defaults
+    func sm(_ window: Int) -> Smoother { Smoother(config: cfg, window: window) }
+    let step = 1600, dur = 1500
+
+    func det(_ i: Int, _ lang: String, conf: Double = 0.95,
+             base: Int = 0) -> LanguageDetection {
+        let s = base + i * step
+        let seg = VADSegment(startMs: s, endMs: s + dur)
+        if lang == "?" {
+            return LanguageDetection(segment: seg, top: LanguageDetection.unknown,
+                                     confidence: 0, margin: 0, logprobs: [:])
+        }
+        let other = lang == "sv" ? "en" : "sv"
+        let lp = [lang: Foundation.log(conf), other: Foundation.log(1 - conf)]
+        return LanguageDetection(segment: seg, top: lang, confidence: conf,
+                                 margin: lp[lang]! - lp[other]!, logprobs: lp)
+    }
+
+    var passed = 0, failed = 0
+    func check(_ name: String, _ ok: Bool, _ detail: @autoclosure () -> String = "") {
+        if ok { passed += 1; print("  ✓ \(name)") }
+        else { failed += 1; print("  ✗ \(name)  \(detail())") }
+    }
+
+    let empty = LanguageTimeline(intervals: [])
+
+    // Pass 1: a single-language track collapses to exactly one run.
+    let svOnly = (0..<8).map { det($0, "sv") }
+    let enOnly = (0..<8).map { det($0, "en") }
+    let svRuns = sm(4).refine(svOnly, priorFrom: empty)
+    let enRuns = sm(4).refine(enOnly, priorFrom: empty)
+    check("sv_only → 1 sv run",
+          svRuns.count == 1 && svRuns.first?.language == "sv",
+          "got \(svRuns.map(\.language))")
+    check("en_only → 1 en run",
+          enRuns.count == 1 && enRuns.first?.language == "en",
+          "got \(enRuns.map(\.language))")
+
+    // Pass 1: mixed sv / en / sv with one en loanword inside the first sv
+    // block → 3 runs (the lone loanword is absorbed by median + hysteresis).
+    var mixed: [LanguageDetection] = []
+    for i in 0..<6 { mixed.append(det(i, i == 2 ? "en" : "sv", conf: 0.9)) }
+    for i in 6..<14 { mixed.append(det(i, "en")) }
+    for i in 14..<20 { mixed.append(det(i, "sv")) }
+    let mixedRuns = sm(4).refine(mixed, priorFrom: empty)
+    check("mixed → 3 runs [sv,en,sv]",
+          mixedRuns.map(\.language) == ["sv", "en", "sv"],
+          "got \(mixedRuns.map(\.language)) (\(mixedRuns.count))")
+
+    // Pass 2: Me has 2 ambiguous segments at t≈20s. Participants is
+    // confidently English ending just before. The cross-track prior must
+    // refine those segments to English…
+    var me: [LanguageDetection] = []
+    for i in 0..<4 { me.append(det(i, "sv")) }
+    me.append(det(0, "?", base: 20_000)); me.append(det(1, "?", base: 20_000))
+    for i in 0..<4 { me.append(det(i, "sv", base: 23_200)) }
+    let partEn = (0..<5).map { det($0, "en", base: 12_000) }
+    let partPrelim = sm(4).preliminary(partEn)
+    let flipped = sm(4).refinedSegmentLabels(me, priorFrom: partPrelim)
+    check("cross-track prior flips ambiguous Me segments to en",
+          flipped[4] == "en" && flipped[5] == "en",
+          "got \(flipped)")
+
+    // …and with no nearby Participants speech, the same segments fall back
+    // to the per-track decision (sv), not flipped.
+    let isolated = sm(4).refinedSegmentLabels(me, priorFrom: empty)
+    check("isolated ambiguous Me segments keep per-track sv",
+          isolated[4] == "sv" && isolated[5] == "sv",
+          "got \(isolated)")
+
+    // Strength 0.5 makes Pass 2 a no-op (debug switch documented in config).
+    var offCfg = CodeSwitchConfig(); offCfg.crossTrackPriorStrength = 0.5
+    let neutral = Smoother(config: offCfg, window: 4)
+        .refinedSegmentLabels(me, priorFrom: partPrelim)
+    check("crossTrackPriorStrength 0.5 disables refinement",
+          neutral[4] == "sv" && neutral[5] == "sv",
+          "got \(neutral)")
+
+    // mostRecentEndingBefore is past-only (causality / timing-skew gotcha).
+    let tl = LanguageTimeline(intervals: [
+        .init(startMs: 0, endMs: 5_000, language: "en", confidence: 0.9),
+        .init(startMs: 9_000, endMs: 12_000, language: "sv", confidence: 0.9)
+    ])
+    check("timeline lookup is past-only & window-bounded",
+          tl.mostRecentEndingBefore(6_000, withinMs: 8_000) == "en"
+          && tl.mostRecentEndingBefore(6_000, withinMs: 500) == nil
+          && tl.mostRecentEndingBefore(8_000, withinMs: 8_000) == "en")
+
+    // Optional end-to-end audio fixtures (Tests/Fixtures) — skipped cleanly
+    // when not present so `ghostie selftest` stays green without 2 GB models.
+    let fixtures = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        .appendingPathComponent("Tests/Fixtures")
+    if FileManager.default.fileExists(atPath: fixtures.path) {
+        print("  · Tests/Fixtures present — audio end-to-end checks would run here")
+    } else {
+        print("  · (audio fixtures absent — skipping end-to-end codeswitch checks)")
+    }
+
+    print("\ncode-switching self-test: \(passed) passed, \(failed) failed")
+    return failed == 0
+}
+
 func printHelp() {
     print("""
     Ghostie — local Teams call transcriber & summarizer (no bot joins).
@@ -252,7 +375,7 @@ func printHelp() {
       process <dir>       Re-run transcription+summary on a recording dir.
       doctor              Check dependencies & permissions.
       process-backlog     Process recordings queued while deps were unavailable.
-      selftest            Verify the transcript hallucination guard.
+      selftest            Verify the hallucination guard + code-switching smoother.
       install-service     Headless background service via launchd.
       uninstall-service   Remove the headless service.
       help                Show this help.
@@ -293,7 +416,10 @@ case "icon":
     let out = args.count > 1 ? args[1] : "icon.png"
     exit(GhostIcon.writeAppIconPNG(to: out) ? 0 : 1)
 case "selftest":
-    exit(runTranscriptCleanerSelfTest() ? 0 : 1)
+    let cleanerOK = runTranscriptCleanerSelfTest()
+    print("")
+    let codeSwitchOK = runCodeSwitchSelfTest()
+    exit(cleanerOK && codeSwitchOK ? 0 : 1)
 case "settings":
     launchSettingsOnly()
 case "install-service":
