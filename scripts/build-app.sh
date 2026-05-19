@@ -7,6 +7,11 @@
 #   ./scripts/build-app.sh --dmg            # also bundle whisper+model and
 #                                           # produce build/Ghostie.dmg
 #   ./scripts/build-app.sh --dmg --notarize # notarize + staple the .dmg
+#   ./scripts/build-app.sh --version 1.2.0  # set the version (else: env
+#                                           # GHOSTIE_VERSION, then git tag)
+#
+# --notarize also emits build/Ghostie-<version>.zip + .sha256 — the OTA
+# self-update payload the in-app updater downloads (see publish-release.sh).
 #
 # --dmg makes the app self-contained: a statically-built whisper-cli and the
 # speech model are bundled inside Ghostie.app, so the target Mac needs nothing
@@ -23,20 +28,31 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP_NAME="Ghostie"
 BUNDLE_ID="com.davidsjunnesson.ghostie"
-VERSION="1.0.0"
 BUILD_DIR="$ROOT/build"
 APP="$BUILD_DIR/$APP_NAME.app"
 WHISPER_TAG="v1.8.4"
 MODEL_CACHE="$HOME/.ghostie/models"
 
 NOTARIZE=0; SELFCONTAINED=0; MAKE_DMG=0; RESET_PERMS=0
-for a in "$@"; do
-  case "$a" in
+CLI_VERSION=""
+while [ $# -gt 0 ]; do
+  case "$1" in
     --notarize)    NOTARIZE=1 ;;
     --dmg)         SELFCONTAINED=1; MAKE_DMG=1 ;;
     --reset-perms) RESET_PERMS=1 ;;
+    --version)     shift; CLI_VERSION="${1:-}" ;;
+    --version=*)   CLI_VERSION="${1#*=}" ;;
   esac
+  shift
 done
+
+# Version: --version arg → $GHOSTIE_VERSION → newest git tag → 1.0.0.
+VERSION="${CLI_VERSION:-${GHOSTIE_VERSION:-}}"
+if [ -z "$VERSION" ]; then
+  VERSION="$(git -C "$ROOT" describe --tags --abbrev=0 2>/dev/null | sed 's/^v//' || true)"
+fi
+: "${VERSION:=1.0.0}"
+echo "==> Version $VERSION"
 
 echo "==> Building release binary"
 cd "$ROOT"
@@ -193,8 +209,18 @@ if [ "$NOTARIZE" = "1" ]; then
     [ "$MAKE_DMG" = "1" ] || { TARGET="$BUILD_DIR/$APP_NAME.zip"; ditto -c -k --keepParent "$APP" "$TARGET"; }
     xcrun notarytool submit "$TARGET" --keychain-profile "$PROFILE" --wait
     xcrun stapler staple "$TARGET"
-    [ "$MAKE_DMG" = "1" ] || xcrun stapler staple "$APP"
+    # Always staple the .app itself so the OTA zip verifies offline (spctl
+    # via the stapled ticket) on the target Mac, even in the --dmg path.
+    xcrun stapler staple "$APP"
     echo "    notarized & stapled"
+    # OTA payload: a stapled-app zip + its SHA-256. The in-app updater
+    # downloads this; publish-release.sh uploads it to the GitHub Release.
+    OTA="$BUILD_DIR/${APP_NAME}-${VERSION}.zip"
+    rm -f "$OTA" "$BUILD_DIR/${APP_NAME}-${VERSION}.sha256"
+    /usr/bin/ditto -c -k --keepParent "$APP" "$OTA"
+    shasum -a 256 "$OTA" | awk '{print $1}' > "$BUILD_DIR/${APP_NAME}-${VERSION}.sha256"
+    echo "    OTA payload: $OTA"
+    echo "    OTA sha256:  $(cat "$BUILD_DIR/${APP_NAME}-${VERSION}.sha256")"
   fi
 fi
 

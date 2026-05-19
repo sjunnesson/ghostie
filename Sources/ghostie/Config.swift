@@ -78,6 +78,18 @@ struct Config: Codable {
     /// your existing Claude Code login (subscription/OAuth) — no API key.
     var claudeBinary: String = ""
 
+    // MARK: Updates (in-app OTA — see Updater.swift)
+
+    /// Check GitHub Releases on launch + ~daily and surface a newer version.
+    var autoCheckUpdates: Bool = true
+
+    /// Last successful update check (throttles the launch/daily checks).
+    var lastUpdateCheck: Date = .distantPast
+
+    /// Point the updater at a fork/fixture feed instead of the canonical
+    /// GitHub Releases endpoint (testing). Empty/nil = canonical.
+    var updateFeedOverride: String? = nil
+
     // MARK: Internal paths
 
     /// Working directory for in-progress recordings.
@@ -100,6 +112,7 @@ struct Config: Codable {
         case requireTriggerApp, pollIntervalSeconds, endGraceSeconds, minCallSeconds
         case whisperBinary, whisperModel, language, initialPrompt, vadModel
         case cleanTranscript, codeSwitch, summaryModel, claudeBinary, workDir
+        case autoCheckUpdates, lastUpdateCheck, updateFeedOverride
     }
 
     init(from decoder: Decoder) throws {
@@ -128,6 +141,9 @@ struct Config: Codable {
         summaryModel = g(.summaryModel, d.summaryModel)
         claudeBinary = g(.claudeBinary, d.claudeBinary)
         workDir = g(.workDir, d.workDir)
+        autoCheckUpdates = g(.autoCheckUpdates, d.autoCheckUpdates)
+        lastUpdateCheck = g(.lastUpdateCheck, d.lastUpdateCheck)
+        updateFeedOverride = g(.updateFeedOverride, d.updateFeedOverride)
     }
 
     // MARK: Loading
@@ -164,6 +180,7 @@ struct Config: Codable {
         if let f = env["GHOSTIE_NOTES_FOLDER"], !f.isEmpty { cfg.notesFolder = f }
         if let m = env["GHOSTIE_WHISPER_MODEL"], !m.isEmpty { cfg.whisperModel = m }
         if let s = env["GHOSTIE_SUMMARY_MODEL"], !s.isEmpty { cfg.summaryModel = s }
+        if let f = env["GHOSTIE_UPDATE_FEED"], !f.isEmpty { cfg.updateFeedOverride = f }
         // Whisper binary: a copy bundled in the .app (self-contained .dmg)
         // always wins; then a still-valid explicit override; then detection.
         // This also self-heals a config.json that pins a path which doesn't
@@ -248,6 +265,9 @@ struct Config: Codable {
 
     /// Models directory shared by setup.sh and the code-switching resolver.
     static var modelsDir: String { "\(NSHomeDirectory())/.ghostie/models" }
+
+    /// Scratch directory for downloaded OTA update payloads (see Updater).
+    static var updatesDir: String { "\(NSHomeDirectory())/.ghostie/updates" }
 
     func writeExampleIfMissing() {
         let dir = (Config.configPath as NSString).deletingLastPathComponent

@@ -53,6 +53,16 @@ final class Engine: @unchecked Sendable {
 
     var isListening: Bool { listening }
 
+    /// Safe to replace the running .app bundle? Never mid-call or mid-summary
+    /// (those would lose the recording / kill the pipeline). Advisory read of
+    /// `state`, consistent with how the menu bar reads it.
+    func swapIsSafe() -> Bool {
+        switch state {
+        case .recording, .processing: return false
+        case .paused, .watching:      return true
+        }
+    }
+
     /// Swap in a new configuration at runtime (from the Settings window).
     /// Recording/transcription/summary already reload `Config.load()` per call;
     /// the detector is rebuilt here so detection settings take effect too.

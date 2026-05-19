@@ -70,6 +70,40 @@ Application** → **Apple Development** → a stable **self-signed** identity
 (`Ghostie Self-Signed`, see [below](#permissions-keep-re-prompting-on-every-rebuild))
 → **ad-hoc**. Anything but ad-hoc keeps granted permissions across rebuilds.
 
+## Automatic updates
+
+Installed copies update themselves over the air from
+[GitHub Releases](https://github.com/sjunnesson/ghostie/releases) — no
+rebuild, no reinstall:
+
+- Ghostie checks for a newer release shortly after launch and about once a
+  day. When one exists it shows **“Update to vX.Y.Z…”** in the menu and posts
+  a single notification.
+- You choose when to install. It downloads the new build, **verifies** it
+  (published SHA-256 **and** Apple notarization — `codesign` confirms the same
+  Developer ID team, `spctl`/Gatekeeper confirms notarization), then quits and
+  relaunches. It **never interrupts an active call** — an install during a
+  call waits until the call finishes.
+- Toggle in **Settings ▸ General ▸ Updates**, or from the CLI:
+  `ghostie update` (check) / `ghostie update --install`.
+- Only **notarized Developer-ID** builds can self-update — that's the only
+  signature the updater can cryptographically trust. From-source / ad-hoc /
+  self-signed dev builds skip the check and say so; grab releases manually.
+
+### Releasing (maintainers)
+
+```bash
+./scripts/publish-release.sh 1.2.0
+```
+
+Human-triggered and irreversible (there is no CI release workflow on purpose).
+It checks preconditions (`gh auth`, clean tree, tag `v1.2.0` unused, notary
+profile present), then builds + notarizes, produces `build/Ghostie-1.2.0.zip`
+(the OTA payload), `…-1.2.0.sha256` and `build/Ghostie.dmg`, tags and pushes
+`v1.2.0`, and creates the GitHub Release with those assets. The release notes
+embed the checksum the in-app updater reads. `build-app.sh` takes the version
+from `--version`, then `$GHOSTIE_VERSION`, then the newest git tag.
+
 ## Menu bar app
 
 Ghostie runs as a **macOS menu bar app** — a 👻 ghost icon in the menu

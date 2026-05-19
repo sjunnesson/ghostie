@@ -15,8 +15,13 @@ final class MenuBarApp: NSObject, NSApplicationDelegate {
     private var lastNoteItem: NSMenuItem!
     private var backlogItem: NSMenuItem!
     private var loginItem: NSMenuItem!
+    private var updateItem: NSMenuItem!
     private var tick: Timer?
     private var settings: SettingsWindow?
+    private let updater = Updater()
+    private var updateTimer: DispatchSourceTimer?
+    private var availableRelease: ReleaseInfo?
+    private var lastNotifiedTag: String?
 
     init(config: Config) {
         self.engine = Engine(config: config)
@@ -56,6 +61,22 @@ final class MenuBarApp: NSObject, NSApplicationDelegate {
             guard let self else { return }
             if case .recording = self.engine.state { self.render(self.engine.state) }
         }
+
+        // OTA: a delayed launch check + a daily timer (only on builds we can
+        // cryptographically verify; the timer re-reads the toggle each fire).
+        if Updater.runningBuildSupportsOTA() {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 20) { [weak self] in
+                self?.maybeAutoCheck()
+            }
+            let ut = DispatchSource.makeTimerSource(
+                queue: DispatchQueue(label: "ghostie.updatecheck"))
+            ut.schedule(deadline: .now() + 86_400, repeating: 86_400)
+            ut.setEventHandler { [weak self] in
+                DispatchQueue.main.async { self?.maybeAutoCheck() }
+            }
+            ut.resume()
+            updateTimer = ut
+        }
     }
 
     // MARK: Menu
@@ -79,6 +100,8 @@ final class MenuBarApp: NSObject, NSApplicationDelegate {
         menu.addItem(backlogItem)
         menu.addItem(.separator())
 
+        updateItem = item("Check for Updates…", #selector(checkForUpdatesManually))
+        menu.addItem(updateItem)
         menu.addItem(item("Settings…", #selector(openSettings), key: ","))
         menu.addItem(item("Diagnostics", #selector(showDiagnostics)))
         loginItem = item("Start at Login", #selector(toggleLogin))
@@ -182,7 +205,7 @@ final class MenuBarApp: NSObject, NSApplicationDelegate {
 
     @objc private func openSettings() {
         if settings == nil {
-            settings = SettingsWindow { [weak self] newConfig in
+            settings = SettingsWindow(engine: engine) { [weak self] newConfig in
                 guard let self else { return }
                 self.engine.applyConfig(newConfig)
                 self.render(self.engine.state)
@@ -255,7 +278,125 @@ final class MenuBarApp: NSObject, NSApplicationDelegate {
 
     @objc private func quit() {
         statusMenuItem.title = "Finishing up…"
+        updateTimer?.cancel(); updateTimer = nil
         engine.shutdown { DispatchQueue.main.async { NSApp.terminate(nil) } }
+    }
+
+    // MARK: Updates
+
+    /// Background launch/daily check: throttled, silent on failure, fires a
+    /// single notification per new version.
+    private func maybeAutoCheck() {
+        guard Updater.runningBuildSupportsOTA() else { return }
+        let cfg = Config.loadRaw()
+        guard cfg.autoCheckUpdates else { return }
+        if Date().timeIntervalSince(cfg.lastUpdateCheck) < 24 * 3600 { return }
+        updater.check(config: config) { [weak self] result in
+            if case .success(.available(let r, _)) = result {
+                self?.surfaceUpdate(r, notifyUser: true)
+            }
+        }
+    }
+
+    private func surfaceUpdate(_ r: ReleaseInfo, notifyUser: Bool) {
+        availableRelease = r
+        updateItem.title = "Update to \(r.tag)…"
+        updateItem.action = #selector(installUpdate)
+        if notifyUser && lastNotifiedTag != r.tag {
+            lastNotifiedTag = r.tag
+            notify("Ghostie update available",
+                   "Version \(r.tag) is ready — choose “Update to \(r.tag)…” from the menu.")
+        }
+    }
+
+    @objc private func checkForUpdatesManually() {
+        if let r = availableRelease { promptInstall(r); return }
+        updateItem.isEnabled = false
+        let prevTitle = updateItem.title
+        updateItem.title = "Checking for updates…"
+        updater.check(config: config) { [weak self] result in
+            guard let self else { return }
+            self.updateItem.isEnabled = true
+            switch result {
+            case .success(.available(let r, _)):
+                self.surfaceUpdate(r, notifyUser: false)
+                self.promptInstall(r)
+            case .success(.upToDate(let cur)):
+                self.updateItem.title = prevTitle
+                self.infoAlert("You're up to date",
+                               "Ghostie \(cur) is the latest version.")
+            case .success(.skippedUnsupportedBuild):
+                self.updateItem.title = prevTitle
+                self.unsupportedBuildAlert()
+            case .failure(let e):
+                self.updateItem.title = prevTitle
+                self.infoAlert("Update check failed", e.localizedDescription)
+            }
+        }
+    }
+
+    @objc private func installUpdate() {
+        guard let r = availableRelease else { return }
+        promptInstall(r)
+    }
+
+    private func promptInstall(_ r: ReleaseInfo) {
+        let a = NSAlert()
+        a.messageText = "Update Ghostie to \(r.tag)?"
+        a.informativeText = (r.notes.isEmpty ? "" : r.notes + "\n\n")
+            + "Ghostie will download and verify the update, then quit and "
+            + "relaunch. It won't interrupt an active call."
+        a.addButton(withTitle: "Update Now")
+        a.addButton(withTitle: "Later")
+        NSApp.activate(ignoringOtherApps: true)
+        guard a.runModal() == .alertFirstButtonReturn else { return }
+        startInstall(r)
+    }
+
+    private func startInstall(_ r: ReleaseInfo) {
+        if updater.isRunning { return }
+        updateItem.isEnabled = false
+        updateItem.title = "Downloading \(r.tag)…"
+        updater.downloadAndInstall(r, engine: engine,
+            status: { [weak self] s in self?.updateItem.title = s },
+            finish: { [weak self] err in
+                guard let self else { return }
+                self.updateItem.isEnabled = true
+                self.updateItem.title = "Update to \(r.tag)…"
+                if let err {
+                    self.infoAlert("Update failed", err.localizedDescription)
+                }
+            },
+            commit: { [weak self] in
+                guard let self else { return }
+                self.statusMenuItem.title = "Updating…"
+                self.engine.shutdown {
+                    DispatchQueue.main.async { NSApp.terminate(nil) }
+                }
+            })
+    }
+
+    private func unsupportedBuildAlert() {
+        let a = NSAlert()
+        a.messageText = "Automatic updates unavailable"
+        a.informativeText = "This build isn't a notarized release, so it "
+            + "can't verify and self-update. Download the latest from GitHub "
+            + "Releases."
+        a.addButton(withTitle: "Open Releases")
+        a.addButton(withTitle: "OK")
+        NSApp.activate(ignoringOtherApps: true)
+        if a.runModal() == .alertFirstButtonReturn {
+            NSWorkspace.shared.open(Updater.releasesPage)
+        }
+    }
+
+    private func infoAlert(_ title: String, _ info: String) {
+        let a = NSAlert()
+        a.messageText = title
+        a.informativeText = info
+        a.addButton(withTitle: "OK")
+        NSApp.activate(ignoringOtherApps: true)
+        a.runModal()
     }
 
     // MARK: Helpers

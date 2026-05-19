@@ -5,6 +5,9 @@ import AppKit
 final class SettingsWindow: NSObject, NSWindowDelegate {
     private var window: NSWindow?
     private let onSave: (Config) -> Void
+    /// Live engine (menu-bar app) so a Settings-initiated update is gated on
+    /// an active call. nil in the standalone `ghostie settings` process.
+    private weak var engine: Engine?
     var onClose: (() -> Void)?
 
     // Controls we read back on Save.
@@ -40,7 +43,17 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
     private let csDownloadStatus = NSTextField(wrappingLabelWithString: "")
     private let downloader = ModelDownloader()
 
-    init(onSave: @escaping (Config) -> Void) {
+    // Updates.
+    private let autoUpdateCheck = NSButton(
+        checkboxWithTitle: "Automatically check for updates (about once a day)",
+        target: nil, action: nil)
+    private let updateCheckBtn = NSButton(title: "Check Now…",
+                                          target: nil, action: nil)
+    private let updateStatus = NSTextField(wrappingLabelWithString: "")
+    private let updater = Updater()
+
+    init(engine: Engine? = nil, onSave: @escaping (Config) -> Void) {
+        self.engine = engine
         self.onSave = onSave
         super.init()
     }
@@ -73,6 +86,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
 
     func windowWillClose(_ notification: Notification) {
         downloader.cancel()
+        updater.cancel()
         window = nil
         onClose?()
     }
@@ -145,6 +159,20 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
             f.alignment = .right
         }
 
+        // ---- Updates -----------------------------------------------------
+        autoUpdateCheck.state = cfg.autoCheckUpdates ? .on : .off
+        updateStatus.font = .systemFont(ofSize: 11)
+        updateStatus.textColor = .secondaryLabelColor
+        updateCheckBtn.bezelStyle = .rounded
+        updateCheckBtn.target = self
+        updateCheckBtn.action = #selector(checkForUpdates)
+        let otaOK = Updater.runningBuildSupportsOTA()
+        autoUpdateCheck.isEnabled = otaOK
+        updateCheckBtn.isEnabled = otaOK
+        updateStatus.stringValue = otaOK
+            ? "Current version: \(Updater.runningVersion())"
+            : "This build can't self-update (not a notarized release). Download from GitHub Releases."
+
         // ---- Tabs --------------------------------------------------------
         let tabs = NSTabView()
         tabs.translatesAutoresizingMaskIntoConstraints = false
@@ -152,7 +180,12 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
             field("Notes folder", pathControl(notesField, chooseDir: true)),
             keepAudio,
             saveTranscript,
-            caption("Summaries are written here as markdown after each call.")
+            caption("Summaries are written here as markdown after each call."),
+            section("Updates"),
+            autoUpdateCheck,
+            leftWrap(updateCheckBtn),
+            updateStatus,
+            caption("Updates come from GitHub Releases and are verified (Apple notarization + SHA-256) before installing. Installing quits and relaunches Ghostie; it never interrupts an active call. Only notarized Developer-ID builds can self-update.")
         ]))
         tabs.addTabViewItem(tab("Detection", [
             requireTeams,
@@ -526,6 +559,57 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         })
     }
 
+    @objc private func checkForUpdates() {
+        if updater.isRunning { return }
+        updateCheckBtn.isEnabled = false
+        updateStatus.stringValue = "Checking…"
+        updater.check(config: Config.load()) { [weak self] result in
+            guard let self else { return }
+            self.updateCheckBtn.isEnabled = true
+            switch result {
+            case .success(.upToDate(let cur)):
+                self.updateStatus.stringValue = "You're up to date — Ghostie \(cur)."
+            case .success(.skippedUnsupportedBuild):
+                self.updateStatus.stringValue =
+                    "This build can't self-update. Download from GitHub Releases."
+            case .failure(let e):
+                self.updateStatus.stringValue = "Check failed: \(e.localizedDescription)"
+            case .success(.available(let r, let cur)):
+                self.updateStatus.stringValue = "Update available: \(cur) → \(r.tag)"
+                let a = NSAlert()
+                a.messageText = "Update Ghostie to \(r.tag)?"
+                a.informativeText = (r.notes.isEmpty ? "" : r.notes + "\n\n")
+                    + "Ghostie will download and verify the update, then quit "
+                    + "and relaunch. It won't interrupt an active call."
+                a.addButton(withTitle: "Update Now")
+                a.addButton(withTitle: "Later")
+                guard a.runModal() == .alertFirstButtonReturn else { return }
+                self.updateCheckBtn.isEnabled = false
+                self.updateCheckBtn.title = "Updating…"
+                self.updater.downloadAndInstall(r, engine: self.engine,
+                    status: { [weak self] s in self?.updateStatus.stringValue = s },
+                    finish: { [weak self] err in
+                        guard let self else { return }
+                        self.updateCheckBtn.isEnabled = true
+                        self.updateCheckBtn.title = "Check Now…"
+                        if let err {
+                            self.alert(.critical, "Update failed",
+                                       err.localizedDescription)
+                        }
+                    },
+                    commit: { [weak self] in
+                        if let engine = self?.engine {
+                            engine.shutdown {
+                                DispatchQueue.main.async { NSApp.terminate(nil) }
+                            }
+                        } else {
+                            DispatchQueue.main.async { NSApp.terminate(nil) }
+                        }
+                    })
+            }
+        }
+    }
+
     private func alert(_ style: NSAlert.Style, _ title: String, _ info: String) {
         let a = NSAlert()
         a.alertStyle = style
@@ -559,6 +643,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         cfg.vadModel = vadField.stringValue.trimmingCharacters(in: .whitespaces)
         cfg.summaryModel = summaryBox.stringValue.trimmingCharacters(in: .whitespaces)
         cfg.claudeBinary = claudeField.stringValue.trimmingCharacters(in: .whitespaces)
+        cfg.autoCheckUpdates = autoUpdateCheck.state == .on
 
         // Code-switching (start from loadRaw so advanced keys are preserved).
         cfg.codeSwitch.enabled = csEnable.state == .on

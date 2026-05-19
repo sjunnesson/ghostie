@@ -8,6 +8,8 @@ import AVFoundation
 final class HeadlessRunner {
     private let engine: Engine
     private var signalSources: [DispatchSourceSignal] = []
+    private var updateTimer: DispatchSourceTimer?
+    private let updater = Updater()
 
     init(config: Config) { engine = Engine(config: config) }
 
@@ -16,6 +18,24 @@ final class HeadlessRunner {
         Log.info("Transcription: \(t.isAvailable ? "local whisper.cpp ✓" : "NOT set up — run scripts/setup.sh")")
         Log.info("Summaries: \(Summarizer(config: engine.config).isConfigured ? "claude -p ✓" : "disabled (Claude Code CLI not found — run `claude` once to log in)")")
         engine.startListening()
+
+        // A launchd daemon never self-swaps (it could be recording); it only
+        // logs that an update is waiting — install via the app or CLI.
+        if Updater.runningBuildSupportsOTA() {
+            let ut = DispatchSource.makeTimerSource(
+                queue: DispatchQueue(label: "ghostie.updatecheck"))
+            ut.schedule(deadline: .now() + 86_400, repeating: 86_400)
+            ut.setEventHandler { [weak self] in
+                guard let self, Config.loadRaw().autoCheckUpdates else { return }
+                self.updater.check(config: Config.load()) { result in
+                    if case .success(.available(let r, let cur)) = result {
+                        Log.info("Update available: \(cur) → \(r.tag). Open Ghostie.app or run `ghostie update --install`.")
+                    }
+                }
+            }
+            ut.resume()
+            updateTimer = ut
+        }
 
         signal(SIGINT, SIG_IGN)
         signal(SIGTERM, SIG_IGN)
@@ -92,6 +112,63 @@ func cmdFetchModels(_ config: Config, variant: String) {
         exit(1)
     }
     Log.ok("Code-switching models ready. Enable it in Settings or set codeSwitch.enabled=true.")
+}
+
+/// `ghostie update [--install]` — check GitHub Releases; with `--install`
+/// download, verify (notarization + checksum) and swap the running .app.
+func cmdUpdate(_ config: Config, install: Bool) {
+    if !Updater.runningBuildSupportsOTA() {
+        print("This build can't self-update (not a notarized Developer ID build).")
+        print("Download the latest from \(Updater.releasesPage.absoluteString)")
+        exit(0)
+    }
+    let up = Updater()
+    var result: Result<UpdateAvailability, Error>?
+    up.check(config: config) { result = $0 }
+    while result == nil {
+        RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.2))
+    }
+    let availability: UpdateAvailability
+    switch result! {
+    case .success(let a): availability = a
+    case .failure(let e):
+        Log.error("Update check failed: \(e.localizedDescription)")
+        exit(1)
+    }
+    switch availability {
+    case .skippedUnsupportedBuild:
+        print("This build can't self-update. Download from \(Updater.releasesPage.absoluteString)")
+        exit(0)
+    case .upToDate(let cur):
+        Log.ok("Ghostie \(cur) is the latest version.")
+        exit(0)
+    case .available(let rel, let cur):
+        print("Update available: \(cur) → \(rel.tag)")
+        if !rel.notes.isEmpty { print("\n\(rel.notes)\n") }
+        if !install {
+            print("Run `ghostie update --install` to download, verify and install it.")
+            exit(0)
+        }
+        Log.info("Downloading and verifying \(rel.tag)…")
+        var failed: Error?
+        var committed = false
+        var finishedFlag = false
+        up.downloadAndInstall(rel, engine: nil,
+            status: { Log.info($0) },
+            finish: { err in failed = err; finishedFlag = true },
+            commit: { committed = true })
+        while !committed && !finishedFlag {
+            RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.2))
+        }
+        if let failed {
+            Log.error("Update failed: \(failed.localizedDescription)")
+            exit(1)
+        }
+        // committed: the detached helper waits for this process to exit, then
+        // swaps the bundle and relaunches.
+        Log.ok("Installing \(rel.tag) — Ghostie will relaunch.")
+        exit(0)
+    }
 }
 
 func cmdDoctor(_ config: Config) {
@@ -385,6 +462,81 @@ func runCodeSwitchSelfTest() -> Bool {
     return failed == 0
 }
 
+/// Regression check for the OTA updater's pure parts — SemVer precedence and
+/// the GitHub manifest parser. No network/disk/models, so it's green
+/// everywhere (per CLAUDE.md selftest policy).
+func runUpdaterSelfTest() -> Bool {
+    var passed = 0, failed = 0
+    func check(_ name: String, _ ok: Bool, _ detail: @autoclosure () -> String = "") {
+        if ok { passed += 1; print("  ✓ \(name)") }
+        else { failed += 1; print("  ✗ \(name)  \(detail())") }
+    }
+    func v(_ s: String) -> SemVer { SemVer.parse(s)! }
+
+    check("equal versions are not an upgrade",
+          !Updater.compare(running: v("1.2.0"), latest: v("1.2.0")))
+    check("patch/minor/major bumps are upgrades",
+          Updater.compare(running: v("1.2.0"), latest: v("1.2.1"))
+          && Updater.compare(running: v("1.2.0"), latest: v("1.3.0"))
+          && Updater.compare(running: v("1.9.0"), latest: v("2.0.0")))
+    check("downgrade is never offered",
+          !Updater.compare(running: v("1.3.0"), latest: v("1.2.0")))
+    check("v / V prefix tolerated",
+          v("v1.2.0") == v("1.2.0") && v("V1.2.0") == v("1.2.0"))
+    check("short cores zero-pad",
+          v("1.2") == v("1.2.0") && v("1") == v("1.0.0")
+          && Updater.compare(running: v("1.2"), latest: v("1.2.1")))
+    check("pre-release precedence (SemVer 2.0)",
+          v("1.2.0-rc.1") < v("1.2.0")
+          && v("1.2.0-rc.1") < v("1.2.0-rc.2")
+          && v("1.2.0-alpha") < v("1.2.0-beta")
+          && !Updater.compare(running: v("1.2.0"), latest: v("1.2.0-rc.1")))
+    check("build metadata ignored", v("1.2.0+abc123") == v("1.2.0"))
+    check("non-numeric version → nil",
+          SemVer.parse("nightly") == nil && SemVer.parse("") == nil
+          && SemVer.parse("v") == nil)
+
+    func json(_ s: String) -> Data { Data(s.utf8) }
+    let sha = String(repeating: "a", count: 64)
+    let good = json("""
+    {"tag_name":"v1.3.0","name":"Ghostie 1.3.0",
+     "body":"Shiny new things.\\n<!--sha256:\(sha)-->",
+     "assets":[{"name":"Ghostie-1.3.0.zip",
+       "browser_download_url":"https://example.com/Ghostie-1.3.0.zip","size":4242}]}
+    """)
+    if let r = try? Updater.parseLatestJSON(good) {
+        check("manifest: tag/asset/sha/size parsed",
+              r.version == v("1.3.0")
+              && r.assetURL.absoluteString == "https://example.com/Ghostie-1.3.0.zip"
+              && r.sha256 == sha && r.expectedSize == 4242)
+        check("manifest: sha comment stripped from notes",
+              !r.notes.contains("sha256") && r.notes.contains("Shiny new things."))
+    } else {
+        check("manifest: tag/asset/sha/size parsed", false, "threw")
+        check("manifest: sha comment stripped from notes", false, "threw")
+    }
+    let noAsset = json("""
+    {"tag_name":"v1.3.0","body":"x <!--sha256:\(sha)-->",
+     "assets":[{"name":"Other.zip","browser_download_url":"https://e/o.zip","size":1}]}
+    """)
+    check("manifest: missing matching asset throws",
+          (try? Updater.parseLatestJSON(noAsset)) == nil)
+    let noSha = json("""
+    {"tag_name":"v1.3.0","body":"no checksum here",
+     "assets":[{"name":"Ghostie-1.3.0.zip","browser_download_url":"https://e/g.zip","size":1}]}
+    """)
+    check("manifest: no sha → throws (never install unverified)",
+          (try? Updater.parseLatestJSON(noSha)) == nil)
+    let badTag = json("""
+    {"tag_name":"nightly","body":"<!--sha256:\(sha)-->","assets":[]}
+    """)
+    check("manifest: unparseable tag throws",
+          (try? Updater.parseLatestJSON(badTag)) == nil)
+
+    print("\nupdater self-test: \(passed) passed, \(failed) failed")
+    return failed == 0
+}
+
 func printHelp() {
     print("""
     Ghostie — local Teams call transcriber & summarizer (no bot joins).
@@ -400,7 +552,10 @@ func printHelp() {
       fetch-models [v]    Download code-switching models (KB variant v +
                           large-v3 + VAD). Same as the Settings button.
       process-backlog     Process recordings queued while deps were unavailable.
-      selftest            Verify the hallucination guard + code-switching smoother.
+      update [--install]  Check for a newer release; --install downloads,
+                          verifies (notarization + SHA-256) and swaps the app.
+      selftest            Verify the hallucination guard + code-switching
+                          smoother + updater version/manifest logic.
       install-service     Headless background service via launchd.
       uninstall-service   Remove the headless service.
       help                Show this help.
@@ -442,11 +597,15 @@ case "icon":
     // Hidden: render the app icon PNG (used by scripts/build-app.sh).
     let out = args.count > 1 ? args[1] : "icon.png"
     exit(GhostIcon.writeAppIconPNG(to: out) ? 0 : 1)
+case "update":
+    cmdUpdate(config, install: args.contains("--install"))
 case "selftest":
     let cleanerOK = runTranscriptCleanerSelfTest()
     print("")
     let codeSwitchOK = runCodeSwitchSelfTest()
-    exit(cleanerOK && codeSwitchOK ? 0 : 1)
+    print("")
+    let updaterOK = runUpdaterSelfTest()
+    exit(cleanerOK && codeSwitchOK && updaterOK ? 0 : 1)
 case "settings":
     launchSettingsOnly()
 case "install-service":
