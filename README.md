@@ -268,3 +268,18 @@ Code login — no Anthropic API key. Run `claude` once in a terminal to sign in;
   Teams call that is overwhelmingly the other participants.
 - Speaker labels are track-based (Me vs everyone-else), not per-person
   diarization.
+
+## License
+
+Ghostie is released under the **MIT License** — see [`LICENSE`](LICENSE). You
+may use, modify, and redistribute it (including commercially); just keep the
+copyright and license notice.
+
+It builds on third-party software and speech models under their own licenses
+(whisper.cpp — MIT; OpenAI Whisper weights — MIT; KB-Whisper — Apache-2.0;
+Silero VAD — MIT). The self-contained `.dmg` redistributes a statically built
+`whisper-cli` and the base speech model. See
+[`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md) for details and attribution.
+
+Models are downloaded by you from their original sources and remain under
+their respective licenses; Ghostie does not relicense them.

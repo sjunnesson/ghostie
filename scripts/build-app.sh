@@ -64,7 +64,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>LSMinimumSystemVersion</key><string>15.0</string>
   <key>NSMicrophoneUsageDescription</key>
   <string>Ghostie transcribes your Teams calls locally so it can summarize them. Audio never leaves your Mac.</string>
-  <key>NSHumanReadableCopyright</key><string>Ghostie</string>
+  <key>NSHumanReadableCopyright</key><string>Copyright (c) 2026 David Sjunnesson. MIT License.</string>
 </dict>
 </plist>
 PLIST
@@ -84,6 +84,11 @@ else
   echo "    icon generation skipped (app still works)"
 fi
 
+echo "==> Bundling license + third-party notices"
+cp "$ROOT/LICENSE" "$APP/Contents/Resources/LICENSE"
+[ -f "$ROOT/THIRD-PARTY-NOTICES.md" ] \
+  && cp "$ROOT/THIRD-PARTY-NOTICES.md" "$APP/Contents/Resources/THIRD-PARTY-NOTICES.md"
+
 # ---- Self-contained: bundle a static whisper-cli + the model ----------------
 NESTED_BINS=()
 if [ "$SELFCONTAINED" = "1" ]; then
@@ -102,6 +107,8 @@ if [ "$SELFCONTAINED" = "1" ]; then
     cmake --build "$SRC/build" -j --config Release --target whisper-cli >/dev/null
   fi
   cp "$SRC/build/bin/whisper-cli" "$APP/Contents/Resources/whisper-cli"
+  # whisper.cpp is MIT — carry its license next to the redistributed binary.
+  [ -f "$SRC/LICENSE" ] && cp "$SRC/LICENSE" "$APP/Contents/Resources/whisper.cpp.LICENSE"
   echo "    bundled whisper-cli ($(otool -L "$APP/Contents/Resources/whisper-cli" | grep -c dylib) dynamic libs)"
   NESTED_BINS+=("$APP/Contents/Resources/whisper-cli")
 
