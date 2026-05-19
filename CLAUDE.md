@@ -23,6 +23,7 @@ swift build -c release            # release build (what the scripts use)
 .build/release/ghostie doctor     # check deps/permissions/backlog
 .build/release/ghostie test-record 15      # smoke-test the full pipeline
 .build/release/ghostie process <dir>       # re-run pipeline on a recording dir
+.build/release/ghostie fetch-models [v]    # download codeswitch models (KB v + large-v3 + VAD)
 ```
 
 There is no XCTest target and no linter. `swift build` warnings are expected to
@@ -83,6 +84,10 @@ the same code drives the menu-bar app and the headless daemon.
   an offset table — no ffmpeg), `CodeSwitchTranscriber.swift` (orchestrates and
   returns per-track `Transcriber.Segment`s; any whisper failure throws so the
   whole call backlogs and re-runs cleanly — no partial state).
+  `ModelDownloader.swift` fetches the dual models from Hugging Face into
+  `~/.ghostie/models/` (shared by the Settings “Download models” button and
+  `ghostie fetch-models`; variant→URL/filename mapping kept in lockstep with
+  `setup.sh` and `CodeSwitchConfig.modelPath`).
 - **`Summarizer.swift`** — shells out to `claude -p` using the user's existing
   Claude Code login (**no API key**). Replaces Claude Code's agentic system
   prompt with an analyst prompt and runs with cwd = `NSTemporaryDirectory()`

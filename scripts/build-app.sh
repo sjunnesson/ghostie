@@ -2,6 +2,8 @@
 # Builds Ghostie.app and (optionally) a self-contained, notarizable .dmg.
 #
 #   ./scripts/build-app.sh                  # build + sign + install locally
+#   ./scripts/build-app.sh --reset-perms    # also clear stale TCC grants once
+#                                           # (use after make-signing-cert.sh)
 #   ./scripts/build-app.sh --dmg            # also bundle whisper+model and
 #                                           # produce build/Ghostie.dmg
 #   ./scripts/build-app.sh --dmg --notarize # notarize + staple the .dmg
@@ -12,7 +14,10 @@
 # they run `claude` once, calls transcribe and queue in the backlog.)
 #
 # Signing identity is auto-detected: Developer ID Application (notarizable,
-# permissions persist) → Apple Development → ad-hoc.
+# permissions persist) → Apple Development → stable self-signed
+# ("Ghostie Self-Signed", or $GHOSTIE_SIGN_IDENTITY) → ad-hoc. Only ad-hoc
+# loses Microphone/Screen-Recording grants on rebuild — see
+# scripts/make-signing-cert.sh to create the stable self-signed identity.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -24,11 +29,12 @@ APP="$BUILD_DIR/$APP_NAME.app"
 WHISPER_TAG="v1.8.4"
 MODEL_CACHE="$HOME/.ghostie/models"
 
-NOTARIZE=0; SELFCONTAINED=0; MAKE_DMG=0
+NOTARIZE=0; SELFCONTAINED=0; MAKE_DMG=0; RESET_PERMS=0
 for a in "$@"; do
   case "$a" in
-    --notarize) NOTARIZE=1 ;;
-    --dmg)      SELFCONTAINED=1; MAKE_DMG=1 ;;
+    --notarize)    NOTARIZE=1 ;;
+    --dmg)         SELFCONTAINED=1; MAKE_DMG=1 ;;
+    --reset-perms) RESET_PERMS=1 ;;
   esac
 done
 
@@ -120,6 +126,9 @@ hash_for() { ids | grep "$1" | head -1 | sed -E 's/^[[:space:]]*[0-9]+\)[[:space
 
 DEVID="$(hash_for 'Developer ID Application' || true)"
 APPLEDEV="$(hash_for 'Apple Development' || true)"
+# Stable self-signed fallback (see scripts/make-signing-cert.sh). Override
+# with GHOSTIE_SIGN_IDENTITY="<identity name or SHA-1>".
+SELFSIGN="$(hash_for "${GHOSTIE_SIGN_IDENTITY:-Ghostie Self-Signed}" || true)"
 ENT="$ROOT/scripts/ghostie.entitlements"
 
 if [ -n "$DEVID" ]; then
@@ -128,10 +137,16 @@ if [ -n "$DEVID" ]; then
 elif [ -n "$APPLEDEV" ]; then
   IDENTITY="$APPLEDEV"; SIGNED="appledev"
   SIGN_OPTS=(--force)
+elif [ -n "$SELFSIGN" ]; then
+  IDENTITY="$SELFSIGN"; SIGNED="selfsigned"
+  SIGN_OPTS=(--force)
+  echo "==> Signing with stable self-signed identity (permissions will persist)"
 else
   IDENTITY="-"; SIGNED="adhoc"
   SIGN_OPTS=(--force)
-  echo "==> No Developer identity found — ad-hoc signing"
+  echo "==> No signing identity found — AD-HOC signing."
+  echo "    macOS will re-ask for Microphone/Screen Recording on every"
+  echo "    rebuild. Fix once with:  ./scripts/make-signing-cert.sh"
 fi
 
 # Sign nested executables first (whisper-cli), then seal the app.
@@ -184,9 +199,28 @@ rm -rf "$DEST/$APP_NAME.app"
 ditto "$APP" "$DEST/$APP_NAME.app"
 
 echo
-echo "==> Installed: $DEST/$APP_NAME.app"
+echo "==> Installed: $DEST/$APP_NAME.app  (signed: $SIGNED)"
 [ "$MAKE_DMG" = "1" ] && echo "==> Distributable: $DMG"
 echo
+
+# Clear stale TCC grants once when moving onto a stable identity, so macOS
+# prompts a single time under the new identity instead of being confused by
+# the old ad-hoc hash. Harmless to run repeatedly (just re-prompts once).
+if [ "$RESET_PERMS" = "1" ]; then
+  echo "==> Resetting Microphone + Screen Recording grants for $BUNDLE_ID"
+  tccutil reset Microphone "$BUNDLE_ID"  >/dev/null 2>&1 || true
+  tccutil reset ScreenCapture "$BUNDLE_ID" >/dev/null 2>&1 || true
+  killall Ghostie >/dev/null 2>&1 || true
+  echo "    Launch Ghostie and approve both ONCE — it will stick from now on."
+  echo
+fi
+if [ "$SIGNED" = "adhoc" ]; then
+  echo "NOTE: ad-hoc signed → macOS will re-prompt for Microphone/Screen"
+  echo "      Recording on every rebuild. One-time fix:"
+  echo "        ./scripts/make-signing-cert.sh"
+  echo "        ./scripts/build-app.sh --reset-perms"
+  echo
+fi
 if [ "$MAKE_DMG" = "1" ]; then
   echo "Share Ghostie.dmg → on the other Mac: open it, drag Ghostie to"
   echo "Applications, launch it. Transcription is fully bundled (no setup)."

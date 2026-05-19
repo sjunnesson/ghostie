@@ -71,6 +71,29 @@ func cmdProcess(_ config: Config, dir: String) {
     Pipeline(config: config).process(result, startedAt: Date())
 }
 
+/// Headless equivalent of the Settings “Download models” button — same
+/// `ModelDownloader`, so GUI and CLI/servers fetch identically.
+func cmdFetchModels(_ config: Config, variant: String) {
+    let v = variant.isEmpty ? config.codeSwitch.kbWhisperVariant : variant
+    guard let items = ModelDownloader.items(variant: v) else {
+        Log.error(ModelDownloader.DLError.subtitleUnavailable.localizedDescription)
+        exit(1)
+    }
+    Log.info("Fetching code-switching models (\(v)) → \(Config.modelsDir)")
+    let dl = ModelDownloader()
+    var failure: Error?
+    var done = false
+    dl.start(items, status: { Log.info($0) }, finish: { err in failure = err; done = true })
+    while !done {
+        RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.2))
+    }
+    if let failure {
+        Log.error("Download failed: \(failure.localizedDescription)")
+        exit(1)
+    }
+    Log.ok("Code-switching models ready. Enable it in Settings or set codeSwitch.enabled=true.")
+}
+
 func cmdDoctor(_ config: Config) {
     print("Ghostie doctor\n==================")
     let t = Transcriber(config: config)
@@ -374,6 +397,8 @@ func printHelp() {
       test-record [secs]  Record N seconds (default 15) → full pipeline.
       process <dir>       Re-run transcription+summary on a recording dir.
       doctor              Check dependencies & permissions.
+      fetch-models [v]    Download code-switching models (KB variant v +
+                          large-v3 + VAD). Same as the Settings button.
       process-backlog     Process recordings queued while deps were unavailable.
       selftest            Verify the hallucination guard + code-switching smoother.
       install-service     Headless background service via launchd.
@@ -406,6 +431,8 @@ case "test-record":
 case "process":
     guard args.count > 1 else { Log.error("Usage: ghostie process <dir>"); exit(1) }
     cmdProcess(config, dir: args[1])
+case "fetch-models":
+    cmdFetchModels(config, variant: args.count > 1 ? args[1] : "")
 case "doctor":
     cmdDoctor(config)
 case "process-backlog":

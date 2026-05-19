@@ -35,6 +35,10 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
     private let csMinSwitch = NSTextField()
     private let csWindowMe = NSTextField()
     private let csWindowPart = NSTextField()
+    private let csDownloadBtn = NSButton(title: "Download models (~2 GB)…",
+                                         target: nil, action: nil)
+    private let csDownloadStatus = NSTextField(wrappingLabelWithString: "")
+    private let downloader = ModelDownloader()
 
     init(onSave: @escaping (Config) -> Void) {
         self.onSave = onSave
@@ -53,7 +57,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         let content = buildForm(cfg)
 
         let win = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 640, height: 620),
+            contentRect: NSRect(x: 0, y: 0, width: 640, height: 700),
             styleMask: [.titled, .closable, .miniaturizable],
             backing: .buffered, defer: false)
         win.title = "Ghostie Settings"
@@ -68,6 +72,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
     }
 
     func windowWillClose(_ notification: Notification) {
+        downloader.cancel()
         window = nil
         onClose?()
     }
@@ -163,16 +168,25 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
             field("Silero VAD model", pathControl(vadField, chooseDir: false)),
             caption("VAD is optional. Run  ./scripts/setup.sh --vad  to fetch it; Ghostie auto-uses it when present.")
         ]))
+        csDownloadStatus.font = .systemFont(ofSize: 11)
+        csDownloadStatus.textColor = .secondaryLabelColor
+        csDownloadBtn.bezelStyle = .rounded
+        csDownloadBtn.target = self
+        csDownloadBtn.action = #selector(downloadModels)
+
         tabs.addTabViewItem(tab("Code-switching", [
             csEnable,
-            caption("For calls that mix Swedish and English. Each speech run is decoded by the best model for its language: KB-Whisper for Swedish, whisper-large-v3 for English. Fetch both with  ./scripts/setup.sh --codeswitch --kb-variant standard."),
+            caption("For calls that mix Swedish and English. Each speech run is decoded by the best model for its language: KB-Whisper for Swedish, whisper-large-v3 for English."),
             field("Languages (comma-separated; first two are used)",
                   leftWrap(sized(csLanguages, 160))),
             field("Dominant language (tiebreaker)", leftWrap(sized(csDominant, 120))),
             field("Swedish model", leftWrap(sized(csSvModel, 260))),
             field("English model", leftWrap(sized(csEnModel, 260))),
             field("Swedish transcription style", leftWrap(sized(csVariant, 160))),
-            caption("standard = balanced (best for notes) · subtitle = condensed · strict = verbatim, keeps filler."),
+            caption("standard = balanced (best for notes) · subtitle = condensed · strict = verbatim, keeps filler. (‘subtitle’ has no downloadable model — use standard or strict.)"),
+            leftWrap(csDownloadBtn),
+            csDownloadStatus,
+            caption("Downloads the chosen Swedish model + whisper-large-v3 + VAD into ~/.ghostie/models/ (≈2 GB; skips files already there). Or run  ./scripts/setup.sh --codeswitch."),
             field("Swedish prompt", csPromptSv),
             field("English prompt", csPromptEn),
             field("Cross-track prior strength (0.5 disables · 1.0 absolute)",
@@ -416,6 +430,61 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         if panel.runModal() == .OK, let url = panel.url {
             field.stringValue = url.path
         }
+    }
+
+    @objc private func downloadModels() {
+        if downloader.isRunning { return }
+        let variant = csVariant.stringValue.trimmingCharacters(in: .whitespaces)
+        guard let items = ModelDownloader.items(variant: variant) else {
+            alert(.warning, "‘\(variant)’ has no downloadable model",
+                  ModelDownloader.DLError.subtitleUnavailable.localizedDescription)
+            return
+        }
+        let confirm = NSAlert()
+        confirm.messageText = "Download code-switching models?"
+        confirm.informativeText = "Fetches the \(variant) Swedish model, whisper-large-v3, and the VAD model (≈2 GB total) into ~/.ghostie/models/. Files already present are skipped. You can keep using Settings while it runs; closing this window cancels it."
+        confirm.addButton(withTitle: "Download")
+        confirm.addButton(withTitle: "Cancel")
+        guard confirm.runModal() == .alertFirstButtonReturn else { return }
+
+        csDownloadBtn.isEnabled = false
+        csDownloadBtn.title = "Downloading…"
+        csDownloadStatus.stringValue = "Starting…"
+        downloader.start(items, status: { [weak self] s in
+            self?.csDownloadStatus.stringValue = s
+        }, finish: { [weak self] err in
+            guard let self else { return }
+            self.csDownloadBtn.isEnabled = true
+            self.csDownloadBtn.title = "Download models (~2 GB)…"
+            if let err {
+                self.csDownloadStatus.stringValue = "Download failed."
+                self.alert(.critical, "Model download failed", err.localizedDescription)
+                return
+            }
+            // Point the model fields at the canonical logical names so
+            // resolution finds what we just downloaded.
+            if self.csSvModel.stringValue.trimmingCharacters(in: .whitespaces).isEmpty
+                || self.csSvModel.stringValue == "kb-whisper-large" {
+                self.csSvModel.stringValue = "kb-whisper-large"
+            }
+            if self.csEnModel.stringValue.trimmingCharacters(in: .whitespaces).isEmpty
+                || self.csEnModel.stringValue == "whisper-large-v3" {
+                self.csEnModel.stringValue = "whisper-large-v3"
+            }
+            if self.vadField.stringValue.trimmingCharacters(in: .whitespaces).isEmpty {
+                self.vadField.stringValue = "\(Config.modelsDir)/ggml-silero-v5.1.2.bin"
+            }
+            self.csDownloadStatus.stringValue =
+                "✓ Models ready. Tick “Enable code-switching” above, then Save."
+        })
+    }
+
+    private func alert(_ style: NSAlert.Style, _ title: String, _ info: String) {
+        let a = NSAlert()
+        a.alertStyle = style
+        a.messageText = title
+        a.informativeText = info
+        a.runModal()
     }
 
     @objc private func openJSON() {
