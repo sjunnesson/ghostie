@@ -70,10 +70,17 @@ final class MenuBarApp: NSObject, NSApplicationDelegate {
         // AX permission can be revoked at any moment via System Settings, so
         // the warning must follow on its own cadence rather than only on
         // engine state changes.
-        tick = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+        //
+        // Scheduled on `.common` mode (not the default `.default`-only mode
+        // that `Timer.scheduledTimer` uses) so the "Recording call… MM:SS"
+        // title keeps ticking while the menu is open — NSMenu tracking runs
+        // the runloop in `.eventTracking`, which `.common` includes.
+        let t = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
             guard let self else { return }
             self.render(self.engine.state)
         }
+        RunLoop.main.add(t, forMode: .common)
+        tick = t
 
         // OTA: a delayed launch check + a daily timer (only on builds we can
         // cryptographically verify; the timer re-reads the toggle each fire).
