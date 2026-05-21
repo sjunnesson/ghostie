@@ -112,6 +112,13 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
     private var contentContainer: NSView?
     private var toolbarBadge: StatusBadgeView?
 
+    /// Ticks the sidebar's "Recording · MM:SS" label while the window is
+    /// open. The engine only fires `onStateChange` at transitions, so the
+    /// MM:SS would otherwise stay frozen at the moment recording started.
+    /// ListeningPane has its own tick for its big tile; this one is just for
+    /// the sidebar (always visible regardless of selected pane).
+    private var sidebarTick: Timer?
+
     // MARK: Window construction
 
     private func rebuildWindow() {
@@ -226,6 +233,17 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         NSApp.activate(ignoringOtherApps: true)
         win.makeKeyAndOrderFront(nil)
         wireEngineObserver()
+        startSidebarTick()
+    }
+
+    private func startSidebarTick() {
+        sidebarTick?.invalidate()
+        sidebarTick = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            guard let self, let engine = self.engine else { return }
+            if case .recording = engine.state {
+                self.sidebar?.refreshStatus(engine.state, perms: PermissionsState.current)
+            }
+        }
     }
 
     /// Block any resize that isn't the user dragging the corner handle.
@@ -255,6 +273,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         downloader.cancel()
         updater.cancel()
         unwireEngineObserver()
+        sidebarTick?.invalidate(); sidebarTick = nil
         window = nil
         sidebar = nil
         split = nil
