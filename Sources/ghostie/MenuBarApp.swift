@@ -1,6 +1,4 @@
 import AppKit
-import AVFoundation
-import ServiceManagement
 import UserNotifications
 
 /// The menu bar (status bar) application. No Dock icon — it lives entirely in
@@ -15,8 +13,6 @@ final class MenuBarApp: NSObject, NSApplicationDelegate {
     private var axWarningItem: NSMenuItem!
     private var toggleItem: NSMenuItem!
     private var lastNoteItem: NSMenuItem!
-    private var backlogItem: NSMenuItem!
-    private var loginItem: NSMenuItem!
     private var updateItem: NSMenuItem!
     private var tick: Timer?
     private var settings: SettingsWindow?
@@ -51,8 +47,11 @@ final class MenuBarApp: NSObject, NSApplicationDelegate {
                 self?.refreshLastNote()
             }
         }
-        engine.onBacklogChange = { [weak self] pending in
-            DispatchQueue.main.async { self?.refreshBacklog(pending) }
+        engine.onBacklogChange = { [weak self] _ in
+            // Backlog count is surfaced in Settings → Notes → Advanced; the
+            // menu no longer carries a counter, but we still keep the
+            // last-note state in sync after a drain.
+            DispatchQueue.main.async { self?.refreshLastNote() }
         }
 
         engine.startListening()
@@ -102,49 +101,26 @@ final class MenuBarApp: NSObject, NSApplicationDelegate {
 
         menu.addItem(.separator())
 
+        // Trimmed menu: only the actions that make sense from the menu bar
+        // itself live here. Anything tied to configuration, diagnostics, the
+        // backlog, login-at-startup or version info moved into Settings.
         toggleItem = item("Pause Listening", #selector(toggleListening))
         menu.addItem(toggleItem)
 
-        menu.addItem(item("Open Notes Folder", #selector(openNotesFolder)))
         lastNoteItem = item("Open Last Summary", #selector(openLastNote))
         lastNoteItem.isEnabled = false
         menu.addItem(lastNoteItem)
         menu.addItem(item("Run 30-Second Test", #selector(runTest)))
-        backlogItem = item("Backlog: none", #selector(processBacklog))
-        backlogItem.isEnabled = false
-        menu.addItem(backlogItem)
         menu.addItem(.separator())
 
         updateItem = item("Check for Updates…", #selector(checkForUpdatesManually))
         menu.addItem(updateItem)
         menu.addItem(item("Settings…", #selector(openSettings), key: ","))
-        menu.addItem(item("Diagnostics", #selector(showDiagnostics)))
-        loginItem = item("Start at Login", #selector(toggleLogin))
-        menu.addItem(loginItem)
         menu.addItem(.separator())
 
-        menu.addItem(item("About Ghostie", #selector(showAbout)))
         menu.addItem(item("Quit Ghostie", #selector(quit), key: "q"))
 
         refreshLastNote()
-        refreshLoginState()
-        refreshBacklog(Backlog.pendingCount)
-    }
-
-    private func refreshBacklog(_ pending: Int) {
-        if pending > 0 {
-            backlogItem.title = "Process Backlog (\(pending) pending)"
-            backlogItem.isEnabled = true
-        } else {
-            backlogItem.title = "Backlog: none"
-            backlogItem.isEnabled = false
-        }
-        refreshLastNote()
-    }
-
-    @objc private func processBacklog() {
-        notify("Ghostie", "Processing backlog…")
-        engine.drainBacklog()
     }
 
     private func item(_ title: String, _ sel: Selector, key: String = "") -> NSMenuItem {
@@ -199,12 +175,6 @@ final class MenuBarApp: NSObject, NSApplicationDelegate {
         render(engine.state)
     }
 
-    @objc private func openNotesFolder() {
-        let f = URL(fileURLWithPath: config.notesFolder)
-        try? FileManager.default.createDirectory(at: f, withIntermediateDirectories: true)
-        NSWorkspace.shared.open(f)
-    }
-
     @objc private func openAccessibilitySettings() {
         let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!
         NSWorkspace.shared.open(url)
@@ -239,83 +209,6 @@ final class MenuBarApp: NSObject, NSApplicationDelegate {
         settings?.show()
     }
 
-    @objc private func showDiagnostics() {
-        let t = Transcriber(config: config)
-        let s = Summarizer(config: config)
-        let mic = AVCaptureDevice.authorizationStatus(for: .audio)
-        let micStr: String = {
-            switch mic {
-            case .authorized:    return "✓ granted"
-            case .denied:        return "✗ DENIED"
-            case .restricted:    return "✗ restricted (MDM)"
-            case .notDetermined: return "· not yet requested"
-            @unknown default:    return "? unknown"
-            }
-        }()
-        let srStr = CGPreflightScreenCaptureAccess() ? "✓ granted" : "✗ not granted"
-        let axStr = AXIsProcessTrusted() ? "✓ granted" : "✗ not granted (optional)"
-        let lines = [
-            "Permissions (this app bundle)",
-            "  Microphone:       \(micStr)",
-            "  Screen Recording: \(srStr)",
-            "  Accessibility:    \(axStr)",
-            "",
-            "Transcription: \(t.isAvailable ? "ready (local whisper.cpp)" : "NOT set up — run scripts/setup.sh")",
-            "Summaries: \(s.isConfigured ? "claude -p (\(config.summaryModel))" : "Claude Code CLI not found — run `claude` once to log in")",
-            "Backlog: \(Backlog.pendingCount) pending (auto-retried; processed on next call too)",
-            "Whisper model: \(config.whisperModel)",
-            "Notes folder: \(config.notesFolder)",
-            "Config: \(Config.configPath)",
-            "Log: \(NSHomeDirectory())/.ghostie/ghostie.log",
-            "",
-            "If a permission shows DENIED or not granted, click below to open",
-            "the right Privacy & Security pane."
-        ]
-        let alert = NSAlert()
-        alert.messageText = "Ghostie Diagnostics"
-        alert.informativeText = lines.joined(separator: "\n")
-        alert.addButton(withTitle: "OK")
-        alert.addButton(withTitle: "Open Privacy Settings")
-        NSApp.activate(ignoringOtherApps: true)
-        if alert.runModal() == .alertSecondButtonReturn {
-            // Open Screen Recording pane (most often the one users need to grant);
-            // the Mic and Accessibility panes are one click away in the same UI.
-            NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!)
-        }
-    }
-
-    @objc private func toggleLogin() {
-        guard #available(macOS 13.0, *) else { return }
-        do {
-            if SMAppService.mainApp.status == .enabled {
-                try SMAppService.mainApp.unregister()
-            } else {
-                try SMAppService.mainApp.register()
-            }
-        } catch {
-            notify("Ghostie", "Could not change login item: \(error.localizedDescription)")
-        }
-        refreshLoginState()
-    }
-
-    private func refreshLoginState() {
-        guard #available(macOS 13.0, *) else { loginItem.isHidden = true; return }
-        loginItem.state = (SMAppService.mainApp.status == .enabled) ? .on : .off
-    }
-
-    @objc private func showAbout() {
-        let alert = NSAlert()
-        alert.messageText = "Ghostie"
-        alert.informativeText = """
-        Listens to your Microsoft Teams calls locally — no bot ever joins the \
-        meeting — then transcribes (locally) and summarizes each call to markdown.
-
-        Calls processed this session: \(engine.callsProcessed)
-        """
-        alert.addButton(withTitle: "OK")
-        NSApp.activate(ignoringOtherApps: true)
-        alert.runModal()
-    }
 
     @objc private func quit() {
         statusMenuItem.title = "Finishing up…"

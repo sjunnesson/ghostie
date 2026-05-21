@@ -1,876 +1,453 @@
 import AppKit
 import AVFoundation
+import ServiceManagement
+import QuartzCore
 
-/// A real Settings window (no more "open the JSON"). Edits the on-disk config,
-/// saves it, and applies the change to the running engine immediately.
+/// A real Settings window in the System-Settings-14+ style: 220 pt sidebar with
+/// a brand row and grouped nav, content panes that crossfade on selection, and
+/// status badges that surface where each knob actually lives. The behavioural
+/// contract (Config keys read, `onSave` callback, engine update path) is the
+/// same as the legacy NSTabView form this replaces.
 final class SettingsWindow: NSObject, NSWindowDelegate {
-    private var window: NSWindow?
-    private let onSave: (Config) -> Void
-    /// Live engine (menu-bar app) so a Settings-initiated update is gated on
-    /// an active call. nil in the standalone `ghostie settings` process.
-    private weak var engine: Engine?
-    var onClose: (() -> Void)?
 
-    // Controls we read back on Save.
-    private let notesField = NSTextField()
-    private let keepAudio = NSButton(checkboxWithTitle: "Keep raw audio recordings after processing", target: nil, action: nil)
-    private let saveTranscript = NSButton(checkboxWithTitle: "Save a separate transcript file alongside the summary", target: nil, action: nil)
-    private let requireTeams = NSButton(checkboxWithTitle: "Only treat microphone use as a call when Microsoft Teams is running", target: nil, action: nil)
-    private let endGrace = NSTextField()
-    private let minCall = NSTextField()
-    private let whisperModelField = NSTextField()
-    private let languageBox = NSComboBox()
-    private let cleanTranscript = NSButton(checkboxWithTitle: "Clean transcript (remove whisper hallucinations)", target: nil, action: nil)
-    private let promptView = NSTextView()
-    private let vadField = NSTextField()
-    private let claudeField = NSTextField()
-    private let summaryBox = NSComboBox()
-
-    // Code-switching (sv ↔ en).
-    private let csEnable = NSButton(checkboxWithTitle: "Enable code-switching (Swedish ↔ English, dual model)", target: nil, action: nil)
-    private let csLanguages = NSTextField()
-    private let csDominant = NSComboBox()
-    private let csSvModel = NSTextField()
-    private let csEnModel = NSTextField()
-    private let csVariant = NSComboBox()
-    private let csPromptSv = NSTextField()
-    private let csPromptEn = NSTextField()
-    private let csPriorStrength = NSTextField()
-    private let csMinSwitch = NSTextField()
-    private let csWindowMe = NSTextField()
-    private let csWindowPart = NSTextField()
-    private let downloader = ModelDownloader()
-
-    // Transcription tab v2. One column, three sections (Mode, Quality, Models
-    // on disk). Advanced knobs and prompt edits live in config.json — kept off
-    // the UI deliberately. The hidden NSTextFields below still hold their
-    // values so Save round-trips them unchanged.
-    private let modePopup = NSPopUpButton(frame: .zero, pullsDown: false)
-    private let whisperModelPopup = NSPopUpButton(frame: .zero, pullsDown: false)
-    private let singleModeBlock = NSStackView()
-    private let codeswitchModeBlock = NSStackView()
-
-    // Per-model row UI. Keyed by a stable identifier ("base", "large-v3",
-    // "kb", "vad") rather than filename so the KB row survives a variant
-    // change. Built on Settings open; updated by `refreshModelRow(_:)`.
-    private struct ModelRowViews {
-        let status: NSTextField
-        let action: NSButton
-    }
-    private var modelRows: [String: ModelRowViews] = [:]
-    /// Set to a key while that single row's download is in flight, so
-    /// per-row downloads serialize without a global "everything disabled".
-    private var inflightModelKey: String?
-
-    // Updates.
-    private let autoUpdateCheck = NSButton(
-        checkboxWithTitle: "Automatically check for updates (about once a day)",
-        target: nil, action: nil)
-    private let updateCheckBtn = NSButton(title: "Check Now…",
-                                          target: nil, action: nil)
-    private let updateStatus = NSTextField(wrappingLabelWithString: "")
-    private let updater = Updater()
+    // MARK: Public API (unchanged)
 
     init(engine: Engine? = nil, onSave: @escaping (Config) -> Void) {
         self.engine = engine
         self.onSave = onSave
         super.init()
     }
-
-    // MARK: Presentation
+    var onClose: (() -> Void)?
 
     func show() {
         if let window {
             NSApp.activate(ignoringOtherApps: true)
             window.makeKeyAndOrderFront(nil)
+            refreshLiveBits()
             return
         }
-        let cfg = Config.loadRaw()
-        let content = buildForm(cfg)
+        rebuildWindow()
+    }
+
+    // MARK: Stored references
+
+    private weak var engine: Engine?
+    private let onSave: (Config) -> Void
+    private var window: NSWindow?
+
+    private var cfg = Config.loadRaw()                // working copy
+    private var currentPaneId: PaneId = .listening
+    private let downloader = ModelDownloader()
+    private let updater = Updater()
+
+    /// `inflightModelKey` is set while a per-row download is running so the
+    /// other rows disable their action buttons without a global "everything
+    /// disabled" pass.
+    private var inflightModelKey: String?
+
+    private struct PaneRefs {
+        var listening: ListeningPane?
+        var notes: NotesPane?
+        var transcription: TranscriptionPane?
+        var summary: SummaryPane?
+        var updates: UpdatesPane?
+        var advanced: AdvancedPane?
+        var about: AboutPane?
+    }
+    private var panes = PaneRefs()
+    private var sidebar: Sidebar?
+    private var contentContainer: NSView?
+    private var toolbarBadge: StatusBadgeView?
+
+    // MARK: Window construction
+
+    private func rebuildWindow() {
+        cfg = Config.loadRaw()
 
         let win = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 640, height: 600),
-            styleMask: [.titled, .closable, .miniaturizable],
+            contentRect: NSRect(x: 0, y: 0, width: 1000, height: 920),
+            styleMask: [.titled, .closable, .miniaturizable,
+                        .resizable, .fullSizeContentView],
             backing: .buffered, defer: false)
         win.title = "Ghostie Settings"
+        win.titleVisibility = .hidden
+        win.titlebarAppearsTransparent = true
+        win.isMovableByWindowBackground = false
         win.delegate = self
         win.isReleasedWhenClosed = false
-        win.contentView = content
-        win.center()
+        win.minSize = NSSize(width: 800, height: 560)
 
+        let split = NSSplitViewController()
+        // The split view's NSSplitView has its own divider; we render our own
+        // borders on the sidebar and content backgrounds, so suppress the
+        // platform divider line entirely.
+        split.splitView.dividerStyle = .thin
+
+        // ---- Sidebar -----------------------------------------------------
+        let side = Sidebar(
+            paneOrder: PaneId.mainOrder,
+            paneBottom: PaneId.bottomOrder,
+            initialPane: currentPaneId,
+            engine: engine,
+            onSelect: { [weak self] id in self?.select(id) })
+        self.sidebar = side
+        let sideVC = NSViewController()
+        sideVC.view = side
+        let sideItem = NSSplitViewItem(sidebarWithViewController: sideVC)
+        sideItem.minimumThickness = 220
+        sideItem.maximumThickness = 220
+        sideItem.canCollapse = false
+        sideItem.holdingPriority = .init(260)
+        split.addSplitViewItem(sideItem)
+
+        // ---- Content -----------------------------------------------------
+        let contentVC = NSViewController()
+        let content = NSView()
+        contentVC.view = content
+        let contentItem = NSSplitViewItem(viewController: contentVC)
+        contentItem.minimumThickness = 480
+        split.addSplitViewItem(contentItem)
+
+        // Thin toolbar strip. Visually invisible (no title text, no tinted
+        // background, no hairline) so the sidebar/content seam runs cleanly
+        // from the title bar all the way down. The strip is still kept as a
+        // 38 pt high slot so the traffic lights have a drag region and the
+        // recording badge has somewhere to sit when a call is live.
+        let toolbar = NSView()
+        toolbar.translatesAutoresizingMaskIntoConstraints = false
+        toolbar.wantsLayer = true
+        toolbar.layer?.backgroundColor = Theme.contentBg.cgColor
+        let toolbarBadge = StatusBadgeView(kind: .danger, label: "Recording")
+        toolbarBadge.translatesAutoresizingMaskIntoConstraints = false
+        toolbarBadge.isHidden = true
+
+        toolbar.addSubview(toolbarBadge)
+        self.toolbarBadge = toolbarBadge
+
+        // Container for pane bodies (scroll view swapped on selection).
+        let container = NSView()
+        container.translatesAutoresizingMaskIntoConstraints = false
+        self.contentContainer = container
+
+        content.addSubview(toolbar)
+        content.addSubview(container)
+        NSLayoutConstraint.activate([
+            toolbar.topAnchor.constraint(equalTo: content.topAnchor),
+            toolbar.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            toolbar.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            toolbar.heightAnchor.constraint(equalToConstant: 38),
+
+            toolbarBadge.trailingAnchor.constraint(equalTo: toolbar.trailingAnchor, constant: -18),
+            toolbarBadge.centerYAnchor.constraint(equalTo: toolbar.centerYAnchor),
+
+            container.topAnchor.constraint(equalTo: toolbar.bottomAnchor),
+            container.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            container.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            container.bottomAnchor.constraint(equalTo: content.bottomAnchor)
+        ])
+
+        win.contentViewController = split
         self.window = win
+        select(currentPaneId, animated: false)
+        win.center()
         NSApp.activate(ignoringOtherApps: true)
         win.makeKeyAndOrderFront(nil)
+        wireEngineObserver()
     }
 
     func windowWillClose(_ notification: Notification) {
         downloader.cancel()
         updater.cancel()
+        unwireEngineObserver()
         window = nil
+        sidebar = nil
+        contentContainer = nil
+        toolbarBadge = nil
+        panes = PaneRefs()
         onClose?()
     }
 
-    // MARK: Form
-
-    private func buildForm(_ cfg: Config) -> NSView {
-        notesField.stringValue = cfg.notesFolder
-        keepAudio.state = cfg.keepAudio ? .on : .off
-        saveTranscript.state = cfg.saveTranscript ? .on : .off
-        requireTeams.state = cfg.requireTriggerApp ? .on : .off
-        endGrace.stringValue = String(Int(cfg.endGraceSeconds))
-        minCall.stringValue = String(Int(cfg.minCallSeconds))
-        whisperModelField.stringValue = cfg.whisperModel
-        cleanTranscript.state = cfg.cleanTranscript ? .on : .off
-        vadField.stringValue = cfg.vadModel
-
-        // `removeAllItems` first — `buildForm` re-runs on every Settings reopen
-        // and `addItems` appends, so without this the lists grow each time.
-        languageBox.removeAllItems()
-        languageBox.addItems(withObjectValues: ["en", "auto", "sv", "de", "fr", "es", "it", "nl", "pt"])
-        languageBox.stringValue = cfg.language
-        languageBox.completes = true
-
-        summaryBox.removeAllItems()
-        summaryBox.addItems(withObjectValues: ["claude-sonnet-4-6", "claude-opus-4-7", "claude-haiku-4-5-20251001"])
-        summaryBox.stringValue = cfg.summaryModel
-        summaryBox.completes = true
-
-        claudeField.stringValue = cfg.claudeBinary.isEmpty
-            ? Config.findClaudeBinary() : cfg.claudeBinary
-        claudeField.placeholderString = "auto-detected"
-
-        // ---- Code-switching ---------------------------------------------
-        let csc = cfg.codeSwitch
-        csEnable.state = csc.enabled ? .on : .off
-        csLanguages.stringValue = csc.languages.joined(separator: ", ")
-        csDominant.removeAllItems()
-        csDominant.addItems(withObjectValues: ["en", "sv"])
-        csDominant.stringValue = csc.dominantLanguage
-        csDominant.completes = true
-        csSvModel.stringValue = csc.modelPerLanguage["sv"] ?? "kb-whisper-large"
-        csEnModel.stringValue = csc.modelPerLanguage["en"] ?? "whisper-large-v3"
-        csVariant.removeAllItems()
-        csVariant.addItems(withObjectValues: ["standard", "strict"])
-        csVariant.stringValue = csc.kbWhisperVariant
-        csVariant.completes = true
-        csPromptSv.stringValue = csc.promptSv
-        csPromptEn.stringValue = csc.promptEn
-        csPriorStrength.stringValue = String(csc.crossTrackPriorStrength)
-        csMinSwitch.stringValue = String(csc.minSwitchSegments)
-        csWindowMe.stringValue = String(csc.smoothingWindowMe)
-        csWindowPart.stringValue = String(csc.smoothingWindowParticipants)
-
-        for f in [notesField, endGrace, minCall, whisperModelField, vadField, claudeField,
-                  csLanguages, csSvModel, csEnModel, csPromptSv, csPromptEn,
-                  csPriorStrength, csMinSwitch, csWindowMe, csWindowPart] {
-            f.translatesAutoresizingMaskIntoConstraints = false
-            f.controlSize = .regular
-            f.usesSingleLineMode = true
-            f.alignment = .left
-            f.lineBreakMode = .byTruncatingTail
-            f.cell?.wraps = false
-            f.cell?.isScrollable = true
-            f.cell?.alignment = .left
-        }
-        // Long paths start flush-left like every other control; the truncated
-        // tail is shown with the full path available on hover.
-        for f in [notesField, whisperModelField, vadField, claudeField,
-                  csSvModel, csEnModel] {
-            f.toolTip = f.stringValue
-        }
-        endGrace.alignment = .right
-        minCall.alignment = .right
-        for f in [csPriorStrength, csMinSwitch, csWindowMe, csWindowPart] {
-            f.alignment = .right
-        }
-
-        // ---- Updates -----------------------------------------------------
-        autoUpdateCheck.state = cfg.autoCheckUpdates ? .on : .off
-        updateStatus.font = .systemFont(ofSize: 11)
-        updateStatus.textColor = .secondaryLabelColor
-        updateCheckBtn.bezelStyle = .rounded
-        updateCheckBtn.target = self
-        updateCheckBtn.action = #selector(checkForUpdates)
-        let otaOK = Updater.runningBuildSupportsOTA()
-        autoUpdateCheck.isEnabled = otaOK
-        updateCheckBtn.isEnabled = otaOK
-        updateStatus.stringValue = otaOK
-            ? "Current version: \(Updater.runningVersion())"
-            : "This build can't self-update (not a notarized release). Download from GitHub Releases."
-
-        // ---- Tabs --------------------------------------------------------
-        let tabs = NSTabView()
-        tabs.translatesAutoresizingMaskIntoConstraints = false
-        tabs.addTabViewItem(tab("General", [
-            field("Notes folder", pathControl(notesField, chooseDir: true)),
-            keepAudio,
-            saveTranscript,
-            caption("Summaries are written here as markdown after each call."),
-            section("Updates"),
-            autoUpdateCheck,
-            leftWrap(updateCheckBtn),
-            updateStatus,
-            caption("Updates come from GitHub Releases and are verified (Apple notarization + SHA-256) before installing. Installing quits and relaunches Ghostie; it never interrupts an active call. Only notarized Developer-ID builds can self-update.")
-        ]))
-        tabs.addTabViewItem(tab("Detection", [
-            requireTeams,
-            field("End call after Teams releases the mic", leftWrap(suffixed(endGrace, "seconds", width: 70))),
-            field("Ignore calls shorter than", leftWrap(suffixed(minCall, "seconds", width: 70))),
-            caption("A call ends when Teams continuously stops holding the microphone for this long. The grace window rides over brief drops — mute toggles, AirPods reconnecting, a quick Teams restart. This is not voice-activity detection; your own pauses do not count as the mic being released.")
-        ]))
-        tabs.addTabViewItem(tab("Permissions", permissionsTabContents()))
-
-        // Mode-specific UI is built in two containers; the popup toggles which
-        // is visible. The variant dropdown drives the KB row's status.
-        csVariant.target = self
-        csVariant.action = #selector(variantChanged)
-        buildModeControls(currentlyCodeswitch: cfg.codeSwitch.enabled,
-                          currentWhisperModelPath: cfg.whisperModel)
-
-        tabs.addTabViewItem(tab("Transcription", [
-            section("Mode"),
-            leftWrap(sized(modePopup, 260)),
-
-            singleModeBlock,
-            codeswitchModeBlock,
-
-            section("Quality"),
-            cleanTranscript,
-            caption("Silero VAD is used automatically when its model is on disk."),
-
-            section("Models on disk"),
-            makeModelRow(key: "base",     title: "Whisper base (English) · ~150 MB"),
-            makeModelRow(key: "kb",       title: "KB-Whisper-large (Swedish) · ~1.1 GB"),
-            makeModelRow(key: "large-v3", title: "Whisper large-v3 (English) · ~1.1 GB"),
-            makeModelRow(key: "vad",      title: "Silero VAD · ~900 KB"),
-            caption("Status comes from the verification sidecar written at download time. Hashes match Hugging Face's published SHA256."),
-
-            caption("Prompts, smoothing and other tuning live in config.json — open with the button below.")
-        ]))
-        tabs.addTabViewItem(tab("Summary", [
-            field("Claude CLI", pathControl(claudeField, chooseDir: false)),
-            caption("Summaries use the Claude Code CLI (`claude -p`) with your existing login — no API key needed. Run `claude` once in a terminal to sign in. Only the text transcript is sent; audio never leaves your Mac."),
-            field("Model", leftWrap(sized(summaryBox, 260)))
-        ]))
-
-        // ---- Buttons -----------------------------------------------------
-        let openJSON = NSButton(title: "Open config.json", target: self, action: #selector(openJSON))
-        openJSON.bezelStyle = .rounded
-        let cancel = NSButton(title: "Cancel", target: self, action: #selector(cancel))
-        cancel.bezelStyle = .rounded
-        cancel.keyEquivalent = "\u{1b}"
-        let save = NSButton(title: "Save", target: self, action: #selector(saveAndClose))
-        save.bezelStyle = .rounded
-        save.keyEquivalent = "\r"
-        let spacer = NSView()
-        spacer.setContentHuggingPriority(.init(1), for: .horizontal)
-        let buttons = NSStackView(views: [openJSON, spacer, cancel, save])
-        buttons.orientation = .horizontal
-        buttons.spacing = 10
-        buttons.translatesAutoresizingMaskIntoConstraints = false
-
-        let header = caption("Audio and transcription always stay 100% local. Changes apply to your next call immediately.")
-        header.translatesAutoresizingMaskIntoConstraints = false
-        let sep = separatorLine()
-        sep.translatesAutoresizingMaskIntoConstraints = false
-
-        let root = NSView()
-        root.addSubview(header)
-        root.addSubview(tabs)
-        root.addSubview(sep)
-        root.addSubview(buttons)
-        NSLayoutConstraint.activate([
-            header.topAnchor.constraint(equalTo: root.topAnchor, constant: 14),
-            header.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 18),
-            header.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -18),
-
-            tabs.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 12),
-            tabs.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 16),
-            tabs.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -16),
-
-            sep.topAnchor.constraint(equalTo: tabs.bottomAnchor, constant: 12),
-            sep.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 16),
-            sep.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -16),
-
-            buttons.topAnchor.constraint(equalTo: sep.bottomAnchor, constant: 12),
-            buttons.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 18),
-            buttons.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -18),
-            buttons.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -16)
-        ])
-        return root
+    /// Re-evaluate permissions / engine state / model rows when the user comes
+    /// back from System Settings or just clicks into the window.
+    func windowDidBecomeKey(_ notification: Notification) {
+        refreshLiveBits()
     }
 
-    /// One tab: a top-aligned vertical stack of rows, vertically scrollable so
-    /// a long tab (the combined Transcription tab) never clips.
-    private func tab(_ label: String, _ rows: [NSView]) -> NSTabViewItem {
-        let stack = NSStackView()
-        stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.spacing = 12
-        stack.translatesAutoresizingMaskIntoConstraints = false
-        rows.forEach {
-            stack.addArrangedSubview($0)
-            // Every row spans the full content width so fields can stretch.
-            $0.leadingAnchor.constraint(equalTo: stack.leadingAnchor).isActive = true
-            $0.trailingAnchor.constraint(equalTo: stack.trailingAnchor).isActive = true
+    private func refreshLiveBits() {
+        panes.listening?.refreshPermissions()
+        panes.listening?.refreshLiveStatus(engine?.state ?? .paused)
+        panes.transcription?.refreshAllRows()
+        sidebar?.refreshStatus(engine?.state ?? .paused, perms: PermissionsState.current)
+    }
+
+    // MARK: Engine observer
+
+    private var oldEngineHandler: ((EngineState) -> Void)?
+    private func wireEngineObserver() {
+        guard let engine else { return }
+        oldEngineHandler = engine.onStateChange
+        engine.onStateChange = { [weak self, oldHandler = oldEngineHandler] st in
+            oldHandler?(st)
+            DispatchQueue.main.async { self?.engineStateChanged(st) }
         }
+    }
+    private func unwireEngineObserver() {
+        guard let engine else { return }
+        engine.onStateChange = oldEngineHandler
+        oldEngineHandler = nil
+    }
+    private func engineStateChanged(_ st: EngineState) {
+        panes.listening?.refreshLiveStatus(st)
+        sidebar?.refreshStatus(st, perms: PermissionsState.current)
+        // Recording badge in the content toolbar (Listening pane only).
+        if case .recording = st, currentPaneId == .listening {
+            toolbarBadge?.isHidden = false
+            toolbarBadge?.set(kind: .danger, label: "Recording")
+        } else {
+            toolbarBadge?.isHidden = true
+        }
+    }
 
-        // Flipped doc view → content starts at the top and scrolls down.
-        let doc = FlippedView()
-        doc.translatesAutoresizingMaskIntoConstraints = false
-        doc.addSubview(stack)
-        NSLayoutConstraint.activate([
-            stack.topAnchor.constraint(equalTo: doc.topAnchor, constant: 20),
-            stack.leadingAnchor.constraint(equalTo: doc.leadingAnchor, constant: 22),
-            stack.trailingAnchor.constraint(equalTo: doc.trailingAnchor, constant: -22),
-            stack.bottomAnchor.constraint(equalTo: doc.bottomAnchor, constant: -18)
-        ])
+    // MARK: Pane selection
 
-        let scroll = NSScrollView()
+    private func select(_ id: PaneId, animated: Bool = true) {
+        currentPaneId = id
+        toolbarBadge?.isHidden = !(id == .listening && (engine?.state.isRecording ?? false))
+
+        guard let container = contentContainer else { return }
+        let new = view(for: id)
+        let scroll = wrapInScroll(new)
         scroll.translatesAutoresizingMaskIntoConstraints = false
-        scroll.drawsBackground = false
-        scroll.hasVerticalScroller = true
-        scroll.hasHorizontalScroller = false
-        scroll.autohidesScrollers = true
-        scroll.documentView = doc
-        // Match doc width to the viewport so it only scrolls vertically and
-        // full-width fields still stretch.
-        NSLayoutConstraint.activate([
-            doc.topAnchor.constraint(equalTo: scroll.contentView.topAnchor),
-            doc.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor),
-            doc.trailingAnchor.constraint(equalTo: scroll.contentView.trailingAnchor),
-            doc.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor)
-        ])
 
-        let container = NSView()
+        let old = container.subviews.first
         container.addSubview(scroll)
         NSLayoutConstraint.activate([
             scroll.topAnchor.constraint(equalTo: container.topAnchor),
-            scroll.bottomAnchor.constraint(equalTo: container.bottomAnchor),
             scroll.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            scroll.trailingAnchor.constraint(equalTo: container.trailingAnchor)
+            scroll.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            scroll.bottomAnchor.constraint(equalTo: container.bottomAnchor)
         ])
-        let item = NSTabViewItem(identifier: label)
-        item.label = label
-        item.view = container
-        return item
-    }
 
-    /// Bold group header inside a tab.
-    private func section(_ s: String) -> NSView {
-        let t = NSTextField(labelWithString: s.uppercased())
-        t.font = .systemFont(ofSize: 11, weight: .semibold)
-        t.textColor = .secondaryLabelColor
-        return t
-    }
-
-    // MARK: Builders
-
-    /// A label on its own line above a full-width control.
-    private func field(_ labelText: String, _ control: NSView) -> NSView {
-        let l = NSTextField(labelWithString: labelText)
-        l.alignment = .left
-        l.font = .systemFont(ofSize: 12)
-        l.lineBreakMode = .byTruncatingTail
-        l.translatesAutoresizingMaskIntoConstraints = false
-        control.translatesAutoresizingMaskIntoConstraints = false
-
-        let v = NSView()
-        v.translatesAutoresizingMaskIntoConstraints = false
-        v.addSubview(l)
-        v.addSubview(control)
-        NSLayoutConstraint.activate([
-            l.topAnchor.constraint(equalTo: v.topAnchor),
-            l.leadingAnchor.constraint(equalTo: v.leadingAnchor),
-            l.trailingAnchor.constraint(equalTo: v.trailingAnchor),
-            control.topAnchor.constraint(equalTo: l.bottomAnchor, constant: 5),
-            control.leadingAnchor.constraint(equalTo: v.leadingAnchor),
-            control.trailingAnchor.constraint(equalTo: v.trailingAnchor),
-            control.bottomAnchor.constraint(equalTo: v.bottomAnchor)
-        ])
-        return v
-    }
-
-    /// Wrap a fixed-size control so it sits left-aligned inside a full-width
-    /// row without being stretched (combos, numeric fields).
-    private func leftWrap(_ inner: NSView) -> NSView {
-        inner.translatesAutoresizingMaskIntoConstraints = false
-        let v = NSView()
-        v.translatesAutoresizingMaskIntoConstraints = false
-        v.addSubview(inner)
-        NSLayoutConstraint.activate([
-            inner.leadingAnchor.constraint(equalTo: v.leadingAnchor),
-            inner.topAnchor.constraint(equalTo: v.topAnchor),
-            inner.bottomAnchor.constraint(equalTo: v.bottomAnchor),
-            inner.trailingAnchor.constraint(lessThanOrEqualTo: v.trailingAnchor)
-        ])
-        return v
-    }
-
-    private func caption(_ s: String) -> NSTextField {
-        let t = NSTextField(wrappingLabelWithString: s)
-        t.font = .systemFont(ofSize: 11)
-        t.textColor = .secondaryLabelColor
-        return t
-    }
-
-    /// Build the contents of the Permissions tab. Status is read once when
-    /// the Settings window is built; reopen Settings to re-check after
-    /// granting in System Settings.
-    private func permissionsTabContents() -> [NSView] {
-        let binaryPath = CommandLine.arguments[0]
-        let isAppBundle = binaryPath.contains(".app/Contents/MacOS/")
-        var rows: [NSView] = [
-            caption("Ghostie needs three permissions from macOS. Microphone and Screen Recording are required for recording calls. Accessibility is optional and adds a third confirmation signal for call detection.")
-        ]
-        if !isAppBundle {
-            let warn = caption("⚠︎  This Settings window was opened from \(binaryPath). That's an ad-hoc-signed CLI build; macOS TCC keys grants to a different identity than /Applications/Ghostie.app, so permissions granted here will not transfer to the installed app. Quit and launch Ghostie.app from Finder to manage real grants.")
-            warn.textColor = .systemOrange
-            rows.append(warn)
+        if animated, let old {
+            scroll.alphaValue = 0
+            NSAnimationContext.runAnimationGroup({ ctx in
+                ctx.duration = 0.15
+                old.animator().alphaValue = 0
+                scroll.animator().alphaValue = 1
+            }, completionHandler: {
+                old.removeFromSuperview()
+            })
+        } else {
+            old?.removeFromSuperview()
         }
-        rows.append(section("Required"))
-        rows.append(permissionRow(
-            "Microphone",
-            granted: AVCaptureDevice.authorizationStatus(for: .audio) == .authorized,
-            deniedExplicit: AVCaptureDevice.authorizationStatus(for: .audio) == .denied,
-            detail: "Captures your voice during a call (the 'Me' track). The first call detection triggers a system prompt the first time.",
-            openPaneURL: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"))
-        rows.append(permissionRow(
-            "Screen Recording",
-            granted: CGPreflightScreenCaptureAccess(),
-            deniedExplicit: false,
-            detail: "Captures system audio (the other participants' voices) via ScreenCaptureKit. The 2x2 video stream attached to the audio capture is dropped, not recorded.",
-            openPaneURL: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"))
-        rows.append(section("Optional"))
-        rows.append(permissionRow(
-            "Accessibility",
-            granted: AXIsProcessTrusted(),
-            deniedExplicit: false,
-            detail: "Reads Teams' top-level window titles and roles to confirm a meeting window is open. Adds a third corroborator for call detection; without it the detector relies on audio I/O attribution alone.",
-            openPaneURL: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"))
-        return rows
+
+        sidebar?.setSelected(id)
     }
 
-    /// One row per permission: status pill + label + short rationale + a
-    /// button that deep-links into the relevant System Settings pane.
-    private func permissionRow(_ title: String,
-                               granted: Bool,
-                               deniedExplicit: Bool,
-                               detail: String,
-                               openPaneURL: String) -> NSView {
-        let badge = NSTextField(labelWithString: granted ? "✓ granted"
-                                : deniedExplicit ? "✗ DENIED"
-                                : "✗ not granted")
-        badge.font = .systemFont(ofSize: 11, weight: .semibold)
-        badge.textColor = granted ? .systemGreen : (deniedExplicit ? .systemRed : .systemOrange)
-
-        let label = NSTextField(labelWithString: title)
-        label.font = .systemFont(ofSize: 13, weight: .medium)
-
-        let rationale = NSTextField(wrappingLabelWithString: detail)
-        rationale.font = .systemFont(ofSize: 11)
-        rationale.textColor = .secondaryLabelColor
-
-        let button = NSButton(title: "Open System Settings",
-                              target: self, action: #selector(openPermissionPane(_:)))
-        button.bezelStyle = .rounded
-        button.controlSize = .small
-        button.toolTip = openPaneURL
-        button.identifier = NSUserInterfaceItemIdentifier(openPaneURL)
-        button.isHidden = granted
-
-        for v in [badge, label, rationale, button] {
-            v.translatesAutoresizingMaskIntoConstraints = false
+    private func view(for id: PaneId) -> NSView {
+        switch id {
+        case .listening:
+            if let p = panes.listening { return p }
+            let p = ListeningPane(
+                cfg: cfg,
+                engineState: { [weak self] in self?.engine?.state ?? .paused },
+                onPause: { [weak self] in self?.toggleListening() },
+                changes: { [weak self] block in self?.mutateCfg(block) }
+            )
+            panes.listening = p
+            return p
+        case .notes:
+            if let p = panes.notes { return p }
+            let p = NotesPane(
+                cfg: cfg,
+                drainBacklog: { [weak self] in self?.engine?.drainBacklog() },
+                changes: { [weak self] block in self?.mutateCfg(block) }
+            )
+            panes.notes = p
+            return p
+        case .transcription:
+            if let p = panes.transcription { return p }
+            let p = TranscriptionPane(
+                cfg: cfg,
+                rowAction: { [weak self] key in self?.handleModelRowAction(key) },
+                openConfig: { [weak self] in self?.openJSON() },
+                changes: { [weak self] block in self?.mutateCfg(block) }
+            )
+            panes.transcription = p
+            return p
+        case .summary:
+            if let p = panes.summary { return p }
+            let p = SummaryPane(
+                cfg: cfg,
+                openConfig: { [weak self] in self?.openJSON() },
+                changes: { [weak self] block in self?.mutateCfg(block) }
+            )
+            panes.summary = p
+            return p
+        case .updates:
+            if let p = panes.updates { return p }
+            let p = UpdatesPane(
+                cfg: cfg,
+                onCheckNow: { [weak self] in self?.checkForUpdates() },
+                changes: { [weak self] block in self?.mutateCfg(block) }
+            )
+            panes.updates = p
+            return p
+        case .advanced:
+            if let p = panes.advanced { return p }
+            let p = AdvancedPane(
+                openConfig: { [weak self] in self?.openJSON() },
+                revealData: { [weak self] in self?.revealDataFolder() },
+                runDiagnose: { [weak self] in self?.runCLI("diagnose-detect") },
+                runSelftest: { [weak self] in self?.runCLI("selftest") },
+                runDoctor: { [weak self] in self?.runCLI("doctor") },
+                resetSettings: { [weak self] in self?.resetAllSettings() }
+            )
+            panes.advanced = p
+            return p
+        case .about:
+            if let p = panes.about { return p }
+            let p = AboutPane(openReleases: {
+                NSWorkspace.shared.open(Updater.releasesPage)
+            })
+            panes.about = p
+            return p
         }
-        let row = NSView()
-        row.translatesAutoresizingMaskIntoConstraints = false
-        row.addSubview(label)
-        row.addSubview(badge)
-        row.addSubview(rationale)
-        row.addSubview(button)
+    }
+
+    private func wrapInScroll(_ doc: NSView) -> NSScrollView {
+        let scroll = NSScrollView()
+        scroll.drawsBackground = true
+        scroll.backgroundColor = Theme.contentBg
+        scroll.hasVerticalScroller = true
+        scroll.hasHorizontalScroller = false
+        scroll.autohidesScrollers = true
+        scroll.borderType = .noBorder
+
+        // FlippedView so content lays out from the top and the page opens at
+        // the top, not the bottom (same trick the old form used).
+        let flipped = FlippedView()
+        flipped.translatesAutoresizingMaskIntoConstraints = false
+        flipped.wantsLayer = true
+        flipped.layer?.backgroundColor = Theme.contentBg.cgColor
+        flipped.addSubview(doc)
+        doc.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
-            label.topAnchor.constraint(equalTo: row.topAnchor),
-            label.leadingAnchor.constraint(equalTo: row.leadingAnchor),
-            badge.firstBaselineAnchor.constraint(equalTo: label.firstBaselineAnchor),
-            badge.leadingAnchor.constraint(equalTo: label.trailingAnchor, constant: 10),
-            rationale.topAnchor.constraint(equalTo: label.bottomAnchor, constant: 2),
-            rationale.leadingAnchor.constraint(equalTo: row.leadingAnchor),
-            rationale.trailingAnchor.constraint(equalTo: row.trailingAnchor),
-            button.topAnchor.constraint(equalTo: rationale.bottomAnchor, constant: 4),
-            button.leadingAnchor.constraint(equalTo: row.leadingAnchor),
-            button.bottomAnchor.constraint(equalTo: row.bottomAnchor)
+            doc.topAnchor.constraint(equalTo: flipped.topAnchor, constant: 24),
+            doc.leadingAnchor.constraint(equalTo: flipped.leadingAnchor, constant: 28),
+            doc.trailingAnchor.constraint(equalTo: flipped.trailingAnchor, constant: -28),
+            doc.bottomAnchor.constraint(lessThanOrEqualTo: flipped.bottomAnchor, constant: -32)
         ])
-        // When granted, there's no button — bind the bottom to rationale instead.
-        if granted {
-            NSLayoutConstraint.activate([
-                rationale.bottomAnchor.constraint(equalTo: row.bottomAnchor)
-            ])
-        }
-        return row
-    }
 
-    @objc private func openPermissionPane(_ sender: NSButton) {
-        guard let raw = sender.identifier?.rawValue,
-              let url = URL(string: raw) else { return }
-        NSWorkspace.shared.open(url)
-    }
-    private func separatorLine() -> NSView {
-        let v = NSBox(); v.boxType = .separator
-        return v
-    }
-    private func sized(_ v: NSView, _ w: CGFloat) -> NSView {
-        v.translatesAutoresizingMaskIntoConstraints = false
-        v.widthAnchor.constraint(equalToConstant: w).isActive = true
-        return v
-    }
-    /// Two small numeric fields side by side with a "/" between them.
-    private func pair(_ a: NSTextField, _ b: NSTextField) -> NSView {
-        for f in [a, b] {
-            f.translatesAutoresizingMaskIntoConstraints = false
-            f.widthAnchor.constraint(equalToConstant: 60).isActive = true
-        }
-        let slash = NSTextField(labelWithString: "/")
-        slash.textColor = .secondaryLabelColor
-        let h = NSStackView(views: [a, slash, b])
-        h.orientation = .horizontal
-        h.spacing = 8
-        h.alignment = .firstBaseline
-        return h
-    }
-    private func suffixed(_ field: NSTextField, _ suffix: String, width: CGFloat) -> NSView {
-        field.translatesAutoresizingMaskIntoConstraints = false
-        field.widthAnchor.constraint(equalToConstant: width).isActive = true
-        let s = NSTextField(labelWithString: suffix)
-        s.font = .systemFont(ofSize: 12)
-        s.textColor = .secondaryLabelColor
-        let h = NSStackView(views: [field, s])
-        h.orientation = .horizontal
-        h.spacing = 6
-        h.alignment = .firstBaseline
-        return h
-    }
-    /// A full-width text field that stretches up to a trailing "Choose…"
-    /// button (no label — `field(_:_:)` supplies the label above it).
-    private func pathControl(_ textField: NSTextField, chooseDir: Bool) -> NSView {
-        let container = NSView()
-        container.translatesAutoresizingMaskIntoConstraints = false
-
-        let btn = NSButton(title: "Choose…",
-                           target: self,
-                           action: chooseDir ? #selector(chooseFolder(_:)) : #selector(chooseFile(_:)))
-        btn.bezelStyle = .rounded
-        btn.translatesAutoresizingMaskIntoConstraints = false
-        btn.setContentHuggingPriority(.required, for: .horizontal)
-        btn.setContentCompressionResistancePriority(.required, for: .horizontal)
-        objc_setAssociatedObject(btn, &Self.fieldKey, textField, .OBJC_ASSOCIATION_RETAIN)
-
-        textField.translatesAutoresizingMaskIntoConstraints = false
-        textField.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        textField.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-
-        container.addSubview(textField)
-        container.addSubview(btn)
+        scroll.documentView = flipped
         NSLayoutConstraint.activate([
-            textField.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            textField.trailingAnchor.constraint(equalTo: btn.leadingAnchor, constant: -8),
-            textField.topAnchor.constraint(equalTo: container.topAnchor),
-            textField.bottomAnchor.constraint(equalTo: container.bottomAnchor),
-
-            btn.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            btn.centerYAnchor.constraint(equalTo: textField.centerYAnchor)
+            flipped.topAnchor.constraint(equalTo: scroll.contentView.topAnchor),
+            flipped.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor),
+            flipped.trailingAnchor.constraint(equalTo: scroll.contentView.trailingAnchor),
+            flipped.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor)
         ])
-        return container
+        return scroll
     }
-    private static var fieldKey: UInt8 = 0
-    private func promptBox(_ text: String) -> NSView {
-        promptView.string = text
-        promptView.font = .systemFont(ofSize: 12)
-        promptView.isRichText = false
-        promptView.textContainerInset = NSSize(width: 4, height: 6)
-        let sc = NSScrollView()
-        sc.borderType = .bezelBorder
-        sc.hasVerticalScroller = true
-        sc.documentView = promptView
-        sc.translatesAutoresizingMaskIntoConstraints = false
-        sc.heightAnchor.constraint(equalToConstant: 64).isActive = true
-        sc.widthAnchor.constraint(greaterThanOrEqualToConstant: 480).isActive = true
-        return sc
+
+    // MARK: Mutations + save
+
+    /// Edits go into the in-memory config and are persisted immediately so the
+    /// running engine sees them on the very next call. Save-on-close is gone —
+    /// every knob is a live toggle, matching the System-Settings model.
+    private func mutateCfg(_ block: (inout Config) -> Void) {
+        block(&cfg)
+        if cfg.save() {
+            onSave(Config.load())
+        }
     }
 
     // MARK: Actions
 
-    @objc private func chooseFolder(_ sender: NSButton) { pick(sender, directories: true) }
-    @objc private func chooseFile(_ sender: NSButton) { pick(sender, directories: false) }
+    private func toggleListening() {
+        guard let engine else { return }
+        if engine.isListening { engine.stopListening() } else { engine.startListening() }
+        panes.listening?.refreshLiveStatus(engine.state)
+        sidebar?.refreshStatus(engine.state, perms: PermissionsState.current)
+    }
 
-    private func pick(_ sender: NSButton, directories: Bool) {
-        guard let field = objc_getAssociatedObject(sender, &Self.fieldKey) as? NSTextField
-        else { return }
-        let panel = NSOpenPanel()
-        panel.canChooseDirectories = directories
-        panel.canChooseFiles = !directories
-        panel.allowsMultipleSelection = false
-        panel.canCreateDirectories = true
-        if !field.stringValue.isEmpty {
-            panel.directoryURL = URL(fileURLWithPath: field.stringValue)
-                .deletingLastPathComponent()
+    private func openJSON() {
+        let url = URL(fileURLWithPath: Config.configPath)
+        if !FileManager.default.fileExists(atPath: url.path) {
+            Config.loadRaw().save()
         }
-        if panel.runModal() == .OK, let url = panel.url {
-            field.stringValue = url.path
-        }
+        NSWorkspace.shared.open(url)
     }
 
-    // MARK: - Mode controls (Single language ↔ Code-switching)
-
-    /// Populate the mode popup + the two per-mode blocks. Called once during
-    /// `buildForm`. The mode popup drives which block is visible; the rest is
-    /// just layout.
-    private func buildModeControls(currentlyCodeswitch: Bool,
-                                   currentWhisperModelPath: String) {
-        modePopup.removeAllItems()
-        modePopup.addItems(withTitles: ["Single language", "Code-switching (Swedish ↔ English)"])
-        modePopup.target = self
-        modePopup.action = #selector(modeChanged)
-        modePopup.selectItem(at: currentlyCodeswitch ? 1 : 0)
-
-        // Single-mode whisper model popup. Each item carries its `Model` (or
-        // nil for the "Custom" sentinel) via `representedObject`, so save just
-        // reads model.destPath without re-mapping titles.
-        whisperModelPopup.removeAllItems()
-        func addModelItem(_ title: String, _ model: Model?) {
-            let mi = NSMenuItem(title: title, action: nil, keyEquivalent: "")
-            mi.representedObject = model
-            whisperModelPopup.menu?.addItem(mi)
-        }
-        addModelItem("Whisper base (English) · 150 MB", Models.baseEnglish)
-        addModelItem("Whisper large-v3 (multilingual) · 1.1 GB", Models.largeV3)
-        // If the user's config points at something unrecognized, surface it as
-        // "Custom" so they don't get silently overwritten on save.
-        let isKnown = currentWhisperModelPath == Models.baseEnglish.destPath
-                   || currentWhisperModelPath == Models.largeV3.destPath
-        if !isKnown && !currentWhisperModelPath.isEmpty {
-            addModelItem("Custom (\(URL(fileURLWithPath: currentWhisperModelPath).lastPathComponent))", nil)
-            whisperModelPopup.selectItem(at: 2)
-        } else if currentWhisperModelPath == Models.largeV3.destPath {
-            whisperModelPopup.selectItem(at: 1)
-        } else {
-            whisperModelPopup.selectItem(at: 0)
-        }
-        whisperModelPopup.target = self
-        whisperModelPopup.action = #selector(whisperModelChanged)
-
-        // ---- Single-language block --------------------------------------
-        singleModeBlock.orientation = .vertical
-        singleModeBlock.alignment = .leading
-        singleModeBlock.spacing = 12
-        singleModeBlock.setHuggingPriority(.defaultLow, for: .horizontal)
-        singleModeBlock.addArrangedSubview(field("Model", leftWrap(sized(whisperModelPopup, 360))))
-        singleModeBlock.addArrangedSubview(field("Language", leftWrap(sized(languageBox, 120))))
-
-        // ---- Code-switching block ---------------------------------------
-        codeswitchModeBlock.orientation = .vertical
-        codeswitchModeBlock.alignment = .leading
-        codeswitchModeBlock.spacing = 12
-        codeswitchModeBlock.setHuggingPriority(.defaultLow, for: .horizontal)
-        codeswitchModeBlock.addArrangedSubview(
-            field("Tie-breaker language", leftWrap(sized(csDominant, 120))))
-        codeswitchModeBlock.addArrangedSubview(
-            field("Swedish transcription style", leftWrap(sized(csVariant, 160))))
-        codeswitchModeBlock.addArrangedSubview(
-            caption("standard, balanced for notes · strict, verbatim with filler."))
-
-        // Both blocks are always in the tab; toggle visibility based on mode.
-        applyModeVisibility()
+    private func revealDataFolder() {
+        let p = "\(NSHomeDirectory())/.ghostie"
+        try? FileManager.default.createDirectory(atPath: p, withIntermediateDirectories: true)
+        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: p)])
     }
 
-    private func applyModeVisibility() {
-        let codeswitch = modePopup.indexOfSelectedItem == 1
-        singleModeBlock.isHidden = codeswitch
-        codeswitchModeBlock.isHidden = !codeswitch
+    private func runCLI(_ subcommand: String) {
+        // Find the same binary that's running us, so the CLI sees the same
+        // bundle / config. Fall back to `ghostie` on PATH if we can't.
+        let me = CommandLine.arguments[0]
+        let bin = FileManager.default.isExecutableFile(atPath: me) ? me : "/usr/local/bin/ghostie"
+        let cmd = "\(bin.shellEscaped) \(subcommand)"
+        let script = "tell application \"Terminal\"\n  activate\n  do script \"\(cmd)\"\nend tell"
+        var err: NSDictionary?
+        NSAppleScript(source: script)?.executeAndReturnError(&err)
     }
 
-    @objc private func modeChanged() {
-        applyModeVisibility()
+    private func resetAllSettings() {
+        let a = NSAlert()
+        a.alertStyle = .warning
+        a.messageText = "Put every setting back to default?"
+        a.informativeText = "Your notes, the queued calls, and the models you've downloaded stay put — only Ghostie's settings are reset."
+        a.addButton(withTitle: "Reset")
+        a.addButton(withTitle: "Cancel")
+        guard a.runModal() == .alertFirstButtonReturn else { return }
+        cfg = Config()
+        if cfg.save() { onSave(Config.load()) }
+        // Rebuild panes so the UI reflects defaults.
+        panes = PaneRefs()
+        select(currentPaneId, animated: false)
     }
 
-    @objc private func whisperModelChanged() {
-        // No-op for now; save() reads the popup's current representedObject.
-        // The handler exists so future UX (e.g. live status under the picker)
-        // can hang off it without restructuring.
-    }
+    // MARK: Updates
 
-    // MARK: - Per-model rows (Models on disk)
-
-    /// Resolve the row key to the Model it currently represents. The "kb"
-    /// row depends on the variant dropdown, so it has to recompute each time.
-    private func modelForKey(_ key: String) -> Model? {
-        switch key {
-        case "base":     return Models.baseEnglish
-        case "large-v3": return Models.largeV3
-        case "vad":      return Models.sileroVAD
-        case "kb":
-            let variant = csVariant.stringValue.trimmingCharacters(in: .whitespaces)
-            return Models.kbWhisperLarge(variant: variant.isEmpty ? "standard" : variant)
-        default:         return nil
-        }
-    }
-
-    /// Build a row: title on the left, status in the middle, action button on
-    /// the right. Same pattern for every model. Stored in `modelRows` by key.
-    private func makeModelRow(key: String, title: String) -> NSView {
-        let name = NSTextField(labelWithString: title)
-        name.font = .systemFont(ofSize: 12)
-        let status = NSTextField(labelWithString: "—")
-        status.font = .systemFont(ofSize: 11)
-        status.textColor = .secondaryLabelColor
-        status.lineBreakMode = .byTruncatingTail
-        let action = NSButton(title: "—", target: self,
-                              action: #selector(modelRowAction(_:)))
-        action.bezelStyle = .rounded
-        action.identifier = NSUserInterfaceItemIdentifier(key)
-        modelRows[key] = ModelRowViews(status: status, action: action)
-
-        let row = NSStackView(views: [name, status, action])
-        row.orientation = .horizontal
-        row.spacing = 12
-        row.alignment = .centerY
-        row.distribution = .fill
-        name.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        name.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        status.setContentHuggingPriority(.defaultHigh, for: .horizontal)
-        action.setContentHuggingPriority(.required, for: .horizontal)
-        DispatchQueue.main.async { [weak self] in self?.refreshModelRow(key) }
-        return row
-    }
-
-    /// Synchronously read the on-disk state via the sidecar and update the row.
-    /// No network and no full re-hash here — that's what the action button is
-    /// for (Verify / Re-verify do the heavy work in the background).
-    private func refreshModelRow(_ key: String) {
-        guard let row = modelRows[key] else { return }
-        if inflightModelKey == key { return }   // mid-download; leave as-is
-        guard let model = modelForKey(key) else {
-            row.status.stringValue = "no downloadable model for this variant"
-            row.action.title = "—"
-            row.action.isEnabled = false
-            return
-        }
-        let h = ModelDownloader.health(for: [model])[0]
-        row.status.stringValue = h.state.summary
-        row.action.isEnabled = inflightModelKey == nil
-        switch h.state {
-        case .ok:                              row.action.title = "Re-verify"
-        case .missing:                         row.action.title = "Download"
-        case .noSidecar:                       row.action.title = "Verify"
-        case .sizeWrong, .hashMismatch:        row.action.title = "Re-download"
-        }
-    }
-
-    private func refreshAllModelRows() {
-        for key in modelRows.keys { refreshModelRow(key) }
-    }
-
-    @objc private func variantChanged() {
-        // The kb row's filename + status both depend on the variant.
-        refreshModelRow("kb")
-    }
-
-    @objc private func modelRowAction(_ sender: NSButton) {
-        guard let key = sender.identifier?.rawValue,
-              let model = modelForKey(key) else { return }
-        let h = ModelDownloader.health(for: [model])[0]
-        switch h.state {
-        case .missing, .sizeWrong, .hashMismatch:
-            startDownload(model, key: key)
-        case .noSidecar:
-            startAdopt(model, key: key)
-        case .ok:
-            startReverify(model, key: key)
-        }
-    }
-
-    private func startDownload(_ model: Model, key: String) {
-        guard inflightModelKey == nil else { return }
-        inflightModelKey = key
-        for k in modelRows.keys where k != key {
-            modelRows[k]?.action.isEnabled = false
-        }
-        modelRows[key]?.status.stringValue = "Starting…"
-        modelRows[key]?.action.title = "Downloading…"
-        modelRows[key]?.action.isEnabled = false
-        downloader.start(models: [model], status: { [weak self] s in
-            self?.modelRows[key]?.status.stringValue = s
-        }, finish: { [weak self] err in
-            guard let self else { return }
-            self.inflightModelKey = nil
-            if let err {
-                self.alert(.critical, "Download failed", err.localizedDescription)
-            }
-            self.refreshAllModelRows()
-        })
-    }
-
-    /// HEAD + hash the existing on-disk file and write the sidecar if it
-    /// matches. No re-download. Runs off the main queue because hashing 1 GB
-    /// is a few seconds.
-    private func startAdopt(_ model: Model, key: String) {
-        guard inflightModelKey == nil else { return }
-        modelRows[key]?.status.stringValue = "Verifying (HEAD + SHA256)…"
-        modelRows[key]?.action.isEnabled = false
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            _ = ModelDownloader.adopt(model)
-            DispatchQueue.main.async { self?.refreshModelRow(key) }
-        }
-    }
-
-    /// Re-hash an already-verified file against the cached sidecar etag.
-    /// Catches local file corruption since the last verify. Same background
-    /// dispatch as adopt.
-    private func startReverify(_ model: Model, key: String) {
-        guard inflightModelKey == nil else { return }
-        modelRows[key]?.status.stringValue = "Re-hashing…"
-        modelRows[key]?.action.isEnabled = false
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            _ = ModelDownloader.health(for: [model])
-            DispatchQueue.main.async { self?.refreshModelRow(key) }
-        }
-    }
-
-    @objc private func checkForUpdates() {
+    private func checkForUpdates() {
+        guard let up = panes.updates else { return }
         if updater.isRunning { return }
-        updateCheckBtn.isEnabled = false
-        updateStatus.stringValue = "Checking…"
+        up.setBusy(true, statusText: "Checking…")
         updater.check(config: Config.load()) { [weak self] result in
             guard let self else { return }
-            self.updateCheckBtn.isEnabled = true
+            up.setBusy(false, statusText: nil)
             switch result {
             case .success(.upToDate(let cur)):
-                self.updateStatus.stringValue = "You're up to date — Ghostie \(cur)."
+                up.show(status: .upToDate(version: "\(cur)"))
             case .success(.skippedUnsupportedBuild):
-                self.updateStatus.stringValue =
-                    "This build can't self-update. Download from GitHub Releases."
+                up.show(status: .unsupported)
             case .failure(let e):
-                self.updateStatus.stringValue = "Check failed: \(e.localizedDescription)"
+                up.show(status: .failed(e.localizedDescription))
             case .success(.available(let r, let cur)):
-                self.updateStatus.stringValue = "Update available: \(cur) → \(r.tag)"
+                up.show(status: .available(from: "\(cur)", to: r.tag, notes: r.notes))
                 let a = NSAlert()
                 a.messageText = "Update Ghostie to \(r.tag)?"
                 a.informativeText = (r.notes.isEmpty ? "" : r.notes + "\n\n")
-                    + "Ghostie will download and verify the update, then quit "
-                    + "and relaunch. It won't interrupt an active call."
+                    + "Ghostie will download and verify the update, then quit and relaunch. It won't interrupt an active call."
                 a.addButton(withTitle: "Update Now")
                 a.addButton(withTitle: "Later")
                 guard a.runModal() == .alertFirstButtonReturn else { return }
-                self.updateCheckBtn.isEnabled = false
-                self.updateCheckBtn.title = "Updating…"
+                up.setBusy(true, statusText: "Updating…")
                 self.updater.downloadAndInstall(r, engine: self.engine,
-                    status: { [weak self] s in self?.updateStatus.stringValue = s },
-                    finish: { [weak self] err in
-                        guard let self else { return }
-                        self.updateCheckBtn.isEnabled = true
-                        self.updateCheckBtn.title = "Check Now…"
-                        if let err {
-                            self.alert(.critical, "Update failed",
-                                       err.localizedDescription)
+                    status: { s in DispatchQueue.main.async { up.setBusy(true, statusText: s) } },
+                    finish: { err in
+                        DispatchQueue.main.async {
+                            up.setBusy(false, statusText: nil)
+                            if let err {
+                                let a = NSAlert()
+                                a.alertStyle = .critical
+                                a.messageText = "Update failed"
+                                a.informativeText = err.localizedDescription
+                                a.runModal()
+                            }
                         }
                     },
                     commit: { [weak self] in
@@ -886,65 +463,2852 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         }
     }
 
-    private func alert(_ style: NSAlert.Style, _ title: String, _ info: String) {
-        let a = NSAlert()
-        a.alertStyle = style
-        a.messageText = title
-        a.informativeText = info
-        a.runModal()
+    // MARK: Model row actions
+
+    /// Resolve the row key to the Model it currently represents. The "kb"
+    /// row depends on the variant in the in-memory config, so it has to
+    /// recompute each time.
+    fileprivate func modelForKey(_ key: String) -> Model? {
+        switch key {
+        case "base":     return Models.baseEnglish
+        case "large-v3": return Models.largeV3
+        case "vad":      return Models.sileroVAD
+        case "kb":
+            let v = cfg.codeSwitch.kbWhisperVariant
+            return Models.kbWhisperLarge(variant: v.isEmpty ? "standard" : v)
+        default: return nil
+        }
     }
 
-    @objc private func openJSON() {
-        let url = URL(fileURLWithPath: Config.configPath)
-        if !FileManager.default.fileExists(atPath: url.path) {
-            Config.loadRaw().save()
+    private func handleModelRowAction(_ key: String) {
+        guard let model = modelForKey(key) else { return }
+        let h = ModelDownloader.health(for: [model])[0]
+        switch h.state {
+        case .missing, .sizeWrong, .hashMismatch:
+            if inflightModelKey == key {
+                downloader.cancel()
+                inflightModelKey = nil
+                panes.transcription?.refreshAllRows()
+            } else {
+                startDownload(model, key: key)
+            }
+        case .noSidecar:
+            startAdopt(model, key: key)
+        case .ok:
+            startReverify(model, key: key)
         }
-        NSWorkspace.shared.open(url)
     }
 
-    @objc private func cancel() { window?.close() }
+    private func startDownload(_ model: Model, key: String) {
+        guard inflightModelKey == nil else { return }
+        inflightModelKey = key
+        panes.transcription?.setRowDownloading(key, percent: 0, status: "Starting…")
+        downloader.start(models: [model], status: { [weak self] s in
+            let pct = Self.parsePercent(s) ?? 0
+            self?.panes.transcription?.setRowDownloading(key, percent: pct, status: s)
+        }, finish: { [weak self] err in
+            guard let self else { return }
+            self.inflightModelKey = nil
+            if let err {
+                let a = NSAlert()
+                a.alertStyle = .critical
+                a.messageText = "Download failed"
+                a.informativeText = err.localizedDescription
+                a.runModal()
+            }
+            self.panes.transcription?.refreshAllRows()
+        })
+    }
 
-    @objc private func saveAndClose() {
-        var cfg = Config.loadRaw()   // preserve advanced fields not in the form
-        cfg.notesFolder = notesField.stringValue.trimmingCharacters(in: .whitespaces)
-        cfg.keepAudio = keepAudio.state == .on
-        cfg.saveTranscript = saveTranscript.state == .on
-        cfg.requireTriggerApp = requireTeams.state == .on
-        cfg.endGraceSeconds = Double(endGrace.stringValue) ?? cfg.endGraceSeconds
-        cfg.minCallSeconds = Double(minCall.stringValue) ?? cfg.minCallSeconds
-        // Single-mode whisper model comes from the popup; falls back to the
-        // existing config value if the user selected the "Custom" sentinel.
-        if let m = whisperModelPopup.selectedItem?.representedObject as? Model {
-            cfg.whisperModel = m.destPath
+    private func startAdopt(_ model: Model, key: String) {
+        guard inflightModelKey == nil else { return }
+        panes.transcription?.setRowBusy(key, status: "Verifying (HEAD + SHA256)…")
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            _ = ModelDownloader.adopt(model)
+            DispatchQueue.main.async { self?.panes.transcription?.refreshRow(key) }
         }
-        cfg.language = languageBox.stringValue.trimmingCharacters(in: .whitespaces)
-        cfg.cleanTranscript = cleanTranscript.state == .on
-        cfg.initialPrompt = promptView.string
-        // VAD model is always the manifest path now (single source of truth).
-        cfg.vadModel = Models.sileroVAD.destPath
-        cfg.summaryModel = summaryBox.stringValue.trimmingCharacters(in: .whitespaces)
-        cfg.claudeBinary = claudeField.stringValue.trimmingCharacters(in: .whitespaces)
-        cfg.autoCheckUpdates = autoUpdateCheck.state == .on
+    }
 
-        // Mode toggles codeSwitch.enabled. The advanced codeswitch values
-        // (prompts, smoothing knobs) are preserved untouched — they round-trip
-        // through cfg loaded above. Only the user-facing knobs are written here.
-        cfg.codeSwitch.enabled = modePopup.indexOfSelectedItem == 1
-        cfg.codeSwitch.languages = ["sv", "en"]
-        cfg.codeSwitch.dominantLanguage = csDominant.stringValue.trimmingCharacters(in: .whitespaces)
-        cfg.codeSwitch.modelPerLanguage["sv"] = "kb-whisper-large"
-        cfg.codeSwitch.modelPerLanguage["en"] = "whisper-large-v3"
-        cfg.codeSwitch.kbWhisperVariant = csVariant.stringValue.trimmingCharacters(in: .whitespaces)
-
-        if cfg.save() {
-            onSave(Config.load())
+    private func startReverify(_ model: Model, key: String) {
+        guard inflightModelKey == nil else { return }
+        panes.transcription?.setRowBusy(key, status: "Re-hashing…")
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            _ = ModelDownloader.health(for: [model])
+            DispatchQueue.main.async { self?.panes.transcription?.refreshRow(key) }
         }
-        window?.close()
+    }
+
+    static func parsePercent(_ s: String) -> Double? {
+        // "Downloading … 62%  (X MB/Y MB)" → 0.62
+        guard let pct = s.range(of: #"\b(\d{1,3})%"#, options: .regularExpression) else { return nil }
+        let n = Int(s[pct].dropLast()) ?? 0
+        return Double(min(max(n, 0), 100)) / 100.0
     }
 }
 
-/// Document view for a scrollable tab — flipped so content is laid out from
-/// the top and the tab opens scrolled to the top, not the bottom.
+private extension EngineState {
+    var isRecording: Bool {
+        if case .recording = self { return true } else { return false }
+    }
+}
+
+private extension String {
+    /// Quote a path for `do script` (AppleScript). Simple enough: escape any
+    /// embedded backslashes / double-quotes; the destination is interpreted by
+    /// /bin/sh, so spaces and parens land in the quoted form unchanged.
+    var shellEscaped: String {
+        let escaped = self
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+        return "\\\"\(escaped)\\\""
+    }
+}
+
+// MARK: - Pane identity
+
+private enum PaneId: String, CaseIterable {
+    case listening, notes, transcription, summary, updates, advanced, about
+
+    static let mainOrder: [PaneId] = [.listening, .notes, .transcription, .summary, .updates]
+    static let bottomOrder: [PaneId] = [.advanced, .about]
+
+    var title: String {
+        switch self {
+        case .listening:     return "Listening"
+        case .notes:         return "Notes"
+        case .transcription: return "Transcription"
+        case .summary:       return "Summary"
+        case .updates:       return "Updates"
+        case .advanced:      return "Developer"
+        case .about:         return "About"
+        }
+    }
+
+    var systemSymbol: String {
+        switch self {
+        case .listening:     return "mic"
+        case .notes:         return "folder"
+        case .transcription: return "waveform"
+        case .summary:       return "sparkles"
+        case .updates:       return "arrow.triangle.2.circlepath"
+        case .advanced:      return "hammer"
+        case .about:         return "info.circle"
+        }
+    }
+}
+
+/// Single global "Show advanced" flag. Replaced the per-pane disclosures —
+/// having one switch per pane meant the user had to flip it five times to see
+/// every advanced row. One switch in the sidebar covers all panes; the panes
+/// listen on `didChange` and re-show their advanced cards.
+enum Disclosure {
+    static let key = "ghostie.advanced"
+    static let didChange = Notification.Name("ghostie.disclosure.didChange")
+    static var isOn: Bool {
+        get { UserDefaults.standard.bool(forKey: key) }
+        set {
+            UserDefaults.standard.set(newValue, forKey: key)
+            NotificationCenter.default.post(name: didChange, object: nil)
+        }
+    }
+    static func toggle() { isOn.toggle() }
+}
+
+// MARK: - Theme tokens
+
+enum Theme {
+
+    static var windowBg: NSColor   { dyn(light: 0xECECEF, dark: 0x1C1C1E) }
+    static var contentBg: NSColor  { dyn(light: 0xFFFFFF, dark: 0x1C1C1E) }
+    static var cardBg: NSColor     { dyn(light: 0xFFFFFF, dark: 0x2C2C2E) }
+    static var sidebarBg: NSColor  { dyn(light: 0xF6F6F9, dark: 0x242426) }
+    static var cardBorder: NSColor {
+        NSColor(name: nil) { ap in
+            ap.name == .darkAqua
+                ? NSColor(white: 1, alpha: 0.07)
+                : NSColor(red: 60/255, green: 60/255, blue: 67/255, alpha: 0.14)
+        }
+    }
+    static var rowDivider: NSColor {
+        NSColor(name: nil) { ap in
+            ap.name == .darkAqua
+                ? NSColor(white: 1, alpha: 0.07)
+                : NSColor(red: 60/255, green: 60/255, blue: 67/255, alpha: 0.12)
+        }
+    }
+    static var chipBg: NSColor {
+        NSColor(name: nil) { ap in
+            ap.name == .darkAqua
+                ? NSColor(white: 1, alpha: 0.06)
+                : NSColor(red: 60/255, green: 60/255, blue: 67/255, alpha: 0.08)
+        }
+    }
+    static var selectedItem: NSColor {
+        NSColor(name: nil) { ap in
+            ap.name == .darkAqua
+                ? NSColor(white: 1, alpha: 0.10)
+                : NSColor(red: 60/255, green: 60/255, blue: 67/255, alpha: 0.12)
+        }
+    }
+    static var text: NSColor {
+        NSColor(name: nil) { ap in
+            ap.name == .darkAqua
+                ? NSColor(white: 1, alpha: 0.92)
+                : NSColor(white: 0, alpha: 0.86)
+        }
+    }
+    static var text2: NSColor {
+        NSColor(name: nil) { ap in
+            ap.name == .darkAqua
+                ? NSColor(red: 235/255, green: 235/255, blue: 245/255, alpha: 0.60)
+                : NSColor(red: 60/255, green: 60/255, blue: 67/255, alpha: 0.62)
+        }
+    }
+    static var text3: NSColor {
+        NSColor(name: nil) { ap in
+            ap.name == .darkAqua
+                ? NSColor(red: 235/255, green: 235/255, blue: 245/255, alpha: 0.35)
+                : NSColor(red: 60/255, green: 60/255, blue: 67/255, alpha: 0.35)
+        }
+    }
+    static var accent: NSColor     { dyn(light: 0x5E5CE6, dark: 0x7D7AFF) }
+    static var ok: NSColor         { dyn(light: 0x1F9D55, dark: 0x30D158) }
+    static var warn: NSColor       { dyn(light: 0xB46300, dark: 0xFF9F0A) }
+    static var danger: NSColor     { dyn(light: 0xC93B32, dark: 0xFF453A) }
+    static var info: NSColor       { dyn(light: 0x0067CC, dark: 0x0A84FF) }
+
+    static var okSoft: NSColor     { soft(.ok) }
+    static var warnSoft: NSColor   { soft(.warn) }
+    static var dangerSoft: NSColor { soft(.danger) }
+    static var infoSoft: NSColor   { soft(.info) }
+    static var accentSoft: NSColor { soft(.accent) }
+
+    static var toolbarBg: NSColor      { sidebarBg }
+    static var toolbarBorder: NSColor  { cardBorder }
+    static var inputBorder: NSColor    { cardBorder }
+
+    private static func dyn(light: UInt32, dark: UInt32) -> NSColor {
+        NSColor(name: nil) { ap in
+            ap.name == .darkAqua ? rgb(dark) : rgb(light)
+        }
+    }
+    private static func rgb(_ hex: UInt32) -> NSColor {
+        NSColor(red: CGFloat((hex >> 16) & 0xff) / 255,
+                green: CGFloat((hex >> 8) & 0xff) / 255,
+                blue: CGFloat(hex & 0xff) / 255, alpha: 1)
+    }
+    private enum SoftKind { case ok, warn, danger, info, accent }
+    private static func soft(_ k: SoftKind) -> NSColor {
+        NSColor(name: nil) { ap in
+            let base: NSColor
+            switch k {
+            case .ok:     base = ap.name == .darkAqua ? rgb(0x30D158) : rgb(0x1F9D55)
+            case .warn:   base = ap.name == .darkAqua ? rgb(0xFF9F0A) : rgb(0xB46300)
+            case .danger: base = ap.name == .darkAqua ? rgb(0xFF453A) : rgb(0xC93B32)
+            case .info:   base = ap.name == .darkAqua ? rgb(0x0A84FF) : rgb(0x0067CC)
+            case .accent: base = ap.name == .darkAqua ? rgb(0x7D7AFF) : rgb(0x5E5CE6)
+            }
+            return base.withAlphaComponent(ap.name == .darkAqua ? 0.18 : 0.13)
+        }
+    }
+}
+
+// MARK: - Primitives
+
 private final class FlippedView: NSView {
     override var isFlipped: Bool { true }
+}
+
+/// Card with a 0.5 pt border and 10 pt corner radius. Holds rows + dividers.
+private final class GroupCard: NSView {
+    private let stack = NSStackView()
+    private let titleLabel = NSTextField(labelWithString: "")
+    init(title: String? = nil) {
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+        if let title {
+            titleLabel.stringValue = title.uppercased()
+            titleLabel.font = .systemFont(ofSize: 11, weight: .semibold)
+            titleLabel.textColor = Theme.text2
+            titleLabel.translatesAutoresizingMaskIntoConstraints = false
+        }
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 0
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        stack.wantsLayer = true
+        stack.layer?.backgroundColor = Theme.cardBg.cgColor
+        stack.layer?.cornerRadius = 10
+        stack.layer?.borderWidth = 0.5
+        stack.layer?.borderColor = Theme.cardBorder.cgColor
+        stack.layer?.masksToBounds = true
+        stack.edgeInsets = .init()
+
+        addSubview(stack)
+        var consts: [NSLayoutConstraint] = []
+        if title != nil {
+            addSubview(titleLabel)
+            consts += [
+                titleLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 4),
+                titleLabel.topAnchor.constraint(equalTo: topAnchor),
+                stack.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 7)
+            ]
+        } else {
+            consts += [stack.topAnchor.constraint(equalTo: topAnchor)]
+        }
+        consts += [
+            stack.leadingAnchor.constraint(equalTo: leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: trailingAnchor),
+            stack.bottomAnchor.constraint(equalTo: bottomAnchor)
+        ]
+        NSLayoutConstraint.activate(consts)
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        stack.layer?.backgroundColor = Theme.cardBg.cgColor
+        stack.layer?.borderColor = Theme.cardBorder.cgColor
+    }
+
+    func addRow(_ row: NSView, last: Bool = false) {
+        row.translatesAutoresizingMaskIntoConstraints = false
+        stack.addArrangedSubview(row)
+        row.leadingAnchor.constraint(equalTo: stack.leadingAnchor).isActive = true
+        row.trailingAnchor.constraint(equalTo: stack.trailingAnchor).isActive = true
+        if !last {
+            let div = DividerView()
+            stack.addArrangedSubview(div)
+            div.leadingAnchor.constraint(equalTo: stack.leadingAnchor, constant: 14).isActive = true
+            div.trailingAnchor.constraint(equalTo: stack.trailingAnchor).isActive = true
+            div.heightAnchor.constraint(equalToConstant: 0.5).isActive = true
+        }
+    }
+}
+
+private final class DividerView: NSView {
+    init() {
+        super.init(frame: .zero)
+        wantsLayer = true
+        layer?.backgroundColor = Theme.rowDivider.cgColor
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        layer?.backgroundColor = Theme.rowDivider.cgColor
+    }
+}
+
+private final class PageHeaderView: NSView {
+    init(title: String, subtitle: String?) {
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+        let t = NSTextField(labelWithString: title)
+        t.font = .systemFont(ofSize: 22, weight: .bold)
+        t.textColor = Theme.text
+        t.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(t)
+        var consts: [NSLayoutConstraint] = [
+            t.topAnchor.constraint(equalTo: topAnchor),
+            t.leadingAnchor.constraint(equalTo: leadingAnchor),
+            t.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor)
+        ]
+        if let subtitle {
+            let s = NSTextField(wrappingLabelWithString: subtitle)
+            s.font = .systemFont(ofSize: 12.5)
+            s.textColor = Theme.text2
+            s.translatesAutoresizingMaskIntoConstraints = false
+            s.preferredMaxLayoutWidth = 560
+            addSubview(s)
+            consts += [
+                s.topAnchor.constraint(equalTo: t.bottomAnchor, constant: 3),
+                s.leadingAnchor.constraint(equalTo: leadingAnchor),
+                s.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor),
+                s.bottomAnchor.constraint(equalTo: bottomAnchor)
+            ]
+        } else {
+            consts += [t.bottomAnchor.constraint(equalTo: bottomAnchor)]
+        }
+        NSLayoutConstraint.activate(consts)
+    }
+    required init?(coder: NSCoder) { fatalError() }
+}
+
+private final class StatusBadgeView: NSView {
+
+    enum Kind { case ok, warn, danger, info, muted, accent }
+
+    private var kind: Kind
+    private var label: String
+    private let dot = NSView()
+    private let text = NSTextField(labelWithString: "")
+    private var pulseLayer: CAShapeLayer?
+
+    init(kind: Kind, label: String, pulsing: Bool = false) {
+        self.kind = kind
+        self.label = label
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+        wantsLayer = true
+        layer?.cornerRadius = 9
+        dot.translatesAutoresizingMaskIntoConstraints = false
+        dot.wantsLayer = true
+        text.font = .systemFont(ofSize: 11, weight: .semibold)
+        text.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(dot)
+        addSubview(text)
+        NSLayoutConstraint.activate([
+            dot.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 7),
+            dot.centerYAnchor.constraint(equalTo: centerYAnchor),
+            dot.widthAnchor.constraint(equalToConstant: 6),
+            dot.heightAnchor.constraint(equalToConstant: 6),
+            text.leadingAnchor.constraint(equalTo: dot.trailingAnchor, constant: 5),
+            text.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
+            text.centerYAnchor.constraint(equalTo: centerYAnchor),
+            heightAnchor.constraint(equalToConstant: 18)
+        ])
+        apply()
+        if pulsing { startPulse() }
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    func set(kind: Kind, label: String) {
+        self.kind = kind
+        self.label = label
+        apply()
+    }
+
+    private var cachedLabel: String?
+    private var cachedKind: Kind?
+
+    private func apply() {
+        let (bg, fg) = colors(for: kind)
+        layer?.backgroundColor = bg.cgColor
+        dot.layer?.backgroundColor = fg.cgColor
+        dot.layer?.cornerRadius = 3
+        // NSTextField redraws on every stringValue/textColor assignment even
+        // when the value hasn't changed, which cascades back into our redraw
+        // chain — only push when something is actually new.
+        if cachedLabel != label {
+            cachedLabel = label
+            text.stringValue = label
+        }
+        if cachedKind != kind {
+            cachedKind = kind
+            text.textColor = fg
+        }
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        let (bg, fg) = colors(for: kind)
+        layer?.backgroundColor = bg.cgColor
+        dot.layer?.backgroundColor = fg.cgColor
+        text.textColor = fg
+    }
+
+    func startPulse() {
+        guard pulseLayer == nil else { return }
+        let r = CAShapeLayer()
+        r.path = CGPath(ellipseIn: CGRect(x: 0, y: 0, width: 6, height: 6), transform: nil)
+        let (_, fg) = colors(for: kind)
+        r.fillColor = fg.withAlphaComponent(0.5).cgColor
+        r.frame = CGRect(x: 0, y: 0, width: 6, height: 6)
+        dot.layer?.addSublayer(r)
+        let scale = CABasicAnimation(keyPath: "transform.scale")
+        scale.fromValue = 1.0
+        scale.toValue = 2.8
+        scale.duration = 1.6
+        scale.repeatCount = .infinity
+        scale.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        let op = CABasicAnimation(keyPath: "opacity")
+        op.fromValue = 0.5
+        op.toValue = 0.0
+        op.duration = 1.6
+        op.repeatCount = .infinity
+        r.add(scale, forKey: "scale")
+        r.add(op, forKey: "opacity")
+        pulseLayer = r
+    }
+
+    func stopPulse() {
+        pulseLayer?.removeAllAnimations()
+        pulseLayer?.removeFromSuperlayer()
+        pulseLayer = nil
+    }
+
+    private func colors(for k: Kind) -> (bg: NSColor, fg: NSColor) {
+        switch k {
+        case .ok:     return (Theme.okSoft, Theme.ok)
+        case .warn:   return (Theme.warnSoft, Theme.warn)
+        case .danger: return (Theme.dangerSoft, Theme.danger)
+        case .info:   return (Theme.infoSoft, Theme.info)
+        case .accent: return (Theme.accentSoft, Theme.accent)
+        case .muted:  return (Theme.chipBg, Theme.text2)
+        }
+    }
+}
+
+/// One settings row. Optional leading tinted icon tile, label + sub, trailing
+/// control. The control area is a single NSView so callers can drop any control
+/// (toggle, segmented control, button, badge) into the same slot.
+private final class RowBuilder {
+    static func row(label: String,
+                    sub: String? = nil,
+                    leadingSymbol: String? = nil,
+                    leadingTint: NSColor? = nil,
+                    control: NSView? = nil,
+                    danger: Bool = false) -> NSView {
+        let row = NSView()
+        row.translatesAutoresizingMaskIntoConstraints = false
+
+        var leading: NSView = row
+        var leadingConstant: CGFloat = 14
+        if let leadingSymbol {
+            let tile = NSView()
+            tile.translatesAutoresizingMaskIntoConstraints = false
+            tile.wantsLayer = true
+            tile.layer?.backgroundColor = (leadingTint ?? Theme.chipBg).cgColor
+            tile.layer?.cornerRadius = 6
+            let iv = NSImageView()
+            iv.translatesAutoresizingMaskIntoConstraints = false
+            iv.image = NSImage(systemSymbolName: leadingSymbol,
+                               accessibilityDescription: nil)?
+                .withSymbolConfiguration(.init(pointSize: 13, weight: .regular))
+            iv.contentTintColor = leadingTint != nil ? .white : Theme.text2
+            tile.addSubview(iv)
+            row.addSubview(tile)
+            NSLayoutConstraint.activate([
+                tile.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 14),
+                tile.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+                tile.widthAnchor.constraint(equalToConstant: 26),
+                tile.heightAnchor.constraint(equalToConstant: 26),
+                iv.centerXAnchor.constraint(equalTo: tile.centerXAnchor),
+                iv.centerYAnchor.constraint(equalTo: tile.centerYAnchor),
+                iv.widthAnchor.constraint(equalToConstant: 15),
+                iv.heightAnchor.constraint(equalToConstant: 15)
+            ])
+            leading = tile
+            leadingConstant = 12
+        }
+
+        let l = NSTextField(labelWithString: label)
+        l.font = .systemFont(ofSize: 13, weight: .medium)
+        l.textColor = danger ? Theme.danger : Theme.text
+        l.translatesAutoresizingMaskIntoConstraints = false
+        l.lineBreakMode = .byTruncatingTail
+        row.addSubview(l)
+
+        let labelStack = NSStackView()
+        labelStack.orientation = .vertical
+        labelStack.alignment = .leading
+        labelStack.spacing = 1.5
+        labelStack.translatesAutoresizingMaskIntoConstraints = false
+
+        row.addSubview(labelStack)
+        labelStack.addArrangedSubview(l)
+        if let sub {
+            let s = NSTextField(wrappingLabelWithString: sub)
+            s.font = .systemFont(ofSize: 11.5)
+            s.textColor = Theme.text2
+            // `wrappingLabelWithString` defaults to `.byWordWrapping`. Leave
+            // it alone — overriding to `.byTruncatingTail` was killing the
+            // wrap and letting the text run behind the trailing control.
+            s.translatesAutoresizingMaskIntoConstraints = false
+            s.maximumNumberOfLines = 2
+            // Allow the layout solver to shrink the sub freely so it wraps
+            // when a wide control (e.g. an NSPopUpButton) occupies the right
+            // side of the row.
+            s.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+            s.setContentHuggingPriority(.defaultLow, for: .horizontal)
+            labelStack.addArrangedSubview(s)
+            s.widthAnchor.constraint(lessThanOrEqualToConstant: 520).isActive = true
+        }
+        l.removeFromSuperview()
+        labelStack.insertArrangedSubview(l, at: 0)
+
+        var constraints: [NSLayoutConstraint] = []
+        if leadingSymbol != nil {
+            constraints += [
+                labelStack.leadingAnchor.constraint(equalTo: leading.trailingAnchor, constant: leadingConstant)
+            ]
+        } else {
+            constraints += [
+                labelStack.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 14)
+            ]
+        }
+        constraints += [
+            labelStack.topAnchor.constraint(equalTo: row.topAnchor, constant: 11),
+            labelStack.bottomAnchor.constraint(equalTo: row.bottomAnchor, constant: -11),
+        ]
+
+        if let control {
+            control.translatesAutoresizingMaskIntoConstraints = false
+            row.addSubview(control)
+            constraints += [
+                control.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -14),
+                control.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+                control.leadingAnchor.constraint(greaterThanOrEqualTo: labelStack.trailingAnchor, constant: 12)
+            ]
+        } else {
+            constraints += [labelStack.trailingAnchor.constraint(lessThanOrEqualTo: row.trailingAnchor, constant: -14)]
+        }
+        NSLayoutConstraint.activate(constraints)
+        return row
+    }
+
+    static func numberInput(value: String, suffix: String?, width: CGFloat = 64,
+                            target: AnyObject?, action: Selector?) -> NSView {
+        let tf = NSTextField()
+        tf.stringValue = value
+        tf.alignment = .right
+        tf.font = .systemFont(ofSize: 12.5)
+        tf.bezelStyle = .roundedBezel
+        tf.translatesAutoresizingMaskIntoConstraints = false
+        tf.target = target
+        tf.action = action
+        tf.widthAnchor.constraint(equalToConstant: width).isActive = true
+        if let suffix {
+            let s = NSTextField(labelWithString: suffix)
+            s.font = .systemFont(ofSize: 12)
+            s.textColor = Theme.text2
+            let h = NSStackView(views: [tf, s])
+            h.orientation = .horizontal
+            h.spacing = 6
+            h.alignment = .firstBaseline
+            h.translatesAutoresizingMaskIntoConstraints = false
+            return h
+        }
+        return tf
+    }
+
+    static func button(_ title: String,
+                       kind: ButtonKind = .secondary,
+                       target: AnyObject?, action: Selector?) -> NSButton {
+        let b = StyledButton(title: title, target: target, action: action)
+        b.kind = kind
+        return b
+    }
+}
+
+enum ButtonKind { case primary, secondary, danger, ghost }
+
+/// A flat NSButton that uses a layer-backed background so it can match the
+/// design tokens regardless of the running macOS theme. Stays an `NSButton`
+/// underneath so target/action wiring and keyboard handling are unchanged.
+private final class StyledButton: NSButton {
+
+    var kind: ButtonKind = .secondary { didSet { restyle() } }
+
+    override var title: String {
+        // Once attributedTitle is set, NSButton stops honouring `title` for
+        // display — so a `button.title = "Resume"` swap from outside would
+        // otherwise leave the old attributed string on screen. Hook the setter
+        // and rebuild the attributed title whenever the underlying title moves.
+        didSet { restyle() }
+    }
+
+    init(title: String, target: AnyObject?, action: Selector?) {
+        super.init(frame: .zero)
+        self.title = title
+        self.target = target
+        self.action = action
+        self.bezelStyle = .regularSquare
+        self.isBordered = false
+        self.translatesAutoresizingMaskIntoConstraints = false
+        self.wantsLayer = true
+        self.layer?.cornerRadius = 6
+        self.layer?.borderWidth = 0.5
+        self.font = .systemFont(ofSize: 12, weight: .medium)
+        self.heightAnchor.constraint(greaterThanOrEqualToConstant: 24).isActive = true
+        restyle()
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    override var intrinsicContentSize: NSSize {
+        let s = super.intrinsicContentSize
+        return NSSize(width: s.width + 22, height: max(s.height, 24))
+    }
+
+    private var cachedTitle: String = ""
+    private var cachedFg: NSColor?
+
+    /// Recompute the layer colours + attributed title. Idempotent: skips the
+    /// attributed-title rebuild when the title and resolved foreground haven't
+    /// changed, otherwise this would recurse forever — setting `attributedTitle`
+    /// inside `updateLayer()` marks the button for redisplay, which re-fires
+    /// `updateLayer()`, allocating a new NSAttributedString each loop until the
+    /// process eats all available memory. NSColor.cgColor evaluates in the
+    /// current effective appearance, so calling this from
+    /// `viewDidChangeEffectiveAppearance` is enough for light/dark switching.
+    private func restyle() {
+        let (bg, fg, border) = colors()
+        layer?.backgroundColor = bg.cgColor
+        layer?.borderColor = border.cgColor
+        if cachedTitle != title || cachedFg != fg {
+            cachedTitle = title
+            cachedFg = fg
+            attributedTitle = NSAttributedString(
+                string: title,
+                attributes: [
+                    .foregroundColor: fg,
+                    .font: font ?? .systemFont(ofSize: 12, weight: .medium)
+                ])
+        }
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        restyle()
+    }
+
+    private func colors() -> (NSColor, NSColor, NSColor) {
+        switch kind {
+        case .primary:   return (Theme.accent, .white, .clear)
+        case .secondary: return (Theme.chipBg, Theme.text, .clear)
+        case .ghost:     return (.clear, Theme.text, Theme.inputBorder)
+        case .danger:    return (.clear, Theme.danger, Theme.danger)
+        }
+    }
+}
+
+// MARK: - Permissions state
+
+private struct PermissionsState {
+    let mic: Bool
+    let micDenied: Bool
+    let screen: Bool
+    let ax: Bool
+
+    var allRequiredGranted: Bool { mic && screen }
+    var allGranted: Bool { mic && screen && ax }
+    var bundleIdMismatch: Bool {
+        // CLI builds carry a different code identity than the installed .app;
+        // a grant against the CLI doesn't transfer. Surface it as if the
+        // perms were missing so the banner explains the situation.
+        !CommandLine.arguments[0].contains(".app/Contents/MacOS/")
+    }
+
+    static var current: PermissionsState {
+        let micAuth = AVCaptureDevice.authorizationStatus(for: .audio)
+        return PermissionsState(
+            mic: micAuth == .authorized,
+            micDenied: micAuth == .denied,
+            screen: CGPreflightScreenCaptureAccess(),
+            ax: AXIsProcessTrusted())
+    }
+}
+
+// MARK: - Sidebar
+
+private final class Sidebar: NSView {
+
+    private let paneOrder: [PaneId]
+    private let paneBottom: [PaneId]
+    private let onSelect: (PaneId) -> Void
+
+    private var itemRows: [PaneId: SidebarItem] = [:]
+    private let statusDot = NSView()
+    private let statusLabel = NSTextField(labelWithString: "")
+    private weak var engine: Engine?
+
+    init(paneOrder: [PaneId], paneBottom: [PaneId], initialPane: PaneId,
+         engine: Engine?, onSelect: @escaping (PaneId) -> Void) {
+        self.paneOrder = paneOrder
+        self.paneBottom = paneBottom
+        self.engine = engine
+        self.onSelect = onSelect
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+        wantsLayer = true
+        layer?.backgroundColor = Theme.sidebarBg.cgColor
+        build(selecting: initialPane)
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        layer?.backgroundColor = Theme.sidebarBg.cgColor
+    }
+
+    private func build(selecting initial: PaneId) {
+        // Top drag region — height of the traffic-light area.
+        let dragRegion = NSView()
+        dragRegion.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(dragRegion)
+
+        // Brand row.
+        let brand = NSView()
+        brand.translatesAutoresizingMaskIntoConstraints = false
+        let logo = NSView()
+        logo.translatesAutoresizingMaskIntoConstraints = false
+        logo.wantsLayer = true
+        logo.layer?.cornerRadius = 8
+        let grad = CAGradientLayer()
+        grad.colors = [
+            NSColor(red: 0x7D/255, green: 0x7A/255, blue: 0xFF/255, alpha: 1).cgColor,
+            NSColor(red: 0x5E/255, green: 0x5C/255, blue: 0xE6/255, alpha: 1).cgColor
+        ]
+        grad.startPoint = CGPoint(x: 0, y: 0)
+        grad.endPoint = CGPoint(x: 1, y: 1)
+        grad.cornerRadius = 8
+        logo.layer?.addSublayer(grad)
+        let ghostImg = NSImageView()
+        ghostImg.translatesAutoresizingMaskIntoConstraints = false
+        ghostImg.image = NSImage(systemSymbolName: "moon.stars",
+                                 accessibilityDescription: nil)?
+            .withSymbolConfiguration(.init(pointSize: 14, weight: .semibold))
+        ghostImg.contentTintColor = .white
+        logo.addSubview(ghostImg)
+
+        let title = NSTextField(labelWithString: "Ghostie")
+        title.font = .systemFont(ofSize: 13.5, weight: .bold)
+        title.textColor = Theme.text
+        title.translatesAutoresizingMaskIntoConstraints = false
+
+        statusDot.translatesAutoresizingMaskIntoConstraints = false
+        statusDot.wantsLayer = true
+        statusDot.layer?.cornerRadius = 3
+
+        statusLabel.font = .systemFont(ofSize: 11)
+        statusLabel.textColor = Theme.text2
+        statusLabel.translatesAutoresizingMaskIntoConstraints = false
+        statusLabel.lineBreakMode = .byTruncatingTail
+
+        let titleStack = NSStackView(views: [title])
+        titleStack.orientation = .vertical
+        titleStack.alignment = .leading
+        titleStack.spacing = 1
+        titleStack.translatesAutoresizingMaskIntoConstraints = false
+
+        let statusLine = NSStackView(views: [statusDot, statusLabel])
+        statusLine.orientation = .horizontal
+        statusLine.alignment = .centerY
+        statusLine.spacing = 4
+        statusLine.translatesAutoresizingMaskIntoConstraints = false
+        titleStack.addArrangedSubview(statusLine)
+
+        brand.addSubview(logo)
+        brand.addSubview(titleStack)
+        addSubview(brand)
+
+        NSLayoutConstraint.activate([
+            dragRegion.topAnchor.constraint(equalTo: topAnchor),
+            dragRegion.leadingAnchor.constraint(equalTo: leadingAnchor),
+            dragRegion.trailingAnchor.constraint(equalTo: trailingAnchor),
+            dragRegion.heightAnchor.constraint(equalToConstant: 38),
+
+            brand.topAnchor.constraint(equalTo: dragRegion.bottomAnchor, constant: 4),
+            brand.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14),
+            brand.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
+
+            logo.leadingAnchor.constraint(equalTo: brand.leadingAnchor),
+            logo.topAnchor.constraint(equalTo: brand.topAnchor),
+            logo.widthAnchor.constraint(equalToConstant: 30),
+            logo.heightAnchor.constraint(equalToConstant: 30),
+
+            ghostImg.centerXAnchor.constraint(equalTo: logo.centerXAnchor),
+            ghostImg.centerYAnchor.constraint(equalTo: logo.centerYAnchor),
+
+            titleStack.leadingAnchor.constraint(equalTo: logo.trailingAnchor, constant: 10),
+            titleStack.centerYAnchor.constraint(equalTo: logo.centerYAnchor),
+            titleStack.trailingAnchor.constraint(equalTo: brand.trailingAnchor),
+
+            statusDot.widthAnchor.constraint(equalToConstant: 6),
+            statusDot.heightAnchor.constraint(equalToConstant: 6),
+
+            brand.bottomAnchor.constraint(equalTo: logo.bottomAnchor)
+        ])
+
+        // Gradient layer needs to follow the logo bounds.
+        DispatchQueue.main.async {
+            grad.frame = logo.bounds
+        }
+
+        // Nav list.
+        let nav = NSStackView()
+        nav.orientation = .vertical
+        nav.alignment = .leading
+        nav.spacing = 1
+        nav.translatesAutoresizingMaskIntoConstraints = false
+
+        addSubview(nav)
+        for id in paneOrder {
+            let item = SidebarItem(id: id, onClick: { [weak self] in self?.onSelect($0) })
+            nav.addArrangedSubview(item)
+            item.leadingAnchor.constraint(equalTo: nav.leadingAnchor).isActive = true
+            item.trailingAnchor.constraint(equalTo: nav.trailingAnchor).isActive = true
+            itemRows[id] = item
+        }
+        let powerUser = NSTextField(labelWithString: "POWER USER")
+        powerUser.font = .systemFont(ofSize: 10, weight: .semibold)
+        powerUser.textColor = Theme.text3
+        let powerWrap = NSView()
+        powerWrap.translatesAutoresizingMaskIntoConstraints = false
+        powerWrap.addSubview(powerUser)
+        powerUser.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            powerUser.leadingAnchor.constraint(equalTo: powerWrap.leadingAnchor, constant: 4),
+            powerUser.topAnchor.constraint(equalTo: powerWrap.topAnchor, constant: 18),
+            powerUser.bottomAnchor.constraint(equalTo: powerWrap.bottomAnchor, constant: -4),
+            powerUser.trailingAnchor.constraint(lessThanOrEqualTo: powerWrap.trailingAnchor)
+        ])
+        nav.addArrangedSubview(powerWrap)
+        powerWrap.leadingAnchor.constraint(equalTo: nav.leadingAnchor).isActive = true
+        powerWrap.trailingAnchor.constraint(equalTo: nav.trailingAnchor).isActive = true
+        for id in paneBottom {
+            let item = SidebarItem(id: id, onClick: { [weak self] in self?.onSelect($0) })
+            nav.addArrangedSubview(item)
+            item.leadingAnchor.constraint(equalTo: nav.leadingAnchor).isActive = true
+            item.trailingAnchor.constraint(equalTo: nav.trailingAnchor).isActive = true
+            itemRows[id] = item
+        }
+
+        NSLayoutConstraint.activate([
+            nav.topAnchor.constraint(equalTo: brand.bottomAnchor, constant: 14),
+            nav.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
+            nav.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8)
+        ])
+
+        // Global Advanced toggle — bottom-left. One switch covers every pane;
+        // each pane listens on `Disclosure.didChange` and re-renders its
+        // advanced section. Tap target spans label + switch so a click on
+        // either flips state.
+        let advLabel = NSTextField(labelWithString: "Advanced")
+        advLabel.font = .systemFont(ofSize: 12, weight: .medium)
+        advLabel.textColor = Theme.text2
+        advLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        let advSwitch = NSSwitch()
+        advSwitch.controlSize = .mini
+        advSwitch.state = Disclosure.isOn ? .on : .off
+        advSwitch.translatesAutoresizingMaskIntoConstraints = false
+        let advTarget = ToggleTarget { Disclosure.isOn = (advSwitch.state == .on) }
+        advSwitch.target = advTarget
+        advSwitch.action = #selector(ToggleTarget.fire)
+        objc_setAssociatedObject(advSwitch, &ToggleTarget.key, advTarget, .OBJC_ASSOCIATION_RETAIN)
+
+        let advRow = NSView()
+        advRow.translatesAutoresizingMaskIntoConstraints = false
+        advRow.addSubview(advLabel)
+        advRow.addSubview(advSwitch)
+        // Clicking the label flips the switch — easier target than the
+        // (mini) switch knob alone. Held strongly via objc_setAssociatedObject
+        // since `NSGestureRecognizer.target` is weak.
+        let labelTarget = ActionTarget {
+            Disclosure.toggle()
+            advSwitch.state = Disclosure.isOn ? .on : .off
+        }
+        let labelClick = NSClickGestureRecognizer(
+            target: labelTarget, action: #selector(ActionTarget.fire))
+        advLabel.addGestureRecognizer(labelClick)
+        objc_setAssociatedObject(advLabel, &ActionTarget.key, labelTarget,
+                                 .OBJC_ASSOCIATION_RETAIN)
+        addSubview(advRow)
+
+        // Search placeholder sits just above the advanced row.
+        let search = NSView()
+        search.translatesAutoresizingMaskIntoConstraints = false
+        search.wantsLayer = true
+        search.layer?.cornerRadius = 7
+        search.layer?.borderWidth = 0.5
+        search.layer?.borderColor = Theme.inputBorder.cgColor
+        let searchIcon = NSImageView()
+        searchIcon.translatesAutoresizingMaskIntoConstraints = false
+        searchIcon.image = NSImage(systemSymbolName: "magnifyingglass",
+                                   accessibilityDescription: nil)?
+            .withSymbolConfiguration(.init(pointSize: 11, weight: .regular))
+        searchIcon.contentTintColor = Theme.text3
+        let placeholder = NSTextField(labelWithString: "Search settings")
+        placeholder.font = .systemFont(ofSize: 12)
+        placeholder.textColor = Theme.text3
+        placeholder.translatesAutoresizingMaskIntoConstraints = false
+        search.addSubview(searchIcon)
+        search.addSubview(placeholder)
+        addSubview(search)
+        NSLayoutConstraint.activate([
+            advRow.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14),
+            advRow.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
+            advRow.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -12),
+            advRow.heightAnchor.constraint(equalToConstant: 22),
+            advLabel.leadingAnchor.constraint(equalTo: advRow.leadingAnchor),
+            advLabel.centerYAnchor.constraint(equalTo: advRow.centerYAnchor),
+            advSwitch.trailingAnchor.constraint(equalTo: advRow.trailingAnchor),
+            advSwitch.centerYAnchor.constraint(equalTo: advRow.centerYAnchor),
+
+            search.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
+            search.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
+            search.bottomAnchor.constraint(equalTo: advRow.topAnchor, constant: -10),
+            search.heightAnchor.constraint(equalToConstant: 28),
+            searchIcon.leadingAnchor.constraint(equalTo: search.leadingAnchor, constant: 9),
+            searchIcon.centerYAnchor.constraint(equalTo: search.centerYAnchor),
+            placeholder.leadingAnchor.constraint(equalTo: searchIcon.trailingAnchor, constant: 6),
+            placeholder.centerYAnchor.constraint(equalTo: search.centerYAnchor),
+            placeholder.trailingAnchor.constraint(lessThanOrEqualTo: search.trailingAnchor, constant: -9)
+        ])
+
+        widthAnchor.constraint(equalToConstant: 220).isActive = true
+        setSelected(initial)
+        refreshStatus(engine?.state ?? .paused, perms: PermissionsState.current)
+    }
+
+    func setSelected(_ id: PaneId) {
+        for (k, v) in itemRows { v.setActive(k == id) }
+    }
+
+    func refreshStatus(_ state: EngineState, perms: PermissionsState) {
+        switch state {
+        case .paused:
+            statusDot.layer?.backgroundColor = Theme.text3.cgColor
+            statusLabel.stringValue = "Paused"
+        case .watching:
+            statusDot.layer?.backgroundColor = Theme.ok.cgColor
+            statusLabel.stringValue = "Watching"
+        case .recording(let since):
+            statusDot.layer?.backgroundColor = Theme.danger.cgColor
+            let secs = Int(Date().timeIntervalSince(since))
+            statusLabel.stringValue = String(format: "Recording · %02d:%02d", secs / 60, secs % 60)
+        case .processing:
+            statusDot.layer?.backgroundColor = Theme.info.cgColor
+            statusLabel.stringValue = "Summarizing"
+        }
+        itemRows[.listening]?.setBadge(perms.allRequiredGranted ? nil : .warn)
+    }
+}
+
+private final class SidebarItem: NSView {
+    private let id: PaneId
+    private let label = NSTextField(labelWithString: "")
+    private let icon = NSImageView()
+    private var badge = NSView()
+    private let onClick: (PaneId) -> Void
+    private var active = false
+    private var trackingArea: NSTrackingArea?
+
+    init(id: PaneId, onClick: @escaping (PaneId) -> Void) {
+        self.id = id
+        self.onClick = onClick
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+        wantsLayer = true
+        layer?.cornerRadius = 6
+
+        icon.translatesAutoresizingMaskIntoConstraints = false
+        icon.image = NSImage(systemSymbolName: id.systemSymbol,
+                             accessibilityDescription: nil)?
+            .withSymbolConfiguration(.init(pointSize: 13, weight: .regular))
+        icon.contentTintColor = Theme.text2
+
+        label.stringValue = id.title
+        label.font = .systemFont(ofSize: 13, weight: .medium)
+        label.textColor = Theme.text
+        label.translatesAutoresizingMaskIntoConstraints = false
+
+        badge.translatesAutoresizingMaskIntoConstraints = false
+
+        addSubview(icon)
+        addSubview(label)
+        addSubview(badge)
+        NSLayoutConstraint.activate([
+            heightAnchor.constraint(equalToConstant: 28),
+            icon.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
+            icon.centerYAnchor.constraint(equalTo: centerYAnchor),
+            icon.widthAnchor.constraint(equalToConstant: 15),
+            icon.heightAnchor.constraint(equalToConstant: 15),
+            label.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 9),
+            label.centerYAnchor.constraint(equalTo: centerYAnchor),
+            badge.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
+            badge.centerYAnchor.constraint(equalTo: centerYAnchor),
+            label.trailingAnchor.constraint(lessThanOrEqualTo: badge.leadingAnchor, constant: -4)
+        ])
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    func setActive(_ on: Bool) {
+        active = on
+        layer?.backgroundColor = on ? Theme.selectedItem.cgColor : NSColor.clear.cgColor
+        icon.contentTintColor = on ? Theme.accent : Theme.text2
+        label.font = .systemFont(ofSize: 13, weight: on ? .semibold : .medium)
+    }
+
+    enum BadgeKind { case warn }
+    func setBadge(_ kind: BadgeKind?) {
+        badge.subviews.forEach { $0.removeFromSuperview() }
+        guard let kind else { return }
+        let dot = NSView()
+        dot.translatesAutoresizingMaskIntoConstraints = false
+        dot.wantsLayer = true
+        dot.layer?.backgroundColor = (kind == .warn ? Theme.warn : Theme.danger).cgColor
+        dot.layer?.cornerRadius = 4
+        badge.addSubview(dot)
+        NSLayoutConstraint.activate([
+            dot.widthAnchor.constraint(equalToConstant: 8),
+            dot.heightAnchor.constraint(equalToConstant: 8),
+            dot.centerXAnchor.constraint(equalTo: badge.centerXAnchor),
+            dot.centerYAnchor.constraint(equalTo: badge.centerYAnchor),
+            badge.widthAnchor.constraint(equalToConstant: 12),
+            badge.heightAnchor.constraint(equalToConstant: 12)
+        ])
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let trackingArea { removeTrackingArea(trackingArea) }
+        let area = NSTrackingArea(rect: bounds,
+                                  options: [.activeInActiveApp, .mouseEnteredAndExited, .inVisibleRect],
+                                  owner: self, userInfo: nil)
+        addTrackingArea(area)
+        trackingArea = area
+    }
+    override func mouseEntered(with event: NSEvent) {
+        if !active { layer?.backgroundColor = Theme.chipBg.cgColor }
+    }
+    override func mouseExited(with event: NSEvent) {
+        if !active { layer?.backgroundColor = NSColor.clear.cgColor }
+    }
+    override func mouseDown(with event: NSEvent) {
+        onClick(id)
+    }
+}
+
+// MARK: - Pane: Listening
+
+private final class ListeningPane: NSView {
+
+    private let cfg: Config
+    private let engineState: () -> EngineState
+    private let onPause: () -> Void
+    private let changes: ((inout Config) -> Void) -> Void
+
+    private var permsCard: NSView?
+    private var liveStatusRow: LiveStatusRow!
+    private var permsContainer = NSStackView()
+    private var advancedContainer = NSStackView()
+    private var paneStack = NSStackView()
+    private var timer: Timer?
+    private var disclosureToken: NSObjectProtocol?
+
+    init(cfg: Config,
+         engineState: @escaping () -> EngineState,
+         onPause: @escaping () -> Void,
+         changes: @escaping ((inout Config) -> Void) -> Void) {
+        self.cfg = cfg
+        self.engineState = engineState
+        self.onPause = onPause
+        self.changes = changes
+        super.init(frame: .zero)
+        build()
+        disclosureToken = NotificationCenter.default.addObserver(
+            forName: Disclosure.didChange, object: nil, queue: .main) { [weak self] _ in
+            self?.refreshAdvanced()
+        }
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    deinit {
+        timer?.invalidate()
+        if let disclosureToken { NotificationCenter.default.removeObserver(disclosureToken) }
+    }
+
+    private func build() {
+        translatesAutoresizingMaskIntoConstraints = false
+        paneStack.orientation = .vertical
+        paneStack.alignment = .leading
+        paneStack.spacing = 22
+        paneStack.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(paneStack)
+        NSLayoutConstraint.activate([
+            paneStack.topAnchor.constraint(equalTo: topAnchor),
+            paneStack.leadingAnchor.constraint(equalTo: leadingAnchor),
+            paneStack.trailingAnchor.constraint(equalTo: trailingAnchor),
+            paneStack.bottomAnchor.constraint(equalTo: bottomAnchor)
+        ])
+
+        let header = PageHeaderView(title: "Listening",
+                                    subtitle: "When Ghostie watches for Teams calls and how it confirms one is real.")
+        paneStack.addArrangedSubview(header)
+        header.widthAnchor.constraint(equalTo: paneStack.widthAnchor).isActive = true
+
+        permsContainer.orientation = .vertical
+        permsContainer.alignment = .leading
+        permsContainer.spacing = 22
+        permsContainer.translatesAutoresizingMaskIntoConstraints = false
+        paneStack.addArrangedSubview(permsContainer)
+        permsContainer.widthAnchor.constraint(equalTo: paneStack.widthAnchor).isActive = true
+        rebuildPermissions()
+
+        // Live status card.
+        liveStatusRow = LiveStatusRow(onPause: { [weak self] in self?.onPause() })
+        let liveCard = GroupCard()
+        liveCard.addRow(liveStatusRow, last: true)
+        paneStack.addArrangedSubview(liveCard)
+        liveCard.widthAnchor.constraint(equalTo: paneStack.widthAnchor).isActive = true
+        refreshLiveStatus(engineState())
+
+        // Detection group. (Used to expose a "Require Microsoft Teams" toggle
+        // here — removed because the new detector always requires a match
+        // against `triggerBundleIds` and ignored the legacy flag.)
+        let detection = GroupCard(title: "Detection")
+        detection.addRow(buildStepperRow(
+            label: "End-call grace",
+            sub: "How long Teams must stay quiet before Ghostie decides the call has ended.",
+            initial: Int(cfg.endGraceSeconds),
+            range: 5...600,
+            suffix: "s") { [weak self] v in
+                self?.changes { c in c.endGraceSeconds = Double(v) }
+            })
+        detection.addRow(buildStepperRow(
+            label: "Ignore short calls",
+            sub: "Anything shorter than this gets thrown away without writing a note.",
+            initial: Int(cfg.minCallSeconds),
+            range: 0...600,
+            suffix: "s") { [weak self] v in
+                self?.changes { c in c.minCallSeconds = Double(v) }
+            }, last: true)
+        paneStack.addArrangedSubview(detection)
+        detection.widthAnchor.constraint(equalTo: paneStack.widthAnchor).isActive = true
+
+        // Advanced container — driven by the global Disclosure toggle in the
+        // sidebar; no per-pane disclosure footer.
+        advancedContainer.orientation = .vertical
+        advancedContainer.alignment = .leading
+        advancedContainer.spacing = 22
+        advancedContainer.translatesAutoresizingMaskIntoConstraints = false
+        paneStack.addArrangedSubview(advancedContainer)
+        advancedContainer.widthAnchor.constraint(equalTo: paneStack.widthAnchor).isActive = true
+        refreshAdvanced()
+
+        // Per-second tick to keep the elapsed time accurate while recording.
+        timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            self.refreshLiveStatus(self.engineState())
+        }
+    }
+
+    func refreshPermissions() {
+        rebuildPermissions()
+    }
+
+    private func rebuildPermissions() {
+        permsContainer.arrangedSubviews.forEach { $0.removeFromSuperview() }
+        let p = PermissionsState.current
+        if p.bundleIdMismatch {
+            let card = WarningCard(title: "These permissions won't stick",
+                                   body: "You launched Ghostie from the command line, not from /Applications/Ghostie.app. macOS keeps permissions per app, so anything you grant here won't apply to the installed app. Quit, then open Ghostie from /Applications.")
+            permsContainer.addArrangedSubview(card)
+            card.widthAnchor.constraint(equalTo: permsContainer.widthAnchor).isActive = true
+        } else if !p.allRequiredGranted {
+            let banner = PermissionsBanner(state: p)
+            permsContainer.addArrangedSubview(banner)
+            banner.widthAnchor.constraint(equalTo: permsContainer.widthAnchor).isActive = true
+        } else {
+            let card = GroupCard(title: "System Access")
+            card.addRow(RowBuilder.row(
+                label: "Microphone",
+                sub: "Lets Ghostie capture your voice during a Teams call.",
+                leadingSymbol: "mic.fill", leadingTint: Theme.danger,
+                control: StatusBadgeView(kind: .ok, label: "Granted")))
+            card.addRow(RowBuilder.row(
+                label: "Screen Recording",
+                sub: "Used to capture the other participants — Ghostie only keeps the audio, never the picture.",
+                leadingSymbol: "display", leadingTint: Theme.info,
+                control: StatusBadgeView(kind: .ok, label: "Granted")))
+            card.addRow(RowBuilder.row(
+                label: "Accessibility",
+                sub: p.ax
+                    ? "Helps Ghostie tell a real Teams meeting apart from the app just being open. Optional."
+                    : "Optional — helps Ghostie spot a real meeting window. Calls still get recorded without it.",
+                leadingSymbol: "figure.stand", leadingTint: NSColor.systemGray,
+                control: StatusBadgeView(kind: p.ax ? .ok : .muted,
+                                         label: p.ax ? "Granted" : "Skipped")),
+                        last: true)
+            permsContainer.addArrangedSubview(card)
+            card.widthAnchor.constraint(equalTo: permsContainer.widthAnchor).isActive = true
+        }
+    }
+
+    func refreshLiveStatus(_ state: EngineState) {
+        liveStatusRow?.apply(state: state)
+    }
+
+    private func refreshAdvanced() {
+        advancedContainer.arrangedSubviews.forEach { $0.removeFromSuperview() }
+        guard Disclosure.isOn else { return }
+        let card = GroupCard(title: "Detection · Advanced")
+        // Parens matter — `??` binds looser than `+`, so the previous form
+        // (`first ?? "..." + suffix`) silently dropped the "+N" tail and only
+        // showed the fallback string with the count when `first` was nil.
+        let primary = cfg.triggerBundleIds.first ?? "com.microsoft.teams"
+        let extras = cfg.triggerBundleIds.count > 1
+            ? " +\(cfg.triggerBundleIds.count - 1)"
+            : ""
+        card.addRow(RowBuilder.row(
+            label: "Apps that count as Teams",
+            sub: "Ghostie only treats microphone activity as a call when one of these apps is running.",
+            control: NSTextField(labelWithString: primary + extras)
+                .styledAsMono()), last: true)
+        advancedContainer.addArrangedSubview(card)
+        card.widthAnchor.constraint(equalTo: advancedContainer.widthAnchor).isActive = true
+    }
+
+    private func buildToggleRow(label: String, sub: String, on: Bool,
+                                onChange: @escaping (Bool) -> Void) -> NSView {
+        let toggle = NSSwitch()
+        toggle.controlSize = .small
+        toggle.state = on ? .on : .off
+        toggle.translatesAutoresizingMaskIntoConstraints = false
+        let target = ToggleTarget { onChange(toggle.state == .on) }
+        toggle.target = target
+        toggle.action = #selector(ToggleTarget.fire)
+        objc_setAssociatedObject(toggle, &ToggleTarget.key, target, .OBJC_ASSOCIATION_RETAIN)
+        return RowBuilder.row(label: label, sub: sub, control: toggle)
+    }
+
+    private func buildStepperRow(label: String, sub: String, initial: Int,
+                                 range: ClosedRange<Int>, suffix: String,
+                                 onChange: @escaping (Int) -> Void,
+                                 last: Bool = false) -> NSView {
+        let tf = NSTextField()
+        tf.stringValue = String(initial)
+        tf.alignment = .right
+        tf.font = .systemFont(ofSize: 12.5)
+        tf.bezelStyle = .roundedBezel
+        tf.translatesAutoresizingMaskIntoConstraints = false
+        tf.widthAnchor.constraint(equalToConstant: 60).isActive = true
+        let stepper = NSStepper()
+        stepper.minValue = Double(range.lowerBound)
+        stepper.maxValue = Double(range.upperBound)
+        stepper.integerValue = initial
+        stepper.translatesAutoresizingMaskIntoConstraints = false
+        let suffixL = NSTextField(labelWithString: suffix)
+        suffixL.font = .systemFont(ofSize: 12)
+        suffixL.textColor = Theme.text2
+        let target = StepperTarget(tf: tf, stepper: stepper) { v in onChange(v) }
+        stepper.target = target
+        stepper.action = #selector(StepperTarget.stepperChanged)
+        tf.target = target
+        tf.action = #selector(StepperTarget.textChanged)
+        tf.delegate = target
+        objc_setAssociatedObject(stepper, &StepperTarget.key, target, .OBJC_ASSOCIATION_RETAIN)
+        let h = NSStackView(views: [tf, stepper, suffixL])
+        h.orientation = .horizontal
+        h.spacing = 6
+        h.alignment = .firstBaseline
+        return RowBuilder.row(label: label, sub: sub, control: h)
+    }
+}
+
+private final class ToggleTarget {
+    static var key: UInt8 = 0
+    let block: () -> Void
+    init(_ block: @escaping () -> Void) { self.block = block }
+    @objc func fire() { block() }
+}
+
+private final class StepperTarget: NSObject, NSTextFieldDelegate {
+    static var key: UInt8 = 0
+    let tf: NSTextField
+    let stepper: NSStepper
+    let onChange: (Int) -> Void
+    init(tf: NSTextField, stepper: NSStepper, onChange: @escaping (Int) -> Void) {
+        self.tf = tf; self.stepper = stepper; self.onChange = onChange
+    }
+    @objc func stepperChanged() {
+        tf.integerValue = stepper.integerValue
+        onChange(stepper.integerValue)
+    }
+    @objc func textChanged() {
+        if let v = Int(tf.stringValue) {
+            let clamped = max(Int(stepper.minValue), min(Int(stepper.maxValue), v))
+            stepper.integerValue = clamped
+            tf.integerValue = clamped
+            onChange(clamped)
+        }
+    }
+    func controlTextDidEndEditing(_ obj: Notification) { textChanged() }
+}
+
+// MARK: - Live status row
+
+private final class LiveStatusRow: NSView {
+    private let tile = NSView()
+    private let symbol = NSImageView()
+    private var pulseLayer: CAShapeLayer?
+    private let title = NSTextField(labelWithString: "")
+    private let timeMono = NSTextField(labelWithString: "")
+    private let detail = NSTextField(labelWithString: "")
+    private let button: StyledButton
+    private let onPause: () -> Void
+
+    init(onPause: @escaping () -> Void) {
+        self.onPause = onPause
+        self.button = StyledButton(title: "Pause listening", target: nil, action: nil)
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+        wantsLayer = true
+
+        tile.translatesAutoresizingMaskIntoConstraints = false
+        tile.wantsLayer = true
+        tile.layer?.cornerRadius = 10
+        symbol.translatesAutoresizingMaskIntoConstraints = false
+        tile.addSubview(symbol)
+        addSubview(tile)
+
+        title.font = .systemFont(ofSize: 14, weight: .semibold)
+        title.textColor = Theme.text
+        title.translatesAutoresizingMaskIntoConstraints = false
+
+        timeMono.font = .monospacedSystemFont(ofSize: 12, weight: .medium)
+        timeMono.textColor = Theme.text2
+        timeMono.translatesAutoresizingMaskIntoConstraints = false
+
+        detail.font = .systemFont(ofSize: 12)
+        detail.textColor = Theme.text2
+        detail.translatesAutoresizingMaskIntoConstraints = false
+
+        let titleLine = NSStackView(views: [title, timeMono])
+        titleLine.orientation = .horizontal
+        titleLine.alignment = .firstBaseline
+        titleLine.spacing = 10
+
+        let stack = NSStackView(views: [titleLine, detail])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 2
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(stack)
+
+        let pauseTarget = ActionTarget { [weak self] in self?.onPause() }
+        button.target = pauseTarget
+        button.action = #selector(ActionTarget.fire)
+        objc_setAssociatedObject(button, &ActionTarget.key, pauseTarget, .OBJC_ASSOCIATION_RETAIN)
+        addSubview(button)
+
+        NSLayoutConstraint.activate([
+            tile.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14),
+            tile.centerYAnchor.constraint(equalTo: centerYAnchor),
+            tile.widthAnchor.constraint(equalToConstant: 42),
+            tile.heightAnchor.constraint(equalToConstant: 42),
+            symbol.centerXAnchor.constraint(equalTo: tile.centerXAnchor),
+            symbol.centerYAnchor.constraint(equalTo: tile.centerYAnchor),
+            symbol.widthAnchor.constraint(equalToConstant: 20),
+            symbol.heightAnchor.constraint(equalToConstant: 20),
+            stack.leadingAnchor.constraint(equalTo: tile.trailingAnchor, constant: 14),
+            stack.centerYAnchor.constraint(equalTo: centerYAnchor),
+            stack.trailingAnchor.constraint(lessThanOrEqualTo: button.leadingAnchor, constant: -12),
+            button.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
+            button.centerYAnchor.constraint(equalTo: centerYAnchor),
+            topAnchor.constraint(equalTo: tile.topAnchor, constant: -14),
+            bottomAnchor.constraint(equalTo: tile.bottomAnchor, constant: 14)
+        ])
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    func apply(state: EngineState) {
+        if case .recording = state { startPulse() } else { stopPulse() }
+        switch state {
+        case .recording(let since):
+            tile.layer?.backgroundColor = Theme.dangerSoft.cgColor
+            symbol.image = NSImage(systemSymbolName: "record.circle",
+                                   accessibilityDescription: nil)?
+                .withSymbolConfiguration(.init(pointSize: 18, weight: .regular))
+            symbol.contentTintColor = Theme.danger
+            title.stringValue = "Recording"
+            let secs = Int(Date().timeIntervalSince(since))
+            timeMono.stringValue = String(format: "%02d:%02d", secs / 60, secs % 60)
+            timeMono.isHidden = false
+            detail.stringValue = "A Teams call is in progress."
+            button.title = "Pause listening"
+            button.kind = .ghost
+        case .watching:
+            tile.layer?.backgroundColor = Theme.okSoft.cgColor
+            symbol.image = NSImage(systemSymbolName: "mic",
+                                   accessibilityDescription: nil)?
+                .withSymbolConfiguration(.init(pointSize: 18, weight: .regular))
+            symbol.contentTintColor = Theme.ok
+            title.stringValue = "Watching for calls"
+            timeMono.stringValue = ""
+            timeMono.isHidden = true
+            detail.stringValue = "Idle. Ghostie will wake up the next time Teams starts using the mic."
+            button.title = "Pause listening"
+            button.kind = .ghost
+        case .processing:
+            tile.layer?.backgroundColor = Theme.infoSoft.cgColor
+            symbol.image = NSImage(systemSymbolName: "sparkles",
+                                   accessibilityDescription: nil)?
+                .withSymbolConfiguration(.init(pointSize: 18, weight: .regular))
+            symbol.contentTintColor = Theme.info
+            title.stringValue = "Writing the note"
+            timeMono.stringValue = ""
+            timeMono.isHidden = true
+            detail.stringValue = "Claude is reading the transcript and pulling out the highlights."
+            button.title = "Pause listening"
+            button.kind = .ghost
+        case .paused:
+            tile.layer?.backgroundColor = Theme.chipBg.cgColor
+            symbol.image = NSImage(systemSymbolName: "pause.fill",
+                                   accessibilityDescription: nil)?
+                .withSymbolConfiguration(.init(pointSize: 18, weight: .regular))
+            symbol.contentTintColor = Theme.text2
+            title.stringValue = "Paused"
+            timeMono.stringValue = ""
+            timeMono.isHidden = true
+            detail.stringValue = "Ghostie isn't watching for calls right now."
+            button.title = "Resume listening"
+            button.kind = .primary
+        }
+    }
+
+    /// Single ring under the symbol that scales out and fades — the recording
+    /// pulse from the design spec. Removed on every non-recording state.
+    private func startPulse() {
+        guard pulseLayer == nil, tile.layer != nil else { return }
+        let ring = CAShapeLayer()
+        ring.path = CGPath(ellipseIn: CGRect(x: 0, y: 0, width: 12, height: 12), transform: nil)
+        ring.fillColor = NSColor.clear.cgColor
+        ring.strokeColor = Theme.danger.cgColor
+        ring.lineWidth = 1.5
+        ring.bounds = CGRect(x: 0, y: 0, width: 12, height: 12)
+        ring.position = CGPoint(x: 21, y: 21)
+        tile.layer?.addSublayer(ring)
+        let scale = CABasicAnimation(keyPath: "transform.scale")
+        scale.fromValue = 1.0
+        scale.toValue = 2.8
+        scale.duration = 1.6
+        scale.repeatCount = .infinity
+        scale.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        let op = CABasicAnimation(keyPath: "opacity")
+        op.fromValue = 0.5
+        op.toValue = 0.0
+        op.duration = 1.6
+        op.repeatCount = .infinity
+        ring.add(scale, forKey: "scale")
+        ring.add(op, forKey: "opacity")
+        pulseLayer = ring
+    }
+    private func stopPulse() {
+        pulseLayer?.removeAllAnimations()
+        pulseLayer?.removeFromSuperlayer()
+        pulseLayer = nil
+    }
+}
+
+private final class ActionTarget {
+    static var key: UInt8 = 0
+    let block: () -> Void
+    init(_ block: @escaping () -> Void) { self.block = block }
+    @objc func fire() { block() }
+}
+
+// MARK: - Permissions banner
+
+private final class PermissionsBanner: NSView {
+    init(state: PermissionsState) {
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+        wantsLayer = true
+        layer?.cornerRadius = 12
+        layer?.borderWidth = 0.5
+        layer?.borderColor = Theme.warn.cgColor
+        layer?.backgroundColor = Theme.warnSoft.cgColor
+        layer?.masksToBounds = true
+
+        // Header.
+        let header = NSView()
+        header.translatesAutoresizingMaskIntoConstraints = false
+        let badge = NSView()
+        badge.translatesAutoresizingMaskIntoConstraints = false
+        badge.wantsLayer = true
+        badge.layer?.cornerRadius = 13
+        badge.layer?.backgroundColor = Theme.warn.cgColor
+        let bang = NSImageView()
+        bang.translatesAutoresizingMaskIntoConstraints = false
+        bang.image = NSImage(systemSymbolName: "exclamationmark.triangle.fill",
+                             accessibilityDescription: nil)?
+            .withSymbolConfiguration(.init(pointSize: 15, weight: .semibold))
+        bang.contentTintColor = .white
+        badge.addSubview(bang)
+        let title = NSTextField(labelWithString:
+            state.mic ? "One more permission needed"
+                      : "Ghostie can't record calls yet")
+        title.font = .systemFont(ofSize: 13.5, weight: .semibold)
+        title.textColor = Theme.text
+        let sub = NSTextField(wrappingLabelWithString:
+            "macOS needs your okay before Ghostie can listen to a call.")
+        sub.font = .systemFont(ofSize: 12)
+        sub.textColor = Theme.text2
+        let textStack = NSStackView(views: [title, sub])
+        textStack.orientation = .vertical
+        textStack.alignment = .leading
+        textStack.spacing = 2
+        textStack.translatesAutoresizingMaskIntoConstraints = false
+        header.addSubview(badge); header.addSubview(textStack)
+        NSLayoutConstraint.activate([
+            badge.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: 14),
+            badge.topAnchor.constraint(equalTo: header.topAnchor, constant: 12),
+            badge.widthAnchor.constraint(equalToConstant: 26),
+            badge.heightAnchor.constraint(equalToConstant: 26),
+            bang.centerXAnchor.constraint(equalTo: badge.centerXAnchor),
+            bang.centerYAnchor.constraint(equalTo: badge.centerYAnchor),
+            textStack.leadingAnchor.constraint(equalTo: badge.trailingAnchor, constant: 12),
+            textStack.trailingAnchor.constraint(equalTo: header.trailingAnchor, constant: -14),
+            textStack.topAnchor.constraint(equalTo: header.topAnchor, constant: 12),
+            header.bottomAnchor.constraint(equalTo: textStack.bottomAnchor, constant: 10)
+        ])
+        addSubview(header)
+
+        let inner = NSStackView()
+        inner.orientation = .vertical
+        inner.alignment = .leading
+        inner.spacing = 0
+        inner.translatesAutoresizingMaskIntoConstraints = false
+        inner.wantsLayer = true
+        inner.layer?.backgroundColor = Theme.cardBg.cgColor
+        addSubview(inner)
+
+        NSLayoutConstraint.activate([
+            header.leadingAnchor.constraint(equalTo: leadingAnchor),
+            header.trailingAnchor.constraint(equalTo: trailingAnchor),
+            header.topAnchor.constraint(equalTo: topAnchor),
+            inner.topAnchor.constraint(equalTo: header.bottomAnchor),
+            inner.leadingAnchor.constraint(equalTo: leadingAnchor),
+            inner.trailingAnchor.constraint(equalTo: trailingAnchor),
+            inner.bottomAnchor.constraint(equalTo: bottomAnchor)
+        ])
+
+        var first = true
+        if !state.mic {
+            inner.addArrangedSubview(permRow(
+                first: first, name: "Microphone",
+                why: state.micDenied
+                    ? "Currently blocked. Turn this on in System Settings so Ghostie can capture your voice."
+                    : "Lets Ghostie capture your voice during a call.",
+                symbol: "mic",
+                url: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"))
+            first = false
+        }
+        if !state.screen {
+            inner.addArrangedSubview(permRow(
+                first: first, name: "Screen Recording",
+                why: "Lets Ghostie capture the other participants. Only the audio is kept, never the picture.",
+                symbol: "display",
+                url: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"))
+            first = false
+        }
+        if !state.ax {
+            inner.addArrangedSubview(permRow(
+                first: first, name: "Accessibility", optional: true,
+                why: "Helps Ghostie tell a real Teams meeting apart from the app just being open.",
+                symbol: "figure.stand",
+                url: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"))
+            first = false
+        }
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    private func permRow(first: Bool, name: String, optional: Bool = false,
+                         why: String, symbol: String, url: String) -> NSView {
+        let row = NSView()
+        row.translatesAutoresizingMaskIntoConstraints = false
+
+        let divider = DividerView()
+        divider.translatesAutoresizingMaskIntoConstraints = false
+
+        let icon = NSImageView()
+        icon.translatesAutoresizingMaskIntoConstraints = false
+        icon.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?
+            .withSymbolConfiguration(.init(pointSize: 15, weight: .regular))
+        icon.contentTintColor = Theme.text2
+
+        let title = NSMutableAttributedString(
+            string: name, attributes: [
+                .foregroundColor: Theme.text,
+                .font: NSFont.systemFont(ofSize: 12.5, weight: .medium)
+            ])
+        if optional {
+            title.append(NSAttributedString(
+                string: "  ·  optional", attributes: [
+                    .foregroundColor: Theme.text3,
+                    .font: NSFont.systemFont(ofSize: 11)
+                ]))
+        }
+        let titleL = NSTextField(labelWithAttributedString: title)
+        titleL.translatesAutoresizingMaskIntoConstraints = false
+        let whyL = NSTextField(wrappingLabelWithString: why)
+        whyL.font = .systemFont(ofSize: 11)
+        whyL.textColor = Theme.text2
+        whyL.translatesAutoresizingMaskIntoConstraints = false
+        whyL.preferredMaxLayoutWidth = 380
+        let textStack = NSStackView(views: [titleL, whyL])
+        textStack.orientation = .vertical
+        textStack.alignment = .leading
+        textStack.spacing = 1
+        textStack.translatesAutoresizingMaskIntoConstraints = false
+
+        let target = OpenURLTarget(url: url)
+        let btn = StyledButton(title: "Open in System Settings",
+                               target: target, action: #selector(OpenURLTarget.fire))
+        btn.kind = .primary
+        objc_setAssociatedObject(btn, &OpenURLTarget.key, target, .OBJC_ASSOCIATION_RETAIN)
+
+        row.addSubview(icon)
+        row.addSubview(textStack)
+        row.addSubview(btn)
+        if !first { row.addSubview(divider) }
+        var consts: [NSLayoutConstraint] = [
+            icon.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 14),
+            icon.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+            icon.widthAnchor.constraint(equalToConstant: 15),
+            icon.heightAnchor.constraint(equalToConstant: 15),
+            textStack.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 10),
+            textStack.topAnchor.constraint(equalTo: row.topAnchor, constant: 9),
+            textStack.bottomAnchor.constraint(equalTo: row.bottomAnchor, constant: -9),
+            btn.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -14),
+            btn.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+            btn.leadingAnchor.constraint(greaterThanOrEqualTo: textStack.trailingAnchor, constant: 12)
+        ]
+        if !first {
+            consts += [
+                divider.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 14),
+                divider.trailingAnchor.constraint(equalTo: row.trailingAnchor),
+                divider.topAnchor.constraint(equalTo: row.topAnchor),
+                divider.heightAnchor.constraint(equalToConstant: 0.5)
+            ]
+        }
+        NSLayoutConstraint.activate(consts)
+        return row
+    }
+}
+
+private final class OpenURLTarget {
+    static var key: UInt8 = 0
+    let url: String
+    init(url: String) { self.url = url }
+    @objc func fire() {
+        if let u = URL(string: url) { NSWorkspace.shared.open(u) }
+    }
+}
+
+private final class WarningCard: NSView {
+    init(title: String, body: String) {
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+        wantsLayer = true
+        layer?.cornerRadius = 10
+        layer?.borderWidth = 0.5
+        layer?.borderColor = Theme.warn.cgColor
+        layer?.backgroundColor = Theme.warnSoft.cgColor
+        let t = NSTextField(labelWithString: title)
+        t.font = .systemFont(ofSize: 13, weight: .semibold)
+        t.textColor = Theme.text
+        let b = NSTextField(wrappingLabelWithString: body)
+        b.font = .systemFont(ofSize: 12)
+        b.textColor = Theme.text2
+        b.preferredMaxLayoutWidth = 600
+        let stack = NSStackView(views: [t, b])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 4
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.topAnchor.constraint(equalTo: topAnchor, constant: 12),
+            stack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14),
+            stack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
+            stack.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -12)
+        ])
+    }
+    required init?(coder: NSCoder) { fatalError() }
+}
+
+// MARK: - Pane: Notes
+
+private final class NotesPane: NSView {
+    private let cfg: Config
+    private let changes: ((inout Config) -> Void) -> Void
+    private let drainBacklog: () -> Void
+    private let pathLabel = NSTextField(labelWithString: "")
+    private var notesFolder: String
+    private let advContainer = NSStackView()
+    private var disclosureToken: NSObjectProtocol?
+
+    init(cfg: Config,
+         drainBacklog: @escaping () -> Void,
+         changes: @escaping ((inout Config) -> Void) -> Void) {
+        self.cfg = cfg
+        self.drainBacklog = drainBacklog
+        self.changes = changes
+        self.notesFolder = cfg.notesFolder
+        super.init(frame: .zero)
+        build()
+        disclosureToken = NotificationCenter.default.addObserver(
+            forName: Disclosure.didChange, object: nil, queue: .main) { [weak self] _ in
+            self?.refreshAdvanced()
+        }
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    deinit {
+        if let disclosureToken { NotificationCenter.default.removeObserver(disclosureToken) }
+    }
+
+    private func build() {
+        translatesAutoresizingMaskIntoConstraints = false
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 22
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.topAnchor.constraint(equalTo: topAnchor),
+            stack.leadingAnchor.constraint(equalTo: leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: trailingAnchor),
+            stack.bottomAnchor.constraint(equalTo: bottomAnchor)
+        ])
+        let header = PageHeaderView(title: "Notes",
+                                    subtitle: "Where Ghostie writes the summary after a call and what else it keeps on disk.")
+        stack.addArrangedSubview(header)
+        header.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+
+        // Notes folder + actions.
+        let card = GroupCard()
+        let folderTarget = ActionTarget { [weak self] in self?.chooseFolder() }
+        let chooseBtn = StyledButton(title: "Choose…", target: folderTarget,
+                                     action: #selector(ActionTarget.fire))
+        chooseBtn.kind = .secondary
+        objc_setAssociatedObject(chooseBtn, &ActionTarget.key, folderTarget, .OBJC_ASSOCIATION_RETAIN)
+        let revealTarget = ActionTarget { [weak self] in
+            guard let self else { return }
+            let url = URL(fileURLWithPath: self.notesFolder)
+            try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+            NSWorkspace.shared.activateFileViewerSelecting([url])
+        }
+        let revealBtn = StyledButton(title: "Reveal", target: revealTarget,
+                                     action: #selector(ActionTarget.fire))
+        revealBtn.kind = .secondary
+        objc_setAssociatedObject(revealBtn, &ActionTarget.key, revealTarget, .OBJC_ASSOCIATION_RETAIN)
+        let h = NSStackView(views: [chooseBtn, revealBtn])
+        h.orientation = .horizontal
+        h.spacing = 6
+
+        pathLabel.stringValue = cfg.notesFolder.replacingOccurrences(of: NSHomeDirectory(), with: "~")
+        card.addRow(RowBuilder.row(
+            label: "Notes folder",
+            sub: pathLabel.stringValue,
+            leadingSymbol: "folder.fill", leadingTint: Theme.accent,
+            control: h))
+
+        card.addRow(buildToggleRow(
+            label: "Save the full transcript too",
+            sub: "Write the raw transcript next to each summary, in case you need the verbatim version.",
+            on: cfg.saveTranscript) { [weak self] on in
+                self?.changes { c in c.saveTranscript = on }
+            })
+
+        card.addRow(buildToggleRow(
+            label: "Keep the recording",
+            sub: "Off by default — Ghostie throws the audio away once the note has been written.",
+            on: cfg.keepAudio) { [weak self] on in
+                self?.changes { c in c.keepAudio = on }
+            }, last: true)
+
+        stack.addArrangedSubview(card)
+        card.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+
+        advContainer.orientation = .vertical
+        advContainer.alignment = .leading
+        advContainer.spacing = 22
+        advContainer.translatesAutoresizingMaskIntoConstraints = false
+        stack.addArrangedSubview(advContainer)
+        advContainer.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        refreshAdvanced()
+    }
+
+    private func refreshAdvanced() {
+        advContainer.arrangedSubviews.forEach { $0.removeFromSuperview() }
+        guard Disclosure.isOn else { return }
+        let card = GroupCard(title: "Backlog")
+        let pending = Backlog.pendingCount
+        let pendingControl: NSView
+        if pending > 0 {
+            let drainTarget = ActionTarget { [weak self] in self?.drainBacklog() }
+            let drainBtn = StyledButton(title: "Process now", target: drainTarget,
+                                        action: #selector(ActionTarget.fire))
+            drainBtn.kind = .primary
+            objc_setAssociatedObject(drainBtn, &ActionTarget.key, drainTarget, .OBJC_ASSOCIATION_RETAIN)
+            let badge = StatusBadgeView(kind: .warn, label: "\(pending) queued")
+            let h = NSStackView(views: [badge, drainBtn])
+            h.orientation = .horizontal
+            h.spacing = 8
+            h.alignment = .centerY
+            pendingControl = h
+        } else {
+            pendingControl = StatusBadgeView(kind: .muted, label: "0 queued")
+        }
+        card.addRow(RowBuilder.row(
+            label: "Waiting in the queue",
+            sub: "Calls that couldn't be processed yet — usually because transcription or Claude wasn't reachable at the time.",
+            control: pendingControl))
+        card.addRow(RowBuilder.row(
+            label: "Retry every",
+            sub: "How often Ghostie tries the queue again on its own.",
+            control: NSTextField(labelWithString: "10 min").styledAsMono()),
+                    last: true)
+        advContainer.addArrangedSubview(card)
+        card.widthAnchor.constraint(equalTo: advContainer.widthAnchor).isActive = true
+    }
+
+    private func chooseFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        if !notesFolder.isEmpty {
+            panel.directoryURL = URL(fileURLWithPath: notesFolder).deletingLastPathComponent()
+        }
+        if panel.runModal() == .OK, let url = panel.url {
+            notesFolder = url.path
+            pathLabel.stringValue = url.path.replacingOccurrences(of: NSHomeDirectory(), with: "~")
+            changes { c in c.notesFolder = url.path }
+        }
+    }
+
+    private func buildToggleRow(label: String, sub: String, on: Bool,
+                                onChange: @escaping (Bool) -> Void,
+                                last: Bool = false) -> NSView {
+        let toggle = NSSwitch()
+        toggle.controlSize = .small
+        toggle.state = on ? .on : .off
+        let target = ToggleTarget { onChange(toggle.state == .on) }
+        toggle.target = target
+        toggle.action = #selector(ToggleTarget.fire)
+        objc_setAssociatedObject(toggle, &ToggleTarget.key, target, .OBJC_ASSOCIATION_RETAIN)
+        return RowBuilder.row(label: label, sub: sub, control: toggle)
+    }
+}
+
+// MARK: - Pane: Transcription
+
+private final class TranscriptionPane: NSView {
+
+    private struct ModelRowState {
+        let row: ModelRowView
+        let key: String
+    }
+
+    private var cfg: Config
+    private let rowAction: (String) -> Void
+    private let openConfig: () -> Void
+    private let parentChanges: ((inout Config) -> Void) -> Void
+    private let advContainer = NSStackView()
+    private var rows: [String: ModelRowState] = [:]
+    private var disclosureToken: NSObjectProtocol?
+
+    init(cfg: Config,
+         rowAction: @escaping (String) -> Void,
+         openConfig: @escaping () -> Void,
+         changes: @escaping ((inout Config) -> Void) -> Void) {
+        self.cfg = cfg
+        self.rowAction = rowAction
+        self.openConfig = openConfig
+        self.parentChanges = changes
+        super.init(frame: .zero)
+        build()
+        disclosureToken = NotificationCenter.default.addObserver(
+            forName: Disclosure.didChange, object: nil, queue: .main) { [weak self] _ in
+            self?.refreshAdvanced()
+        }
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    deinit {
+        if let disclosureToken { NotificationCenter.default.removeObserver(disclosureToken) }
+    }
+
+    /// Apply a config mutation locally and to the persisted config in one
+    /// step. The pane caches `cfg` so the model-row refresh and radio
+    /// selection read coherent state without going back to disk.
+    private func change(_ block: (inout Config) -> Void) {
+        block(&cfg)
+        parentChanges(block)
+    }
+
+    private func build() {
+        translatesAutoresizingMaskIntoConstraints = false
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 22
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.topAnchor.constraint(equalTo: topAnchor),
+            stack.leadingAnchor.constraint(equalTo: leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: trailingAnchor),
+            stack.bottomAnchor.constraint(equalTo: bottomAnchor)
+        ])
+        let header = PageHeaderView(title: "Transcription",
+                                    subtitle: "How Ghostie turns the recording into text and which models it runs locally on your Mac.")
+        stack.addArrangedSubview(header)
+        header.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+
+        // Mode — dropdown over single vs. dual-language transcription. Maps
+        // to the `codeSwitch.enabled` flag in Config; the Models card reacts
+        // to the selection (KB + large-v3 paired vs. base/large-v3 alone).
+        let mode = GroupCard(title: "Mode")
+        let modePopup = NSPopUpButton(frame: .zero, pullsDown: false)
+        modePopup.addItems(withTitles: [
+            "Single language",
+            "Language switching (Swedish ↔ English)"
+        ])
+        modePopup.selectItem(at: cfg.codeSwitch.enabled ? 1 : 0)
+        modePopup.translatesAutoresizingMaskIntoConstraints = false
+        modePopup.widthAnchor.constraint(equalToConstant: 280).isActive = true
+        let modeTarget = ToggleTarget { [weak self] in
+            let on = modePopup.indexOfSelectedItem == 1
+            self?.change { c in c.codeSwitch.enabled = on }
+            self?.refreshAllRows()
+        }
+        modePopup.target = modeTarget
+        modePopup.action = #selector(ToggleTarget.fire)
+        objc_setAssociatedObject(modePopup, &ToggleTarget.key, modeTarget, .OBJC_ASSOCIATION_RETAIN)
+        mode.addRow(RowBuilder.row(
+            label: "Transcription mode",
+            sub: "Pick language switching for calls that mix Swedish and English.",
+            control: modePopup), last: true)
+        stack.addArrangedSubview(mode)
+        mode.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+
+        // Models.
+        let modelsCard = GroupCard(title: "Models")
+        let modelDefs: [(key: String, title: String, subtitle: String, size: String)] = [
+            ("base",     "Whisper base",        "English only. ~150 MB. The quick one.",   "150 MB"),
+            ("large-v3", "Whisper large-v3",    "Speaks every language. ~1.1 GB. The accurate one.", "1.1 GB"),
+            ("kb",       "KB-Whisper-large (sv)","Swedish specialist. ~1.1 GB. Runs alongside Whisper large for mixed-language calls.", "1.1 GB"),
+            ("vad",      "Silero VAD",          "~900 KB. Lets Ghostie skip silent stretches so it doesn't invent words.", "900 KB")
+        ]
+        for (i, m) in modelDefs.enumerated() {
+            let row = ModelRowView(key: m.key, title: m.title, subtitle: m.subtitle)
+            row.onAction = { [weak self] in self?.rowAction(m.key) }
+            modelsCard.addRow(row, last: i == modelDefs.count - 1)
+            rows[m.key] = ModelRowState(row: row, key: m.key)
+        }
+        stack.addArrangedSubview(modelsCard)
+        modelsCard.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+
+        // Quality.
+        let quality = GroupCard(title: "Quality")
+        quality.addRow(buildToggleRow(
+            label: "Tidy up the transcript",
+            sub: "Trims the things Whisper sometimes invents in silent stretches, like \"Thanks for watching.\"",
+            on: cfg.cleanTranscript) { [weak self] on in
+                self?.change { c in c.cleanTranscript = on }
+            })
+        let vadOnDisk = FileManager.default.fileExists(atPath: Models.sileroVAD.destPath)
+        quality.addRow(RowBuilder.row(
+            label: "Skip the quiet bits",
+            sub: vadOnDisk ? "Ghostie uses the Silero model below to find pauses and ignore them."
+                           : "Download the Silero VAD model below to turn this on.",
+            control: StatusBadgeView(kind: vadOnDisk ? .ok : .muted,
+                                     label: vadOnDisk ? "Active" : "Inactive")),
+                       last: true)
+        stack.addArrangedSubview(quality)
+        quality.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+
+        advContainer.orientation = .vertical
+        advContainer.alignment = .leading
+        advContainer.spacing = 22
+        advContainer.translatesAutoresizingMaskIntoConstraints = false
+        stack.addArrangedSubview(advContainer)
+        advContainer.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        refreshAdvanced()
+
+        refreshAllRows()
+    }
+
+    private func refreshAdvanced() {
+        advContainer.arrangedSubviews.forEach { $0.removeFromSuperview() }
+        guard Disclosure.isOn else { return }
+        let card = GroupCard(title: "Transcription · Advanced")
+        let editTarget = ActionTarget { [weak self] in self?.openConfig() }
+        let editBtn = StyledButton(title: "Edit in config.json",
+                                   target: editTarget, action: #selector(ActionTarget.fire))
+        objc_setAssociatedObject(editBtn, &ActionTarget.key, editTarget, .OBJC_ASSOCIATION_RETAIN)
+        card.addRow(RowBuilder.row(
+            label: "Starter sentence",
+            sub: cfg.initialPrompt.isEmpty
+                ? "Empty — Ghostie will let Whisper figure punctuation out on its own."
+                : cfg.initialPrompt,
+            control: editBtn))
+        let editTarget2 = ActionTarget { [weak self] in self?.openConfig() }
+        let editBtn2 = StyledButton(title: "Edit in config.json",
+                                    target: editTarget2, action: #selector(ActionTarget.fire))
+        objc_setAssociatedObject(editBtn2, &ActionTarget.key, editTarget2, .OBJC_ASSOCIATION_RETAIN)
+        card.addRow(RowBuilder.row(
+            label: "Decoding knobs",
+            sub: "How carefully Whisper second-guesses itself. Tuned for clean business speech.",
+            control: editBtn2))
+        card.addRow(RowBuilder.row(
+            label: "Cross-language confidence",
+            sub: "How much weight Ghostie gives the other speaker when picking a language. 0.5 means no help, 1.0 means override.",
+            control: NSTextField(labelWithString:
+                String(format: "%.2f", cfg.codeSwitch.crossTrackPriorStrength))
+                .styledAsMono()), last: true)
+        advContainer.addArrangedSubview(card)
+        card.widthAnchor.constraint(equalTo: advContainer.widthAnchor).isActive = true
+    }
+
+    func refreshRow(_ key: String) {
+        guard let st = rows[key], let model = modelForKey(key) else { return }
+        let h = ModelDownloader.health(for: [model])[0]
+        let single = !cfg.codeSwitch.enabled
+        // Single-mode pairs with one whisper model (base or large-v3); the KB
+        // row pairs with large-v3 in codeswitch mode and only then.
+        let selected: Bool = {
+            switch key {
+            case "base":
+                return single && cfg.whisperModel == Models.baseEnglish.destPath
+            case "large-v3":
+                return (single && cfg.whisperModel == Models.largeV3.destPath)
+                    || (!single)
+            case "kb":
+                return !single
+            case "vad":
+                // VAD has no explicit toggle in Config — whisper-cli uses it
+                // automatically whenever the file is on disk. Show a tick to
+                // confirm it's active rather than leaving the row indicator
+                // permanently blank.
+                return h.state.isOK
+            default:
+                return false
+            }
+        }()
+        st.row.apply(state: h.state, selected: selected, isPaired: key == "kb" && !single)
+    }
+
+    func refreshAllRows() {
+        for key in rows.keys { refreshRow(key) }
+    }
+
+    func setRowDownloading(_ key: String, percent: Double, status: String) {
+        rows[key]?.row.setDownloading(percent: percent, status: status)
+    }
+    func setRowBusy(_ key: String, status: String) {
+        rows[key]?.row.setBusy(status: status)
+    }
+
+    private func modelForKey(_ key: String) -> Model? {
+        switch key {
+        case "base":     return Models.baseEnglish
+        case "large-v3": return Models.largeV3
+        case "vad":      return Models.sileroVAD
+        case "kb":       return Models.kbWhisperLarge(variant: cfg.codeSwitch.kbWhisperVariant.isEmpty
+                                                              ? "standard"
+                                                              : cfg.codeSwitch.kbWhisperVariant)
+        default: return nil
+        }
+    }
+
+    private func buildToggleRow(label: String, sub: String, on: Bool,
+                                onChange: @escaping (Bool) -> Void) -> NSView {
+        let toggle = NSSwitch()
+        toggle.controlSize = .small
+        toggle.state = on ? .on : .off
+        let target = ToggleTarget { onChange(toggle.state == .on) }
+        toggle.target = target
+        toggle.action = #selector(ToggleTarget.fire)
+        objc_setAssociatedObject(toggle, &ToggleTarget.key, target, .OBJC_ASSOCIATION_RETAIN)
+        return RowBuilder.row(label: label, sub: sub, control: toggle)
+    }
+}
+
+// MARK: - Model row
+
+private final class ModelRowView: NSView {
+    private let radio = RadioCircle()
+    private let title = NSTextField(labelWithString: "")
+    private let subtitle = NSTextField(labelWithString: "")
+    private let badge = StatusBadgeView(kind: .muted, label: "Not downloaded")
+    private let action: StyledButton
+    private let progressBar = ProgressBar()
+    private let statusLine = NSTextField(labelWithString: "")
+    private var progressHeight: NSLayoutConstraint!
+    private var statusHeight: NSLayoutConstraint!
+    private var subtitleToBottom: NSLayoutConstraint!
+    private var statusToBottom: NSLayoutConstraint!
+    var onAction: (() -> Void)?
+
+    init(key: String, title: String, subtitle: String) {
+        self.action = StyledButton(title: "Download", target: nil, action: nil)
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+
+        self.title.stringValue = title
+        self.title.font = .systemFont(ofSize: 13, weight: .semibold)
+        self.title.textColor = Theme.text
+        self.title.translatesAutoresizingMaskIntoConstraints = false
+        self.title.setContentHuggingPriority(.required, for: .horizontal)
+
+        self.subtitle.stringValue = subtitle
+        self.subtitle.font = .systemFont(ofSize: 11.5)
+        self.subtitle.textColor = Theme.text2
+        self.subtitle.translatesAutoresizingMaskIntoConstraints = false
+
+        statusLine.font = .systemFont(ofSize: 11)
+        statusLine.textColor = Theme.text2
+        statusLine.translatesAutoresizingMaskIntoConstraints = false
+        statusLine.isHidden = true
+
+        progressBar.translatesAutoresizingMaskIntoConstraints = false
+        progressBar.isHidden = true
+
+        // Title + badge on one line. `.centerY` puts them on the same visual
+        // line; `.firstBaseline` would resolve the badge's baseline to its
+        // top edge (StatusBadgeView has no text baseline of its own) and
+        // push the pill under the title.
+        let titleLine = NSStackView(views: [self.title, badge])
+        titleLine.orientation = .horizontal
+        titleLine.spacing = 8
+        titleLine.alignment = .centerY
+        titleLine.translatesAutoresizingMaskIntoConstraints = false
+
+        radio.translatesAutoresizingMaskIntoConstraints = false
+
+        let actionTarget = ActionTarget { [weak self] in self?.onAction?() }
+        action.target = actionTarget
+        action.action = #selector(ActionTarget.fire)
+        objc_setAssociatedObject(action, &ActionTarget.key, actionTarget, .OBJC_ASSOCIATION_RETAIN)
+
+        addSubview(radio)
+        addSubview(titleLine)
+        addSubview(self.subtitle)
+        addSubview(action)
+        addSubview(progressBar)
+        addSubview(statusLine)
+
+        // Progress and status carry their own height constraints, toggled to
+        // 0 when hidden so the row collapses to title + subtitle without
+        // leaving phantom space.
+        progressHeight = progressBar.heightAnchor.constraint(equalToConstant: 0)
+        statusHeight = statusLine.heightAnchor.constraint(equalToConstant: 0)
+        progressHeight.isActive = true
+        statusHeight.isActive = true
+
+        subtitleToBottom = bottomAnchor.constraint(equalTo: self.subtitle.bottomAnchor, constant: 11)
+        statusToBottom = bottomAnchor.constraint(equalTo: statusLine.bottomAnchor, constant: 9)
+        subtitleToBottom.isActive = true
+
+        NSLayoutConstraint.activate([
+            radio.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14),
+            radio.centerYAnchor.constraint(equalTo: titleLine.centerYAnchor),
+            radio.widthAnchor.constraint(equalToConstant: 16),
+            radio.heightAnchor.constraint(equalToConstant: 16),
+
+            titleLine.leadingAnchor.constraint(equalTo: radio.trailingAnchor, constant: 12),
+            titleLine.topAnchor.constraint(equalTo: topAnchor, constant: 11),
+            titleLine.trailingAnchor.constraint(lessThanOrEqualTo: action.leadingAnchor, constant: -12),
+
+            self.subtitle.leadingAnchor.constraint(equalTo: titleLine.leadingAnchor),
+            self.subtitle.topAnchor.constraint(equalTo: titleLine.bottomAnchor, constant: 2),
+            self.subtitle.trailingAnchor.constraint(lessThanOrEqualTo: action.leadingAnchor, constant: -12),
+
+            progressBar.leadingAnchor.constraint(equalTo: titleLine.leadingAnchor),
+            progressBar.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
+            progressBar.topAnchor.constraint(equalTo: self.subtitle.bottomAnchor, constant: 8),
+
+            statusLine.leadingAnchor.constraint(equalTo: titleLine.leadingAnchor),
+            statusLine.topAnchor.constraint(equalTo: progressBar.bottomAnchor, constant: 3),
+            statusLine.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -14),
+
+            action.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
+            action.centerYAnchor.constraint(equalTo: titleLine.centerYAnchor)
+        ])
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    private func setProgressVisible(_ visible: Bool) {
+        progressBar.isHidden = !visible
+        statusLine.isHidden = !visible
+        progressHeight.constant = visible ? 4 : 0
+        statusHeight.constant = visible ? 14 : 0
+        subtitleToBottom.isActive = !visible
+        statusToBottom.isActive = visible
+    }
+
+    func apply(state: ModelDownloader.HealthState, selected: Bool, isPaired: Bool) {
+        setProgressVisible(false)
+        radio.isSelected = selected
+        radio.isPaired = isPaired
+        switch state {
+        case .ok:
+            badge.set(kind: .ok, label: "On disk")
+            action.title = "Re-verify"
+            action.kind = .secondary
+        case .missing:
+            badge.set(kind: .muted, label: "Not downloaded")
+            action.title = "Download"
+            action.kind = .primary
+        case .noSidecar:
+            badge.set(kind: .warn, label: "Unverified")
+            action.title = "Verify"
+            action.kind = .secondary
+        case .sizeWrong, .hashMismatch:
+            badge.set(kind: .danger, label: "Mismatch")
+            action.title = "Re-download"
+            action.kind = .primary
+        }
+    }
+    func setDownloading(percent: Double, status: String) {
+        badge.set(kind: .info, label: "Downloading")
+        action.title = "Cancel"
+        action.kind = .secondary
+        setProgressVisible(true)
+        progressBar.set(progress: percent)
+        statusLine.stringValue = status
+    }
+    func setBusy(status: String) {
+        // Verify / re-hash: status line only, no progress bar — but we still
+        // need somewhere to land the message. Reuse the progress slot with a
+        // zero bar.
+        setProgressVisible(true)
+        progressBar.set(progress: 0)
+        statusLine.stringValue = status
+        action.title = "Working…"
+        action.kind = .secondary
+    }
+}
+
+/// Status mark in front of each model row. The model the engine actually uses
+/// is driven by `cfg.codeSwitch.enabled` + `cfg.whisperModel`, not by clicking
+/// the row — so render a tickmark for the active model and leave the slot
+/// empty otherwise. (Was previously a radio circle which implied a per-row
+/// selection affordance that isn't actually wired.)
+private final class RadioCircle: NSView {
+    var isSelected = false { didSet { needsDisplay = true } }
+    var isPaired = false { didSet { needsDisplay = true } }
+    override var isFlipped: Bool { true }
+    override func draw(_ dirtyRect: NSRect) {
+        guard isSelected || isPaired else { return }
+        let r = bounds.insetBy(dx: 1, dy: 1)
+        Theme.accent.setStroke()
+        let check = NSBezierPath()
+        check.lineWidth = 1.8
+        check.lineCapStyle = .round
+        check.lineJoinStyle = .round
+        // Three-point checkmark inscribed in the 14x14 box.
+        check.move(to: CGPoint(x: r.minX + r.width * 0.18,
+                               y: r.minY + r.height * 0.55))
+        check.line(to: CGPoint(x: r.minX + r.width * 0.42,
+                               y: r.minY + r.height * 0.78))
+        check.line(to: CGPoint(x: r.minX + r.width * 0.85,
+                               y: r.minY + r.height * 0.28))
+        check.stroke()
+    }
+}
+
+private final class ProgressBar: NSView {
+    private var progress: CGFloat = 0
+    private let fillLayer = CALayer()
+    override var isFlipped: Bool { true }
+    init() {
+        super.init(frame: .zero)
+        wantsLayer = true
+        layer?.cornerRadius = 2
+        layer?.backgroundColor = Theme.chipBg.cgColor
+        layer?.masksToBounds = true
+        fillLayer.backgroundColor = Theme.accent.cgColor
+        fillLayer.cornerRadius = 2
+        layer?.addSublayer(fillLayer)
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    override func layout() {
+        super.layout()
+        // Drive the fill from layout (not updateLayer); previously this ran
+        // inside updateLayer + re-added a sublayer on every pass, which
+        // accumulated layers and reentered display.
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        fillLayer.frame = CGRect(x: 0, y: 0,
+                                  width: bounds.width * progress,
+                                  height: bounds.height)
+        CATransaction.commit()
+    }
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        layer?.backgroundColor = Theme.chipBg.cgColor
+        fillLayer.backgroundColor = Theme.accent.cgColor
+    }
+    func set(progress: Double) {
+        let p = CGFloat(max(0, min(1, progress)))
+        guard p != self.progress else { return }
+        self.progress = p
+        needsLayout = true
+    }
+}
+
+// MARK: - Pane: Summary
+
+private final class SummaryPane: NSView {
+    private let cfg: Config
+    private let openConfig: () -> Void
+    private let changes: ((inout Config) -> Void) -> Void
+    private let advContainer = NSStackView()
+    private var disclosureToken: NSObjectProtocol?
+
+    init(cfg: Config,
+         openConfig: @escaping () -> Void,
+         changes: @escaping ((inout Config) -> Void) -> Void) {
+        self.cfg = cfg
+        self.openConfig = openConfig
+        self.changes = changes
+        super.init(frame: .zero)
+        build()
+        disclosureToken = NotificationCenter.default.addObserver(
+            forName: Disclosure.didChange, object: nil, queue: .main) { [weak self] _ in
+            self?.refreshAdvanced()
+        }
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    deinit {
+        if let disclosureToken { NotificationCenter.default.removeObserver(disclosureToken) }
+    }
+
+    private func build() {
+        translatesAutoresizingMaskIntoConstraints = false
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 22
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.topAnchor.constraint(equalTo: topAnchor),
+            stack.leadingAnchor.constraint(equalTo: leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: trailingAnchor),
+            stack.bottomAnchor.constraint(equalTo: bottomAnchor)
+        ])
+        let header = PageHeaderView(title: "Summary",
+                                    subtitle: "How Ghostie hands the transcript to Claude and which model writes the note.")
+        stack.addArrangedSubview(header)
+        header.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+
+        let card = GroupCard()
+        let claudePath = cfg.claudeBinary.isEmpty ? Config.findClaudeBinary() : cfg.claudeBinary
+        let claudeReady = !claudePath.isEmpty
+        card.addRow(RowBuilder.row(
+            label: "Claude Code",
+            sub: claudeReady
+                ? "Ready at \(claudePath.replacingOccurrences(of: NSHomeDirectory(), with: "~"))"
+                : "Couldn't find Claude on this Mac. Open a terminal and run `claude` once to sign in.",
+            leadingSymbol: "terminal", leadingTint: Theme.text2,
+            control: StatusBadgeView(kind: claudeReady ? .ok : .warn,
+                                     label: claudeReady ? "Signed in" : "Missing")))
+        let modelPopup = NSPopUpButton(frame: .zero, pullsDown: false)
+        modelPopup.addItems(withTitles: ["claude-sonnet-4-6", "claude-opus-4-7", "claude-haiku-4-5-20251001"])
+        modelPopup.selectItem(withTitle: cfg.summaryModel)
+        let modelTarget = ToggleTarget { [weak self] in
+            let title = modelPopup.titleOfSelectedItem ?? "claude-sonnet-4-6"
+            self?.changes { c in c.summaryModel = title }
+        }
+        modelPopup.target = modelTarget
+        modelPopup.action = #selector(ToggleTarget.fire)
+        objc_setAssociatedObject(modelPopup, &ToggleTarget.key, modelTarget, .OBJC_ASSOCIATION_RETAIN)
+        modelPopup.widthAnchor.constraint(equalToConstant: 220).isActive = true
+        card.addRow(RowBuilder.row(
+            label: "Which Claude writes the note",
+            sub: "Sonnet is the good balance. Opus is slower but smarter. Haiku is faster but lighter.",
+            control: modelPopup), last: true)
+        stack.addArrangedSubview(card)
+        card.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+
+        advContainer.orientation = .vertical
+        advContainer.alignment = .leading
+        advContainer.spacing = 22
+        advContainer.translatesAutoresizingMaskIntoConstraints = false
+        stack.addArrangedSubview(advContainer)
+        advContainer.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        refreshAdvanced()
+    }
+
+    private func refreshAdvanced() {
+        advContainer.arrangedSubviews.forEach { $0.removeFromSuperview() }
+        guard Disclosure.isOn else { return }
+        let card = GroupCard(title: "Prompt")
+        // The analyst prompt is hardcoded in Summarizer.swift, not in
+        // config.json — surface it as informational with a badge that points
+        // there, rather than an "Edit in config.json" button that would lead
+        // users to a file that doesn't contain the prompt.
+        card.addRow(RowBuilder.row(
+            label: "How Ghostie asks Claude to write",
+            sub: "Ghostie ships with its own meeting-notes prompt that replaces Claude Code's coding-assistant one.",
+            control: StatusBadgeView(kind: .muted, label: "Built-in")),
+                    last: true)
+        advContainer.addArrangedSubview(card)
+        card.widthAnchor.constraint(equalTo: advContainer.widthAnchor).isActive = true
+    }
+}
+
+// MARK: - Pane: Updates
+
+private final class UpdatesPane: NSView {
+    enum DisplayStatus {
+        case unknown(version: String)
+        case upToDate(version: String)
+        case available(from: String, to: String, notes: String)
+        case unsupported
+        case failed(String)
+    }
+
+    private let cfg: Config
+    private let onCheckNow: () -> Void
+    private let changes: ((inout Config) -> Void) -> Void
+
+    private let heroTile = NSView()
+    private let heroSymbol = NSImageView()
+    private let heroTitle = NSTextField(labelWithString: "")
+    private let heroSub = NSTextField(labelWithString: "")
+    private let checkBtn: StyledButton
+
+    init(cfg: Config, onCheckNow: @escaping () -> Void,
+         changes: @escaping ((inout Config) -> Void) -> Void) {
+        self.cfg = cfg
+        self.onCheckNow = onCheckNow
+        self.changes = changes
+        self.checkBtn = StyledButton(title: "Check now", target: nil, action: nil)
+        super.init(frame: .zero)
+        build()
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    private func build() {
+        translatesAutoresizingMaskIntoConstraints = false
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 22
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.topAnchor.constraint(equalTo: topAnchor),
+            stack.leadingAnchor.constraint(equalTo: leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: trailingAnchor),
+            stack.bottomAnchor.constraint(equalTo: bottomAnchor)
+        ])
+        let header = PageHeaderView(title: "Updates",
+                                    subtitle: "How Ghostie checks for new releases and how it verifies them before installing.")
+        stack.addArrangedSubview(header)
+        header.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+
+        let card = GroupCard()
+        let hero = NSView()
+        hero.translatesAutoresizingMaskIntoConstraints = false
+        heroTile.translatesAutoresizingMaskIntoConstraints = false
+        heroTile.wantsLayer = true
+        heroTile.layer?.cornerRadius = 10
+        heroSymbol.translatesAutoresizingMaskIntoConstraints = false
+
+        heroTitle.font = .systemFont(ofSize: 14, weight: .semibold)
+        heroTitle.textColor = Theme.text
+        heroTitle.translatesAutoresizingMaskIntoConstraints = false
+
+        heroSub.font = .systemFont(ofSize: 12)
+        heroSub.textColor = Theme.text2
+        heroSub.translatesAutoresizingMaskIntoConstraints = false
+
+        heroTile.addSubview(heroSymbol)
+        let textStack = NSStackView(views: [heroTitle, heroSub])
+        textStack.orientation = .vertical
+        textStack.alignment = .leading
+        textStack.spacing = 2
+        textStack.translatesAutoresizingMaskIntoConstraints = false
+
+        let checkTarget = ActionTarget { [weak self] in self?.onCheckNow() }
+        checkBtn.target = checkTarget
+        checkBtn.action = #selector(ActionTarget.fire)
+        objc_setAssociatedObject(checkBtn, &ActionTarget.key, checkTarget, .OBJC_ASSOCIATION_RETAIN)
+
+        hero.addSubview(heroTile)
+        hero.addSubview(textStack)
+        hero.addSubview(checkBtn)
+        NSLayoutConstraint.activate([
+            heroTile.leadingAnchor.constraint(equalTo: hero.leadingAnchor, constant: 14),
+            heroTile.centerYAnchor.constraint(equalTo: hero.centerYAnchor),
+            heroTile.widthAnchor.constraint(equalToConstant: 44),
+            heroTile.heightAnchor.constraint(equalToConstant: 44),
+            heroSymbol.centerXAnchor.constraint(equalTo: heroTile.centerXAnchor),
+            heroSymbol.centerYAnchor.constraint(equalTo: heroTile.centerYAnchor),
+            heroSymbol.widthAnchor.constraint(equalToConstant: 22),
+            heroSymbol.heightAnchor.constraint(equalToConstant: 22),
+            textStack.leadingAnchor.constraint(equalTo: heroTile.trailingAnchor, constant: 14),
+            textStack.centerYAnchor.constraint(equalTo: hero.centerYAnchor),
+            textStack.trailingAnchor.constraint(lessThanOrEqualTo: checkBtn.leadingAnchor, constant: -12),
+            checkBtn.trailingAnchor.constraint(equalTo: hero.trailingAnchor, constant: -14),
+            checkBtn.centerYAnchor.constraint(equalTo: hero.centerYAnchor),
+            hero.topAnchor.constraint(equalTo: heroTile.topAnchor, constant: -14),
+            hero.bottomAnchor.constraint(equalTo: heroTile.bottomAnchor, constant: 14)
+        ])
+        card.addRow(hero)
+
+        card.addRow(buildToggleRow(
+            label: "Check on its own",
+            sub: "Ghostie peeks at GitHub about once a day and just after launch.",
+            on: cfg.autoCheckUpdates) { [weak self] on in
+                self?.changes { c in c.autoCheckUpdates = on }
+            })
+        card.addRow(buildStartAtLoginRow(), last: true)
+        stack.addArrangedSubview(card)
+        card.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+
+        // Initial state — no GitHub round-trip happens on window open, so
+        // don't claim "You're up to date". Show the running version with a
+        // neutral prompt to check; the user clicks Check now to verify.
+        if Updater.runningBuildSupportsOTA() {
+            show(status: .unknown(version: "\(Updater.runningVersion())"))
+        } else {
+            show(status: .unsupported)
+        }
+    }
+
+    private func buildToggleRow(label: String, sub: String, on: Bool,
+                                onChange: @escaping (Bool) -> Void) -> NSView {
+        let toggle = NSSwitch()
+        toggle.controlSize = .small
+        toggle.state = on ? .on : .off
+        let target = ToggleTarget { onChange(toggle.state == .on) }
+        toggle.target = target
+        toggle.action = #selector(ToggleTarget.fire)
+        objc_setAssociatedObject(toggle, &ToggleTarget.key, target, .OBJC_ASSOCIATION_RETAIN)
+        return RowBuilder.row(label: label, sub: sub, control: toggle)
+    }
+
+    private func buildStartAtLoginRow() -> NSView {
+        let toggle = NSSwitch()
+        toggle.controlSize = .small
+        if #available(macOS 13.0, *) {
+            toggle.state = (SMAppService.mainApp.status == .enabled) ? .on : .off
+        }
+        let target = ToggleTarget {
+            guard #available(macOS 13.0, *) else { return }
+            do {
+                if SMAppService.mainApp.status == .enabled {
+                    try SMAppService.mainApp.unregister()
+                } else {
+                    try SMAppService.mainApp.register()
+                }
+            } catch {
+                let a = NSAlert()
+                a.messageText = "Could not change login item"
+                a.informativeText = error.localizedDescription
+                a.runModal()
+            }
+            if #available(macOS 13.0, *) {
+                toggle.state = (SMAppService.mainApp.status == .enabled) ? .on : .off
+            }
+        }
+        toggle.target = target
+        toggle.action = #selector(ToggleTarget.fire)
+        objc_setAssociatedObject(toggle, &ToggleTarget.key, target, .OBJC_ASSOCIATION_RETAIN)
+        return RowBuilder.row(
+            label: "Open Ghostie when I log in",
+            sub: "Skip the manual launch — Ghostie comes back to the menu bar every time you sign in.",
+            control: toggle)
+    }
+
+    func setBusy(_ busy: Bool, statusText: String?) {
+        checkBtn.isEnabled = !busy
+        if let statusText {
+            heroSub.stringValue = statusText
+        }
+    }
+
+    func show(status: DisplayStatus) {
+        switch status {
+        case .unknown(let v):
+            heroTile.layer?.backgroundColor = Theme.chipBg.cgColor
+            heroSymbol.image = NSImage(systemSymbolName: "arrow.clockwise",
+                                       accessibilityDescription: nil)?
+                .withSymbolConfiguration(.init(pointSize: 20, weight: .regular))
+            heroSymbol.contentTintColor = Theme.text2
+            heroTitle.stringValue = "Ghostie \(v)"
+            heroSub.stringValue = "Click Check now to see if there's a newer release."
+            checkBtn.title = "Check now"
+        case .upToDate(let v):
+            heroTile.layer?.backgroundColor = Theme.okSoft.cgColor
+            heroSymbol.image = NSImage(systemSymbolName: "checkmark",
+                                       accessibilityDescription: nil)?
+                .withSymbolConfiguration(.init(pointSize: 22, weight: .semibold))
+            heroSymbol.contentTintColor = Theme.ok
+            heroTitle.stringValue = "You're on the latest"
+            heroSub.stringValue = "Ghostie \(v)"
+            checkBtn.title = "Check now"
+        case .available(let from, let to, _):
+            heroTile.layer?.backgroundColor = Theme.infoSoft.cgColor
+            heroSymbol.image = NSImage(systemSymbolName: "arrow.down.circle",
+                                       accessibilityDescription: nil)?
+                .withSymbolConfiguration(.init(pointSize: 22, weight: .semibold))
+            heroSymbol.contentTintColor = Theme.info
+            heroTitle.stringValue = "A new version is ready"
+            heroSub.stringValue = "\(from) → \(to)"
+            checkBtn.title = "Update"
+        case .unsupported:
+            heroTile.layer?.backgroundColor = Theme.warnSoft.cgColor
+            heroSymbol.image = NSImage(systemSymbolName: "exclamationmark.triangle",
+                                       accessibilityDescription: nil)?
+                .withSymbolConfiguration(.init(pointSize: 22, weight: .semibold))
+            heroSymbol.contentTintColor = Theme.warn
+            heroTitle.stringValue = "Can't update from here"
+            heroSub.stringValue = "This copy of Ghostie wasn't signed by us, so it can't update itself safely. Grab the latest from the GitHub releases page."
+            checkBtn.title = "Open Releases"
+            // Repoint to releases page when the build can't OTA.
+            let target = ActionTarget {
+                NSWorkspace.shared.open(Updater.releasesPage)
+            }
+            checkBtn.target = target
+            checkBtn.action = #selector(ActionTarget.fire)
+            objc_setAssociatedObject(checkBtn, &ActionTarget.key, target, .OBJC_ASSOCIATION_RETAIN)
+        case .failed(let e):
+            heroTile.layer?.backgroundColor = Theme.dangerSoft.cgColor
+            heroSymbol.image = NSImage(systemSymbolName: "xmark.circle",
+                                       accessibilityDescription: nil)?
+                .withSymbolConfiguration(.init(pointSize: 22, weight: .semibold))
+            heroSymbol.contentTintColor = Theme.danger
+            heroTitle.stringValue = "Couldn't reach GitHub"
+            heroSub.stringValue = e
+            checkBtn.title = "Try again"
+        }
+    }
+}
+
+// MARK: - Pane: Advanced
+
+private final class AdvancedPane: NSView {
+    init(openConfig: @escaping () -> Void,
+         revealData: @escaping () -> Void,
+         runDiagnose: @escaping () -> Void,
+         runSelftest: @escaping () -> Void,
+         runDoctor: @escaping () -> Void,
+         resetSettings: @escaping () -> Void) {
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 22
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.topAnchor.constraint(equalTo: topAnchor),
+            stack.leadingAnchor.constraint(equalTo: leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: trailingAnchor),
+            stack.bottomAnchor.constraint(equalTo: bottomAnchor)
+        ])
+        let header = PageHeaderView(title: "Developer",
+                                    subtitle: "Where Ghostie keeps its files and how to poke at it from the terminal. Most people won't need anything here.")
+        stack.addArrangedSubview(header)
+        header.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+
+        let card = GroupCard()
+        card.addRow(rowWithButton(label: "Open the config file",
+                                  sub: "~/.ghostie/config.json — every setting Ghostie remembers, in one editable file.",
+                                  symbol: "doc.text",
+                                  button: ("Open", .secondary, openConfig)))
+        card.addRow(rowWithButton(label: "Show me the Ghostie folder",
+                                  sub: "~/.ghostie — where models, queued calls, and recordings live.",
+                                  symbol: "folder",
+                                  button: ("Reveal", .secondary, revealData)))
+        card.addRow(rowWithButton(label: "Watch the detector live",
+                                  sub: "Opens a terminal and streams what Ghostie sees while deciding if a call is real.",
+                                  symbol: "terminal",
+                                  button: ("Run", .secondary, runDiagnose)))
+        card.addRow(rowWithButton(label: "Run a health check",
+                                  sub: "Opens a terminal and reports whether Whisper, Claude and the permissions are all set up.",
+                                  symbol: "stethoscope",
+                                  button: ("Run", .secondary, runDoctor)))
+        card.addRow(rowWithButton(label: "Run the self-test",
+                                  sub: "Opens a terminal and replays the internal regression suite. Useful after editing Ghostie.",
+                                  symbol: "checkmark.shield",
+                                  button: ("Run", .secondary, runSelftest)))
+        card.addRow(rowWithButton(label: "Reset all settings",
+                                  sub: "Puts every setting back to its default. Your notes, the queue, and downloaded models stay.",
+                                  symbol: nil,
+                                  danger: true,
+                                  button: ("Reset…", .danger, resetSettings)), last: true)
+        stack.addArrangedSubview(card)
+        card.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    private func rowWithButton(label: String, sub: String,
+                               symbol: String?,
+                               danger: Bool = false,
+                               button: (title: String, kind: ButtonKind, action: () -> Void))
+        -> NSView {
+        let target = ActionTarget { button.action() }
+        let b = StyledButton(title: button.title, target: target, action: #selector(ActionTarget.fire))
+        b.kind = button.kind
+        objc_setAssociatedObject(b, &ActionTarget.key, target, .OBJC_ASSOCIATION_RETAIN)
+        return RowBuilder.row(label: label, sub: sub,
+                              leadingSymbol: symbol,
+                              leadingTint: symbol == nil ? nil : Theme.text2,
+                              control: b, danger: danger)
+    }
+}
+
+// MARK: - Pane: About
+
+private final class AboutPane: NSView {
+    init(openReleases: @escaping () -> Void) {
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 22
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.topAnchor.constraint(equalTo: topAnchor),
+            stack.leadingAnchor.constraint(equalTo: leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: trailingAnchor),
+            stack.bottomAnchor.constraint(equalTo: bottomAnchor)
+        ])
+        let header = PageHeaderView(title: "About Ghostie",
+                                    subtitle: "What Ghostie does, what's running on this Mac, and the licences it ships with.")
+        stack.addArrangedSubview(header)
+        header.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+
+        let card = GroupCard()
+        let v = "\(Updater.runningVersion())"
+        let signed = Updater.runningBuildSupportsOTA()
+        let macVer = ProcessInfo.processInfo.operatingSystemVersionString
+        card.addRow(RowBuilder.row(
+            label: "Version",
+            sub: signed ? "\(v) · official signed release"
+                        : "\(v) · built from source",
+            control: NSTextField(labelWithString: v).styledAsMono()))
+        card.addRow(RowBuilder.row(
+            label: "macOS", sub: macVer,
+            control: StatusBadgeView(kind: .ok, label: "Supported")))
+        let target = ActionTarget(openReleases)
+        let btn = StyledButton(title: "Open releases", target: target,
+                               action: #selector(ActionTarget.fire))
+        objc_setAssociatedObject(btn, &ActionTarget.key, target, .OBJC_ASSOCIATION_RETAIN)
+        card.addRow(RowBuilder.row(
+            label: "Open-source bits",
+            sub: "Ghostie itself is MIT. It stands on Whisper.cpp (MIT), KB-Whisper (Apache 2.0), and Silero VAD (MIT).",
+            control: btn), last: true)
+        stack.addArrangedSubview(card)
+        card.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+    }
+    required init?(coder: NSCoder) { fatalError() }
+}
+
+// MARK: - Misc helpers
+
+private extension NSTextField {
+    /// Style a static label with the monospace font used for paths / sizes.
+    func styledAsMono() -> NSTextField {
+        font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        textColor = Theme.text2
+        return self
+    }
 }
