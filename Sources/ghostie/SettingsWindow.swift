@@ -1390,7 +1390,7 @@ private final class Sidebar: NSView {
 
         let title = NSTextField(labelWithString: "Ghostie")
         title.font = .systemFont(ofSize: 13.5, weight: .bold)
-        title.textColor = Theme.text
+        title.textColor = .labelColor
         title.translatesAutoresizingMaskIntoConstraints = false
 
         statusDot.translatesAutoresizingMaskIntoConstraints = false
@@ -1398,7 +1398,7 @@ private final class Sidebar: NSView {
         statusDot.layer?.cornerRadius = 3
 
         statusLabel.font = .systemFont(ofSize: 11)
-        statusLabel.textColor = Theme.text2
+        statusLabel.textColor = .secondaryLabelColor
         statusLabel.translatesAutoresizingMaskIntoConstraints = false
         statusLabel.lineBreakMode = .byTruncatingTail
 
@@ -1461,7 +1461,7 @@ private final class Sidebar: NSView {
         }
         let powerUser = NSTextField(labelWithString: "POWER USER")
         powerUser.font = .systemFont(ofSize: 10, weight: .semibold)
-        powerUser.textColor = Theme.text3
+        powerUser.textColor = .tertiaryLabelColor
         let powerWrap = NSView()
         powerWrap.translatesAutoresizingMaskIntoConstraints = false
         powerWrap.addSubview(powerUser)
@@ -1495,7 +1495,7 @@ private final class Sidebar: NSView {
         // either flips state.
         let advLabel = NSTextField(labelWithString: "Advanced")
         advLabel.font = .systemFont(ofSize: 12, weight: .medium)
-        advLabel.textColor = Theme.text2
+        advLabel.textColor = .secondaryLabelColor
         advLabel.translatesAutoresizingMaskIntoConstraints = false
 
         let advSwitch = NSSwitch()
@@ -1586,11 +1586,16 @@ private final class SidebarItem: NSView {
         icon.image = NSImage(systemSymbolName: id.systemSymbol,
                              accessibilityDescription: nil)?
             .withSymbolConfiguration(.init(pointSize: 13, weight: .regular))
-        icon.contentTintColor = Theme.text2
+        // System semantic colors instead of Theme.text2/Theme.text. The custom
+        // dynamic NSColor providers (NSColor(name: nil) { ap in ... }) were
+        // freezing at light-mode resolution inside layer-backed sidebar items
+        // and never refreshing — `.secondaryLabelColor` / `.labelColor` are
+        // managed by AppKit and update reliably on appearance changes.
+        icon.contentTintColor = .secondaryLabelColor
 
         label.stringValue = id.title
         label.font = .systemFont(ofSize: 13, weight: .medium)
-        label.textColor = Theme.text
+        label.textColor = .labelColor
         label.translatesAutoresizingMaskIntoConstraints = false
 
         badge.translatesAutoresizingMaskIntoConstraints = false
@@ -1615,9 +1620,28 @@ private final class SidebarItem: NSView {
 
     func setActive(_ on: Bool) {
         active = on
-        layer?.backgroundColor = on ? Theme.selectedItem.cgColor : NSColor.clear.cgColor
-        icon.contentTintColor = on ? Theme.accent : Theme.text2
-        label.font = .systemFont(ofSize: 13, weight: on ? .semibold : .medium)
+        applyTheme()
+    }
+
+    /// Re-resolve every dynamic color we depend on. Layer-backed views capture
+    /// `cgColor` snapshots that don't track appearance changes, and AppKit
+    /// occasionally caches `NSTextField`/`NSImageView` tints set before the
+    /// window's effective appearance flipped to `.darkAqua`. Calling this on
+    /// both `setActive(_:)` and `viewDidChangeEffectiveAppearance` keeps the
+    /// sidebar legible whether the user toggles dark mode at launch or
+    /// mid-session.
+    private func applyTheme() {
+        layer?.backgroundColor = active ? Theme.selectedItem.cgColor : NSColor.clear.cgColor
+        icon.contentTintColor = active ? Theme.accent : .secondaryLabelColor
+        label.textColor = .labelColor
+        label.font = .systemFont(ofSize: 13, weight: active ? .semibold : .medium)
+        label.needsDisplay = true
+        icon.needsDisplay = true
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        applyTheme()
     }
 
     enum BadgeKind { case warn }
@@ -3105,10 +3129,7 @@ private final class SummaryPane: NSView {
 
         // URL row. Action fires on Enter or focus loss; on change we rebuild
         // the card so the model list and status badge re-probe.
-        let urlField = NSTextField(string: cfgState.ollamaUrl)
-        urlField.bezelStyle = .roundedBezel
-        urlField.font = .systemFont(ofSize: 12.5)
-        urlField.translatesAutoresizingMaskIntoConstraints = false
+        let urlField = ThemedTextField(string: cfgState.ollamaUrl)
         urlField.widthAnchor.constraint(equalToConstant: 220).isActive = true
         let urlTarget = OllamaTextTarget { [weak self] in
             guard let self else { return }
@@ -3162,11 +3183,8 @@ private final class SummaryPane: NSView {
                     : "Used for every summary while Ollama is selected. Bigger models follow the prompt better.",
                 control: popup), last: true)
         } else {
-            let modelField = NSTextField(string: cfgState.ollamaModel)
-            modelField.bezelStyle = .roundedBezel
-            modelField.font = .systemFont(ofSize: 12.5)
+            let modelField = ThemedTextField(string: cfgState.ollamaModel)
             modelField.placeholderString = "llama3.1:8b"
-            modelField.translatesAutoresizingMaskIntoConstraints = false
             modelField.widthAnchor.constraint(equalToConstant: 220).isActive = true
             let modelTarget = OllamaTextTarget { [weak self] in
                 guard let self else { return }
@@ -3214,6 +3232,43 @@ private final class OllamaTextTarget: NSObject, NSTextFieldDelegate {
     init(_ block: @escaping () -> Void) { self.block = block }
     @objc func fire() { block() }
     func controlTextDidEndEditing(_ obj: Notification) { block() }
+}
+
+/// `NSTextField` with explicit dark-mode-aware text + background colors.
+/// A plain `NSTextField(string:)` resolves its background against the system
+/// appearance at init time and doesn't repaint when the parent's effective
+/// appearance flips — which is how the Ollama URL field ended up rendered in
+/// light-mode white inside a dark-mode card. Subclassing lets us refresh on
+/// `viewDidChangeEffectiveAppearance`.
+private final class ThemedTextField: NSTextField {
+    init(string: String) {
+        super.init(frame: .zero)
+        stringValue = string
+        isBordered = true
+        isBezeled = true
+        bezelStyle = .roundedBezel
+        isEditable = true
+        isSelectable = true
+        drawsBackground = true
+        font = .systemFont(ofSize: 12.5)
+        translatesAutoresizingMaskIntoConstraints = false
+        applyTheme()
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        applyTheme()
+    }
+
+    private func applyTheme() {
+        // `.textBackgroundColor` and `.labelColor` are system dynamic colors;
+        // re-assigning here forces the field to drop its cached resolution
+        // and pick up the current appearance.
+        textColor = .labelColor
+        backgroundColor = .textBackgroundColor
+        needsDisplay = true
+    }
 }
 
 // MARK: - Pane: Updates
