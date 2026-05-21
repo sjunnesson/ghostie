@@ -150,7 +150,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         csSvModel.stringValue = csc.modelPerLanguage["sv"] ?? "kb-whisper-large"
         csEnModel.stringValue = csc.modelPerLanguage["en"] ?? "whisper-large-v3"
         csVariant.removeAllItems()
-        csVariant.addItems(withObjectValues: ["standard", "subtitle", "strict"])
+        csVariant.addItems(withObjectValues: ["standard", "strict"])
         csVariant.stringValue = csc.kbWhisperVariant
         csVariant.completes = true
         csPromptSv.stringValue = csc.promptSv
@@ -676,7 +676,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         codeswitchModeBlock.addArrangedSubview(
             field("Swedish transcription style", leftWrap(sized(csVariant, 160))))
         codeswitchModeBlock.addArrangedSubview(
-            caption("standard, balanced for notes · strict, verbatim with filler · subtitle has no GGML upstream."))
+            caption("standard, balanced for notes · strict, verbatim with filler."))
 
         // Both blocks are always in the tab; toggle visibility based on mode.
         applyModeVisibility()
