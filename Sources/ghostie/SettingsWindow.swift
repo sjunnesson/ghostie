@@ -34,6 +34,11 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
     private weak var engine: Engine?
     private let onSave: (Config) -> Void
     private var window: NSWindow?
+    /// The size the user picked (initially the default 1000x920, updated on
+    /// every interactive corner drag). `windowWillResize` clamps any
+    /// non-live-resize request back to this so internal autolayout passes
+    /// can't grow or shrink the window when switching panes.
+    private var lockedContentSize = NSSize(width: 900, height: 820)
 
     private var cfg = Config.loadRaw()                // working copy
     private var currentPaneId: PaneId = .listening
@@ -56,6 +61,12 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
     }
     private var panes = PaneRefs()
     private var sidebar: Sidebar?
+    /// Retained so its view stays alive while we use it as the window's
+    /// contentView. `NSWindow.contentViewController` would re-derive the
+    /// window's contentSize from this controller's preferredContentSize and
+    /// its children's intrinsic sizes — which is exactly the auto-resize on
+    /// pane switch we want to avoid.
+    private var split: NSSplitViewController?
     private var contentContainer: NSView?
     private var toolbarBadge: StatusBadgeView?
 
@@ -65,7 +76,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         cfg = Config.loadRaw()
 
         let win = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 1000, height: 920),
+            contentRect: NSRect(x: 0, y: 0, width: 900, height: 820),
             styleMask: [.titled, .closable, .miniaturizable,
                         .resizable, .fullSizeContentView],
             backing: .buffered, defer: false)
@@ -146,7 +157,27 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
             container.bottomAnchor.constraint(equalTo: content.bottomAnchor)
         ])
 
-        win.contentViewController = split
+        // Use the split view as the window's contentView directly (rather
+        // than `win.contentViewController = split`). The contentViewController
+        // path makes NSWindow listen to the controller's preferredContentSize
+        // and recompute its own contentSize on every pane swap, which is what
+        // was making the window grow on Listening and shrink on Updates.
+        // Going via contentView decouples the window's size from anything
+        // happening inside the panes — the user is the only thing that can
+        // resize it.
+        self.split = split
+        let splitView = split.view
+        splitView.translatesAutoresizingMaskIntoConstraints = false
+        let host = NSView(frame: NSRect(origin: .zero,
+                                         size: NSSize(width: 900, height: 820)))
+        host.addSubview(splitView)
+        NSLayoutConstraint.activate([
+            splitView.topAnchor.constraint(equalTo: host.topAnchor),
+            splitView.leadingAnchor.constraint(equalTo: host.leadingAnchor),
+            splitView.trailingAnchor.constraint(equalTo: host.trailingAnchor),
+            splitView.bottomAnchor.constraint(equalTo: host.bottomAnchor)
+        ])
+        win.contentView = host
         self.window = win
         select(currentPaneId, animated: false)
         win.center()
@@ -155,12 +186,36 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         wireEngineObserver()
     }
 
+    /// Block any resize that isn't the user dragging the corner handle.
+    /// `inLiveResize` is true only during an active interactive drag, so a
+    /// programmatic `setFrame:` from NSSplitViewController's internal sizing
+    /// passes lands here with `inLiveResize == false` and gets snapped back.
+    func windowWillResize(_ sender: NSWindow, to frameSize: NSSize) -> NSSize {
+        if sender.inLiveResize { return frameSize }
+        // Translate the locked content size back into a frame size, including
+        // the title bar height.
+        let dummy = NSRect(origin: .zero,
+                            size: NSSize(width: lockedContentSize.width,
+                                          height: lockedContentSize.height))
+        return sender.frameRect(forContentRect: dummy).size
+    }
+
+    func windowDidEndLiveResize(_ notification: Notification) {
+        // The user finished dragging — record the new size so subsequent
+        // programmatic resize attempts get clamped to it instead of the
+        // original default.
+        if let win = window {
+            lockedContentSize = win.contentRect(forFrameRect: win.frame).size
+        }
+    }
+
     func windowWillClose(_ notification: Notification) {
         downloader.cancel()
         updater.cancel()
         unwireEngineObserver()
         window = nil
         sidebar = nil
+        split = nil
         contentContainer = nil
         toolbarBadge = nil
         panes = PaneRefs()
@@ -2965,7 +3020,12 @@ private final class UpdatesPane: NSView {
     private let heroTile = NSView()
     private let heroSymbol = NSImageView()
     private let heroTitle = NSTextField(labelWithString: "")
-    private let heroSub = NSTextField(labelWithString: "")
+    // Wrapping label — when the unsupported-build hero subtitle is set
+    // ("This copy of Ghostie wasn't signed by us, so it can't update itself
+    // safely. Grab the latest from the GitHub releases page."), a non-
+    // wrapping label's intrinsic single-line width was pushing the entire
+    // window wider on every visit to Updates.
+    private let heroSub = NSTextField(wrappingLabelWithString: "")
     private let checkBtn: StyledButton
 
     init(cfg: Config, onCheckNow: @escaping () -> Void,
@@ -3013,6 +3073,9 @@ private final class UpdatesPane: NSView {
         heroSub.font = .systemFont(ofSize: 12)
         heroSub.textColor = Theme.text2
         heroSub.translatesAutoresizingMaskIntoConstraints = false
+        heroSub.maximumNumberOfLines = 2
+        heroSub.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        heroSub.setContentHuggingPriority(.defaultLow, for: .horizontal)
 
         heroTile.addSubview(heroSymbol)
         let textStack = NSStackView(views: [heroTitle, heroSub])
