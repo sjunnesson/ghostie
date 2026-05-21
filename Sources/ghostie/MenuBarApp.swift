@@ -1,4 +1,5 @@
 import AppKit
+import AVFoundation
 import ServiceManagement
 import UserNotifications
 
@@ -11,6 +12,7 @@ final class MenuBarApp: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private let menu = NSMenu()
     private var statusMenuItem: NSMenuItem!
+    private var axWarningItem: NSMenuItem!
     private var toggleItem: NSMenuItem!
     private var lastNoteItem: NSMenuItem!
     private var backlogItem: NSMenuItem!
@@ -56,10 +58,13 @@ final class MenuBarApp: NSObject, NSApplicationDelegate {
         engine.startListening()
         render(engine.state)
 
-        // Refresh the recording timer label every second.
+        // Refresh the recording timer + AX warning visibility every second.
+        // AX permission can be revoked at any moment via System Settings, so
+        // the warning must follow on its own cadence rather than only on
+        // engine state changes.
         tick = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             guard let self else { return }
-            if case .recording = self.engine.state { self.render(self.engine.state) }
+            self.render(self.engine.state)
         }
 
         // OTA: a delayed launch check + a daily timer (only on builds we can
@@ -85,6 +90,16 @@ final class MenuBarApp: NSObject, NSApplicationDelegate {
         statusMenuItem = NSMenuItem(title: "Starting…", action: nil, keyEquivalent: "")
         statusMenuItem.isEnabled = false
         menu.addItem(statusMenuItem)
+
+        // AX denial warning. Hidden when permission is granted; clicking opens
+        // the relevant System Settings pane so the user can grant in one step.
+        axWarningItem = NSMenuItem(
+            title: "⚠︎ Accessibility off — meeting-window signal disabled",
+            action: #selector(openAccessibilitySettings), keyEquivalent: "")
+        axWarningItem.target = self
+        axWarningItem.isHidden = true
+        menu.addItem(axWarningItem)
+
         menu.addItem(.separator())
 
         toggleItem = item("Pause Listening", #selector(toggleListening))
@@ -146,6 +161,9 @@ final class MenuBarApp: NSObject, NSApplicationDelegate {
         }
         statusMenuItem.title = title
         toggleItem.title = engine.isListening ? "Pause Listening" : "Resume Listening"
+        // AX permission state can change at any moment via System Settings; we
+        // re-check on every render so revocation surfaces within a second.
+        axWarningItem.isHidden = AXIsProcessTrusted()
 
         // Always the ghost; its tint conveys state.
         let color: NSColor? = {
@@ -187,6 +205,11 @@ final class MenuBarApp: NSObject, NSApplicationDelegate {
         NSWorkspace.shared.open(f)
     }
 
+    @objc private func openAccessibilitySettings() {
+        let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!
+        NSWorkspace.shared.open(url)
+    }
+
     @objc private func openLastNote() {
         if let n = engine.lastNote ?? engineLastNoteFallback ?? mostRecentNote() {
             NSWorkspace.shared.open(n)
@@ -219,7 +242,24 @@ final class MenuBarApp: NSObject, NSApplicationDelegate {
     @objc private func showDiagnostics() {
         let t = Transcriber(config: config)
         let s = Summarizer(config: config)
+        let mic = AVCaptureDevice.authorizationStatus(for: .audio)
+        let micStr: String = {
+            switch mic {
+            case .authorized:    return "✓ granted"
+            case .denied:        return "✗ DENIED"
+            case .restricted:    return "✗ restricted (MDM)"
+            case .notDetermined: return "· not yet requested"
+            @unknown default:    return "? unknown"
+            }
+        }()
+        let srStr = CGPreflightScreenCaptureAccess() ? "✓ granted" : "✗ not granted"
+        let axStr = AXIsProcessTrusted() ? "✓ granted" : "✗ not granted (optional)"
         let lines = [
+            "Permissions (this app bundle)",
+            "  Microphone:       \(micStr)",
+            "  Screen Recording: \(srStr)",
+            "  Accessibility:    \(axStr)",
+            "",
             "Transcription: \(t.isAvailable ? "ready (local whisper.cpp)" : "NOT set up — run scripts/setup.sh")",
             "Summaries: \(s.isConfigured ? "claude -p (\(config.summaryModel))" : "Claude Code CLI not found — run `claude` once to log in")",
             "Backlog: \(Backlog.pendingCount) pending (auto-retried; processed on next call too)",
@@ -228,9 +268,8 @@ final class MenuBarApp: NSObject, NSApplicationDelegate {
             "Config: \(Config.configPath)",
             "Log: \(NSHomeDirectory())/.ghostie/ghostie.log",
             "",
-            "Screen Recording + Microphone permission are requested on the first",
-            "recording. Grant them to Ghostie in System Settings ▸",
-            "Privacy & Security, then start a call."
+            "If a permission shows DENIED or not granted, click below to open",
+            "the right Privacy & Security pane."
         ]
         let alert = NSAlert()
         alert.messageText = "Ghostie Diagnostics"
@@ -239,6 +278,8 @@ final class MenuBarApp: NSObject, NSApplicationDelegate {
         alert.addButton(withTitle: "Open Privacy Settings")
         NSApp.activate(ignoringOtherApps: true)
         if alert.runModal() == .alertSecondButtonReturn {
+            // Open Screen Recording pane (most often the one users need to grant);
+            // the Mic and Accessibility panes are one click away in the same UI.
             NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!)
         }
     }

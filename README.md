@@ -6,27 +6,51 @@ meeting** — automatically transcribes each call and writes a markdown summary
 
 ## How it works (no bot, no Graph API)
 
-1. **Detect** — polls CoreAudio's `kAudioDevicePropertyDeviceIsRunningSomewhere`
-   on the default input device and checks that Microsoft Teams is running. When
-   both hold, a call is in progress; when the mic goes idle for a grace period,
-   the call has ended. Nothing connects to the meeting.
-2. **Record** — `ScreenCaptureKit` captures two independent local audio taps:
-   system audio (everyone else) and your microphone (you), as two 16 kHz mono
-   WAV files. No virtual audio driver, no bot participant.
-3. **Transcribe** — [whisper.cpp](https://github.com/ggerganov/whisper.cpp) runs
-   **entirely on your machine**. Call audio never leaves your Mac. Decoding
+1. **Detect.** The detector watches per-process audio I/O via CoreAudio
+   (`kAudioProcessPropertyIsRunningInput` / `IsRunningOutput`, macOS 14.2+),
+   filtered to Teams' bundle IDs. A Teams PID holding the input is the
+   **primary signal**; promotion to a confirmed call requires the primary
+   plus at least one independent **corroborator** from this list:
+
+   - **Output I/O** on a Teams PID. Other participants' voices land here,
+     so a real meeting almost always shows it.
+   - **Camera in use** while Teams is running. CoreMediaIO does not expose
+     per-PID camera attribution publicly, so this is approximated as any
+     camera running with Teams open.
+   - **AX meeting window** match on the Teams main app. Versioned title and
+     role-description heuristics, see `MeetingWindowHeuristics.swift`. AX
+     permission is optional. Denial just removes one corroborator; output
+     and camera still carry the signal.
+
+   A device hot-swap (headphones unplugged, AirPods handed off) starts a
+   three-second quiescence window so a transient input drop does not collapse
+   a confirmed call. A 30-second end grace covers mute, brief network blips,
+   and Teams crash-relaunch uniformly.
+
+2. **Record.** `ScreenCaptureKit` captures two independent local audio taps,
+   system audio (the other participants) and your microphone (you), as two
+   16 kHz mono WAV files. No virtual audio driver, no bot participant. The
+   first 30 seconds of every recording sit in a bounded in-memory PCM ring;
+   if the call ends before crossing `minCallSeconds`, no file ever reaches
+   disk.
+
+3. **Transcribe.** [whisper.cpp](https://github.com/ggerganov/whisper.cpp)
+   runs entirely on your machine. Call audio never leaves your Mac. Decoding
    uses hallucination-resistant settings and a per-track **hallucination
    guard** (see below). The two tracks are merged by timestamp and labelled
    **Me** vs **Participants**.
-4. **Summarize** — the transcript is sent through the **Claude Code CLI**
-   (`claude -p`) using your existing Claude Code login (**no API key**) and
-   turned into a structured markdown note: Context · Participants · Discussion ·
-   Decisions · Action Items · Open Questions · Summary.
-5. **Save** — `~/Documents/Teams Call Notes/2026-05-16_14-03_Teams-Call.md`
+
+4. **Summarize.** The transcript is sent through the **Claude Code CLI**
+   (`claude -p`) using your existing Claude Code login (no API key) and
+   turned into a structured markdown note: Context, Participants, Discussion,
+   Decisions, Action Items, Open Questions, Summary.
+
+5. **Save.** `~/Documents/Teams Call Notes/2026-05-16_14-03_Teams-Call.md`
    (plus a transcript file). Audio is deleted afterwards by default.
 
 The detect → record → process loop runs forever, so every call is captured
-automatically with zero interaction.
+automatically with zero interaction. Use `ghostie diagnose-detect` to see
+live detector state in the field.
 
 ## Install
 
@@ -141,13 +165,19 @@ Assistant ▸ Create a Certificate**, name `Ghostie Self-Signed`, Identity Type
 The same binary also runs without a UI — useful for launchd or remote boxes:
 
 ```bash
-ghostie run                # headless watch loop; Ctrl-C to stop
-ghostie test-record 15     # 15s smoke test through the full pipeline
-ghostie process <dir>      # re-summarize a saved recording folder
-ghostie install-service    # headless launchd service
-ghostie doctor             # diagnostics
-ghostie selftest           # verify the transcript hallucination guard
+ghostie run                          # headless watch loop; Ctrl-C to stop
+ghostie test-record 15               # 15s smoke test through the full pipeline
+ghostie process <dir>                # re-summarize a saved recording folder
+ghostie install-service              # headless launchd service
+ghostie doctor                       # dependency + permission diagnostics
+ghostie diagnose-detect              # live detector readout (30s, 500ms refresh)
+ghostie diagnose-detect --json       # line-delimited JSON for scripting
+ghostie selftest                     # transcript guard + codeswitch + updater + detector
 ```
+
+When detection misfires (a false start or a missed call), `diagnose-detect`
+is the first stop. Each line shows the current state machine stage, every
+evidence signal, and the most recent transition reason.
 
 ## Transcript quality
 
@@ -240,8 +270,10 @@ Edit `~/.ghostie/config.json` (created on first run). Notable keys:
 |-----|---------|---------|
 | `notesFolder` | `~/Documents/Teams Call Notes` | Where summaries are saved |
 | `keepAudio` | `false` | Keep raw WAVs after processing |
-| `endGraceSeconds` | `12` | Mic-idle time before a call is "ended" |
-| `minCallSeconds` | `20` | Ignore calls shorter than this |
+| `endGraceSeconds` | `30` | Primary-signal-lost grace before a call is "ended"; covers mute, brief blips, Teams crash-relaunch |
+| `minCallSeconds` | `20` | Calls shorter than this are dropped from the in-memory ring without hitting disk |
+| `triggerBundleIds` | `["com.microsoft.teams", "com.microsoft.teams2"]` | Exact Teams main-app bundle IDs the detector trusts |
+| `triggerBundlePrefixes` | `["com.microsoft.teams"]` | Deprecated; use `triggerBundleIds`. Readable for one release, then removed |
 | `whisperModel` | `…/ggml-base.en.bin` | Bigger model = better accuracy, slower |
 | `language` | `en` | `auto` for automatic detection |
 | `cleanTranscript` | `true` | Run the hallucination guard |
@@ -282,11 +314,25 @@ Code login — no Anthropic API key. Run `claude` once in a terminal to sign in;
 
 ## Limitations
 
-- Detection assumes a Teams mic session = a call. If another app uses the mic
-  while Teams is open, that audio is captured too. Tune `triggerBundlePrefixes`.
-- System-audio capture records *all* system sound during the call; during a
-  Teams call that is overwhelmingly the other participants.
-- Speaker labels are track-based (Me vs everyone-else), not per-person
+- **Teams only by design.** The detector is scoped to the Microsoft Teams
+  desktop app. Zoom, Google Meet, and Slack huddles do not trigger a
+  recording, even when the mic is in use. The provider architecture in
+  `Sources/ghostie/Detection/` is built to make adding them later
+  straightforward, but each needs its own evidence shape.
+- **Browser-Teams is not yet detected.** Calls held in `teams.microsoft.com`
+  inside Safari, Chrome, Edge, or Arc fall through. Opt-in browser detection
+  via a TLS-peer probe plus AX title matching is on the roadmap. Until it
+  lands, install the desktop client for anything you want auto-captured.
+- **AX heuristics drift over Teams releases.** Microsoft can change the
+  meeting window's title or role description in any release. The
+  versioned `MeetingWindowHeuristics` constant gives us something to bump
+  when it happens, but we may not detect the change before users do.
+  Because AX is a corroborator and not a veto, output and camera signals
+  keep working in the meantime.
+- **System-audio capture records all system sound during the call.** During
+  a Teams call that is overwhelmingly the other participants, but anything
+  else playing audio at the time gets mixed in.
+- **Speaker labels are track-based** (Me vs everyone-else), not per-person
   diarization.
 
 ## License

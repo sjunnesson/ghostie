@@ -171,6 +171,16 @@ func cmdUpdate(_ config: Config, install: Bool) {
     }
 }
 
+/// `ghostie diagnose-detect [--duration N] [--json]` — live readout of the
+/// detector for N seconds. Refresh is 500 ms. JSON mode emits one
+/// line-delimited JSON object per tick; selftest asserts each line parses.
+func cmdDiagnoseDetect(_ config: Config, durationSeconds: Double, jsonMode: Bool) {
+    DiagnoseDetect.run(config: config, duration: durationSeconds, jsonMode: jsonMode) { line in
+        print(line)
+        fflush(stdout)
+    }
+}
+
 func cmdDoctor(_ config: Config) {
     print("Ghostie doctor\n==================")
     let t = Transcriber(config: config)
@@ -202,18 +212,54 @@ func cmdDoctor(_ config: Config) {
         row(true, "code-switching", "disabled (single-language path)")
     }
 
+    let matchers = config.triggerBundleIds.map { $0.lowercased() }
     let teams = NSWorkspace.shared.runningApplications.contains {
-        ($0.bundleIdentifier?.lowercased().hasPrefix("com.microsoft.teams") ?? false)
+        guard let b = $0.bundleIdentifier else { return false }
+        return DetectionCoordinator.matchesTeamsBundle(b, matchers: matchers)
     }
     row(teams, "Microsoft Teams running", teams ? "" : "(only needed during a call)")
     row(CallDetector.defaultInputDevice() != nil, "default input device detected")
     let pending = Backlog.pendingCount
     row(pending == 0, "backlog",
         pending == 0 ? "empty" : "\(pending) pending — auto-retried; `ghostie process-backlog` to force")
+
+    // MARK: Permissions
+    //
+    // Each row shows the TCC verdict for the CURRENTLY RUNNING binary. If
+    // that binary is the .app bundle, the verdict reflects /Applications/
+    // Ghostie.app. If it's `.build/debug/ghostie`, you're seeing the verdict
+    // for an ad-hoc-signed CLI that TCC keys to a different identity than
+    // the app — granting permissions to one does not transfer to the other.
+    print("\nPermissions (this binary)")
+    let binaryPath = CommandLine.arguments[0]
+    let isAppBundle = binaryPath.contains(".app/Contents/MacOS/")
+    print("  Binary: \(binaryPath)")
+    if !isAppBundle {
+        print("  ⚠︎  Running an ad-hoc-signed CLI. TCC will not share grants")
+        print("     with /Applications/Ghostie.app. To test the real")
+        print("     permission flow, launch Ghostie.app and run doctor")
+        print("     via the menu bar's 'Diagnostics' item.")
+    }
+    let micStatus = AVCaptureDevice.authorizationStatus(for: .audio)
+    row(micStatus == .authorized, "Microphone",
+        micStatus == .authorized ? "granted" :
+        micStatus == .denied ? "DENIED — System Settings ▸ Privacy & Security ▸ Microphone" :
+        micStatus == .restricted ? "restricted (MDM profile)" :
+        "not yet requested (fires on first call detection)")
+    let axOK = AXIsProcessTrusted()
+    row(axOK, "Accessibility",
+        axOK ? "granted (AX corroborator active)" :
+        "not granted — detection still works on audio I/O alone. Grant in System Settings ▸ Privacy & Security ▸ Accessibility for a third signal.")
+    // Screen Recording has no public preflight API. CGPreflightScreenCaptureAccess
+    // is available since macOS 10.15 and returns true if access is allowed
+    // without prompting.
+    let srOK = CGPreflightScreenCaptureAccess()
+    row(srOK, "Screen Recording",
+        srOK ? "granted (required for capturing other participants' voices)" :
+        "not granted — System Settings ▸ Privacy & Security ▸ Screen Recording. The next captured call will prompt.")
+
     print("\n  Notes folder: \(config.notesFolder)")
     print("  Config file:  \(Config.configPath)")
-    print("\n  Screen Recording + Microphone permissions are requested on first")
-    print("  capture. Grant them to the app in System Settings ▸ Privacy & Security.")
 }
 
 func serviceLabel() -> String { "com.davidsjunnesson.ghostie" }
@@ -549,6 +595,9 @@ func printHelp() {
       test-record [secs]  Record N seconds (default 15) → full pipeline.
       process <dir>       Re-run transcription+summary on a recording dir.
       doctor              Check dependencies & permissions.
+      diagnose-detect [--duration N] [--json]
+                          Live readout of the call detector. 30s default,
+                          500ms refresh. --json emits line-delimited JSON.
       fetch-models [v]    Download code-switching models (KB variant v +
                           large-v3 + VAD). Same as the Settings button.
       process-backlog     Process recordings queued while deps were unavailable.
@@ -590,6 +639,12 @@ case "fetch-models":
     cmdFetchModels(config, variant: args.count > 1 ? args[1] : "")
 case "doctor":
     cmdDoctor(config)
+case "diagnose-detect":
+    var dur = 30.0
+    if let i = args.firstIndex(of: "--duration"), i + 1 < args.count,
+       let v = Double(args[i + 1]) { dur = v }
+    let json = args.contains("--json")
+    cmdDiagnoseDetect(config, durationSeconds: dur, jsonMode: json)
 case "process-backlog":
     let n = Pipeline.drain(config: config)
     print("Backlog: completed \(n); \(Backlog.pendingCount) still pending.")
@@ -605,7 +660,9 @@ case "selftest":
     let codeSwitchOK = runCodeSwitchSelfTest()
     print("")
     let updaterOK = runUpdaterSelfTest()
-    exit(cleanerOK && codeSwitchOK && updaterOK ? 0 : 1)
+    print("")
+    let detectorOK = runDetectorStateMachineSelfTest()
+    exit(cleanerOK && codeSwitchOK && updaterOK && detectorOK ? 0 : 1)
 case "settings":
     launchSettingsOnly()
 case "install-service":

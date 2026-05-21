@@ -20,7 +20,20 @@ struct Config: Codable {
     /// Bundle-identifier prefixes that, when running, qualify a microphone
     /// session as a "Teams call". New Teams = com.microsoft.teams2,
     /// classic Teams = com.microsoft.teams.
+    ///
+    /// Deprecated: superseded by `triggerBundleIds`. Left readable for one
+    /// release so existing user configs do not need editing. A non-default
+    /// value triggers a warning log at load time.
     var triggerBundlePrefixes: [String] = ["com.microsoft.teams"]
+
+    /// Exact bundle IDs of the Teams **main** apps. The detector queries AX
+    /// against PIDs whose bundle ID matches this list exactly. Audio helper
+    /// processes (e.g. `com.microsoft.teams2.helper`) are still picked up by
+    /// CoreAudio attribution via a prefix-with-dot match derived from these
+    /// IDs, so a single list serves both purposes without cross-matching
+    /// (classic Teams does not silently swallow new Teams helpers, or vice
+    /// versa).
+    var triggerBundleIds: [String] = ["com.microsoft.teams", "com.microsoft.teams2"]
 
     /// Require a trigger app (Teams) to be running for a call to be detected.
     /// If false, ANY microphone session is treated as a call.
@@ -109,6 +122,7 @@ struct Config: Codable {
 
     enum CodingKeys: String, CodingKey {
         case notesFolder, keepAudio, saveTranscript, triggerBundlePrefixes
+        case triggerBundleIds
         case requireTriggerApp, pollIntervalSeconds, endGraceSeconds, minCallSeconds
         case whisperBinary, whisperModel, language, initialPrompt, vadModel
         case cleanTranscript, codeSwitch, summaryModel, claudeBinary, workDir
@@ -127,6 +141,7 @@ struct Config: Codable {
         keepAudio = g(.keepAudio, d.keepAudio)
         saveTranscript = g(.saveTranscript, d.saveTranscript)
         triggerBundlePrefixes = g(.triggerBundlePrefixes, d.triggerBundlePrefixes)
+        triggerBundleIds = g(.triggerBundleIds, d.triggerBundleIds)
         requireTriggerApp = g(.requireTriggerApp, d.requireTriggerApp)
         pollIntervalSeconds = g(.pollIntervalSeconds, d.pollIntervalSeconds)
         endGraceSeconds = g(.endGraceSeconds, d.endGraceSeconds)

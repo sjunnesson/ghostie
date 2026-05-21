@@ -138,13 +138,10 @@ final class Engine: @unchecked Sendable {
             self.recorder = nil
             let started = self.recordingStartedAt
             Task {
+                // AudioRecorder.stop() returns nil for sub-`minCallSeconds`
+                // calls (the in-memory ring is dropped without ever writing
+                // to disk). No post-hoc disk-discard needed here.
                 guard let result = await rec.stop() else {
-                    self.state = self.listening ? .watching : .paused
-                    return
-                }
-                if result.duration < self.config.minCallSeconds {
-                    Log.info("Call too short (\(Int(result.duration))s) — discarding.")
-                    try? FileManager.default.removeItem(at: result.sessionDir)
                     self.state = self.listening ? .watching : .paused
                     return
                 }

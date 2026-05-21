@@ -1,4 +1,5 @@
 import AppKit
+import AVFoundation
 
 /// A real Settings window (no more "open the JSON"). Edits the on-disk config,
 /// saves it, and applies the change to the running engine immediately.
@@ -193,6 +194,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
             field("Ignore calls shorter than", leftWrap(suffixed(minCall, "seconds", width: 70))),
             caption("A call is detected from microphone use; it ends after the mic is idle for the grace period.")
         ]))
+        tabs.addTabViewItem(tab("Permissions", permissionsTabContents()))
         csDownloadStatus.font = .systemFont(ofSize: 11)
         csDownloadStatus.textColor = .secondaryLabelColor
         csDownloadBtn.bezelStyle = .rounded
@@ -406,6 +408,107 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         t.font = .systemFont(ofSize: 11)
         t.textColor = .secondaryLabelColor
         return t
+    }
+
+    /// Build the contents of the Permissions tab. Status is read once when
+    /// the Settings window is built; reopen Settings to re-check after
+    /// granting in System Settings.
+    private func permissionsTabContents() -> [NSView] {
+        let binaryPath = CommandLine.arguments[0]
+        let isAppBundle = binaryPath.contains(".app/Contents/MacOS/")
+        var rows: [NSView] = [
+            caption("Ghostie needs three permissions from macOS. Microphone and Screen Recording are required for recording calls. Accessibility is optional and adds a third confirmation signal for call detection.")
+        ]
+        if !isAppBundle {
+            let warn = caption("⚠︎  This Settings window was opened from \(binaryPath). That's an ad-hoc-signed CLI build; macOS TCC keys grants to a different identity than /Applications/Ghostie.app, so permissions granted here will not transfer to the installed app. Quit and launch Ghostie.app from Finder to manage real grants.")
+            warn.textColor = .systemOrange
+            rows.append(warn)
+        }
+        rows.append(section("Required"))
+        rows.append(permissionRow(
+            "Microphone",
+            granted: AVCaptureDevice.authorizationStatus(for: .audio) == .authorized,
+            deniedExplicit: AVCaptureDevice.authorizationStatus(for: .audio) == .denied,
+            detail: "Captures your voice during a call (the 'Me' track). The first call detection triggers a system prompt the first time.",
+            openPaneURL: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"))
+        rows.append(permissionRow(
+            "Screen Recording",
+            granted: CGPreflightScreenCaptureAccess(),
+            deniedExplicit: false,
+            detail: "Captures system audio (the other participants' voices) via ScreenCaptureKit. The 2x2 video stream attached to the audio capture is dropped, not recorded.",
+            openPaneURL: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"))
+        rows.append(section("Optional"))
+        rows.append(permissionRow(
+            "Accessibility",
+            granted: AXIsProcessTrusted(),
+            deniedExplicit: false,
+            detail: "Reads Teams' top-level window titles and roles to confirm a meeting window is open. Adds a third corroborator for call detection; without it the detector relies on audio I/O attribution alone.",
+            openPaneURL: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"))
+        return rows
+    }
+
+    /// One row per permission: status pill + label + short rationale + a
+    /// button that deep-links into the relevant System Settings pane.
+    private func permissionRow(_ title: String,
+                               granted: Bool,
+                               deniedExplicit: Bool,
+                               detail: String,
+                               openPaneURL: String) -> NSView {
+        let badge = NSTextField(labelWithString: granted ? "✓ granted"
+                                : deniedExplicit ? "✗ DENIED"
+                                : "✗ not granted")
+        badge.font = .systemFont(ofSize: 11, weight: .semibold)
+        badge.textColor = granted ? .systemGreen : (deniedExplicit ? .systemRed : .systemOrange)
+
+        let label = NSTextField(labelWithString: title)
+        label.font = .systemFont(ofSize: 13, weight: .medium)
+
+        let rationale = NSTextField(wrappingLabelWithString: detail)
+        rationale.font = .systemFont(ofSize: 11)
+        rationale.textColor = .secondaryLabelColor
+
+        let button = NSButton(title: "Open System Settings",
+                              target: self, action: #selector(openPermissionPane(_:)))
+        button.bezelStyle = .rounded
+        button.controlSize = .small
+        button.toolTip = openPaneURL
+        button.identifier = NSUserInterfaceItemIdentifier(openPaneURL)
+        button.isHidden = granted
+
+        for v in [badge, label, rationale, button] {
+            v.translatesAutoresizingMaskIntoConstraints = false
+        }
+        let row = NSView()
+        row.translatesAutoresizingMaskIntoConstraints = false
+        row.addSubview(label)
+        row.addSubview(badge)
+        row.addSubview(rationale)
+        row.addSubview(button)
+        NSLayoutConstraint.activate([
+            label.topAnchor.constraint(equalTo: row.topAnchor),
+            label.leadingAnchor.constraint(equalTo: row.leadingAnchor),
+            badge.firstBaselineAnchor.constraint(equalTo: label.firstBaselineAnchor),
+            badge.leadingAnchor.constraint(equalTo: label.trailingAnchor, constant: 10),
+            rationale.topAnchor.constraint(equalTo: label.bottomAnchor, constant: 2),
+            rationale.leadingAnchor.constraint(equalTo: row.leadingAnchor),
+            rationale.trailingAnchor.constraint(equalTo: row.trailingAnchor),
+            button.topAnchor.constraint(equalTo: rationale.bottomAnchor, constant: 4),
+            button.leadingAnchor.constraint(equalTo: row.leadingAnchor),
+            button.bottomAnchor.constraint(equalTo: row.bottomAnchor)
+        ])
+        // When granted, there's no button — bind the bottom to rationale instead.
+        if granted {
+            NSLayoutConstraint.activate([
+                rationale.bottomAnchor.constraint(equalTo: row.bottomAnchor)
+            ])
+        }
+        return row
+    }
+
+    @objc private func openPermissionPane(_ sender: NSButton) {
+        guard let raw = sender.identifier?.rawValue,
+              let url = URL(string: raw) else { return }
+        NSWorkspace.shared.open(url)
     }
     private func separatorLine() -> NSView {
         let v = NSBox(); v.boxType = .separator

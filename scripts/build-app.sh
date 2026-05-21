@@ -80,6 +80,10 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>LSMinimumSystemVersion</key><string>15.0</string>
   <key>NSMicrophoneUsageDescription</key>
   <string>Ghostie transcribes your Teams calls locally so it can summarize them. Audio never leaves your Mac.</string>
+  <key>NSScreenCaptureUsageDescription</key>
+  <string>Ghostie captures system audio during Teams calls so the other participants' voices end up in the transcript. The 2x2 video stream is dropped, not recorded.</string>
+  <key>NSAccessibilityUsageDescription</key>
+  <string>Ghostie reads Teams' window titles to confirm a call is actually in progress (versus the mic being open for a notification or settings panel). No window content is read; only titles and roles are inspected. Optional: without this, detection still works using audio I/O attribution.</string>
   <key>NSHumanReadableCopyright</key><string>Copyright (c) 2026 David Sjunnesson. MIT License.</string>
 </dict>
 </plist>
