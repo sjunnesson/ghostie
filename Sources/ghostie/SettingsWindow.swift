@@ -778,6 +778,91 @@ private final class FlippedView: NSView {
     override var isFlipped: Bool { true }
 }
 
+/// The little ghost in the sidebar brand row. Solid black silhouette from
+/// `GhostIcon.bodyPath`, two white pupils that follow the mouse pointer
+/// anywhere in the Settings window via a local event monitor.
+private final class GhostBrandView: NSView {
+
+    private var lookOffset = NSPoint.zero
+    private var monitor: Any?
+    /// Pupil offset is clamped to a small radius so the eye stays cleanly
+    /// inside the ghost's face even when the cursor is in the far corner.
+    private static let maxOffset: CGFloat = 1.8
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        // No layer-backed background — the previous indigo tile is gone, so
+        // the ghost draws straight onto the sidebar's vibrancy.
+        // Watch every mouse-moved event in the app while this view is alive.
+        // `addLocalMonitorForEvents` runs the callback before the event hits
+        // the responder chain, which means we don't need a tracking area on
+        // the whole window. Re-render on every move.
+        monitor = NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved]) {
+            [weak self] event in
+            self?.updateGaze(toWindowPoint: event.locationInWindow)
+            return event
+        }
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    deinit { if let m = monitor { NSEvent.removeMonitor(m) } }
+
+    private func updateGaze(toWindowPoint p: NSPoint) {
+        guard window != nil else { return }
+        let pInView = convert(p, from: nil)
+        let center = NSPoint(x: bounds.midX, y: bounds.midY + bounds.height * 0.10)
+        let dx = pInView.x - center.x
+        let dy = pInView.y - center.y
+        let dist = sqrt(dx * dx + dy * dy)
+        guard dist > 0 else { lookOffset = .zero; needsDisplay = true; return }
+        // Normalize direction and pin to max offset — the eyes always commit
+        // to looking at the cursor, near or far.
+        let scale = Self.maxOffset / dist
+        lookOffset = NSPoint(x: dx * scale, y: dy * scale)
+        needsDisplay = true
+    }
+
+    override func draw(_ rect: NSRect) {
+        // Black ghost body, no backdrop. The full view is the ghost.
+        let face = bounds
+        let body = GhostIcon.bodyPath(in: face)
+        NSColor.labelColor.setFill()   // black in light mode, white in dark
+        body.fill()
+
+        // Sclera (the white of the eye) sits at a fixed position on the
+        // ghost's face. The iris is a smaller, darker oval inside the sclera
+        // that translates with `lookOffset` so the gaze follows the cursor.
+        let (sL, _, sR, _) = GhostIcon.eyeRects(in: face)
+        let scleraW = face.width * 0.22
+        let scleraH = face.width * 0.28
+        let irisW = face.width * 0.11
+        let irisH = face.width * 0.14
+
+        NSColor.white.setFill()
+        let leftSclera = NSRect(x: sL.midX - scleraW / 2,
+                                 y: sL.midY - scleraH / 2,
+                                 width: scleraW, height: scleraH)
+        let rightSclera = NSRect(x: sR.midX - scleraW / 2,
+                                  y: sR.midY - scleraH / 2,
+                                  width: scleraW, height: scleraH)
+        NSBezierPath(ovalIn: leftSclera).fill()
+        NSBezierPath(ovalIn: rightSclera).fill()
+
+        // Black iris on the white sclera — monochrome by design. Stays
+        // black in both light and dark mode (the sclera is always white,
+        // so a black iris reads correctly either way).
+        NSColor.black.setFill()
+        let leftIris = NSRect(x: sL.midX - irisW / 2 + lookOffset.x,
+                              y: sL.midY - irisH / 2 + lookOffset.y,
+                              width: irisW, height: irisH)
+        let rightIris = NSRect(x: sR.midX - irisW / 2 + lookOffset.x,
+                               y: sR.midY - irisH / 2 + lookOffset.y,
+                               width: irisW, height: irisH)
+        NSBezierPath(ovalIn: leftIris).fill()
+        NSBezierPath(ovalIn: rightIris).fill()
+    }
+}
+
 /// Card with a 0.5 pt border and 10 pt corner radius. Holds rows + dividers.
 private final class GroupCard: NSView {
     private let stack = NSStackView()
@@ -1296,29 +1381,12 @@ private final class Sidebar: NSView {
         dragRegion.translatesAutoresizingMaskIntoConstraints = false
         addSubview(dragRegion)
 
-        // Brand row.
+        // Brand row — the little ghost in the sidebar, with eyes that
+        // follow the mouse around the Settings window.
         let brand = NSView()
         brand.translatesAutoresizingMaskIntoConstraints = false
-        let logo = NSView()
+        let logo = GhostBrandView()
         logo.translatesAutoresizingMaskIntoConstraints = false
-        logo.wantsLayer = true
-        logo.layer?.cornerRadius = 8
-        let grad = CAGradientLayer()
-        grad.colors = [
-            NSColor(red: 0x7D/255, green: 0x7A/255, blue: 0xFF/255, alpha: 1).cgColor,
-            NSColor(red: 0x5E/255, green: 0x5C/255, blue: 0xE6/255, alpha: 1).cgColor
-        ]
-        grad.startPoint = CGPoint(x: 0, y: 0)
-        grad.endPoint = CGPoint(x: 1, y: 1)
-        grad.cornerRadius = 8
-        logo.layer?.addSublayer(grad)
-        let ghostImg = NSImageView()
-        ghostImg.translatesAutoresizingMaskIntoConstraints = false
-        ghostImg.image = NSImage(systemSymbolName: "moon.stars",
-                                 accessibilityDescription: nil)?
-            .withSymbolConfiguration(.init(pointSize: 14, weight: .semibold))
-        ghostImg.contentTintColor = .white
-        logo.addSubview(ghostImg)
 
         let title = NSTextField(labelWithString: "Ghostie")
         title.font = .systemFont(ofSize: 13.5, weight: .bold)
@@ -1363,11 +1431,8 @@ private final class Sidebar: NSView {
 
             logo.leadingAnchor.constraint(equalTo: brand.leadingAnchor),
             logo.topAnchor.constraint(equalTo: brand.topAnchor),
-            logo.widthAnchor.constraint(equalToConstant: 30),
-            logo.heightAnchor.constraint(equalToConstant: 30),
-
-            ghostImg.centerXAnchor.constraint(equalTo: logo.centerXAnchor),
-            ghostImg.centerYAnchor.constraint(equalTo: logo.centerYAnchor),
+            logo.widthAnchor.constraint(equalToConstant: 38),
+            logo.heightAnchor.constraint(equalToConstant: 38),
 
             titleStack.leadingAnchor.constraint(equalTo: logo.trailingAnchor, constant: 10),
             titleStack.centerYAnchor.constraint(equalTo: logo.centerYAnchor),
@@ -1378,11 +1443,6 @@ private final class Sidebar: NSView {
 
             brand.bottomAnchor.constraint(equalTo: logo.bottomAnchor)
         ])
-
-        // Gradient layer needs to follow the logo bounds.
-        DispatchQueue.main.async {
-            grad.frame = logo.bounds
-        }
 
         // Nav list.
         let nav = NSStackView()
@@ -1465,26 +1525,6 @@ private final class Sidebar: NSView {
                                  .OBJC_ASSOCIATION_RETAIN)
         addSubview(advRow)
 
-        // Search placeholder sits just above the advanced row.
-        let search = NSView()
-        search.translatesAutoresizingMaskIntoConstraints = false
-        search.wantsLayer = true
-        search.layer?.cornerRadius = 7
-        search.layer?.borderWidth = 0.5
-        search.layer?.borderColor = Theme.inputBorder.cgColor
-        let searchIcon = NSImageView()
-        searchIcon.translatesAutoresizingMaskIntoConstraints = false
-        searchIcon.image = NSImage(systemSymbolName: "magnifyingglass",
-                                   accessibilityDescription: nil)?
-            .withSymbolConfiguration(.init(pointSize: 11, weight: .regular))
-        searchIcon.contentTintColor = Theme.text3
-        let placeholder = NSTextField(labelWithString: "Search settings")
-        placeholder.font = .systemFont(ofSize: 12)
-        placeholder.textColor = Theme.text3
-        placeholder.translatesAutoresizingMaskIntoConstraints = false
-        search.addSubview(searchIcon)
-        search.addSubview(placeholder)
-        addSubview(search)
         NSLayoutConstraint.activate([
             advRow.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14),
             advRow.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
@@ -1493,17 +1533,7 @@ private final class Sidebar: NSView {
             advLabel.leadingAnchor.constraint(equalTo: advRow.leadingAnchor),
             advLabel.centerYAnchor.constraint(equalTo: advRow.centerYAnchor),
             advSwitch.trailingAnchor.constraint(equalTo: advRow.trailingAnchor),
-            advSwitch.centerYAnchor.constraint(equalTo: advRow.centerYAnchor),
-
-            search.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
-            search.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
-            search.bottomAnchor.constraint(equalTo: advRow.topAnchor, constant: -10),
-            search.heightAnchor.constraint(equalToConstant: 28),
-            searchIcon.leadingAnchor.constraint(equalTo: search.leadingAnchor, constant: 9),
-            searchIcon.centerYAnchor.constraint(equalTo: search.centerYAnchor),
-            placeholder.leadingAnchor.constraint(equalTo: searchIcon.trailingAnchor, constant: 6),
-            placeholder.centerYAnchor.constraint(equalTo: search.centerYAnchor),
-            placeholder.trailingAnchor.constraint(lessThanOrEqualTo: search.trailingAnchor, constant: -9)
+            advSwitch.centerYAnchor.constraint(equalTo: advRow.centerYAnchor)
         ])
 
         widthAnchor.constraint(equalToConstant: 220).isActive = true

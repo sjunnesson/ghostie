@@ -31,7 +31,7 @@ enum GhostIcon {
     }
 
     /// (sclera, pupil) ellipse rects for one eye; mirrored for the other.
-    private static func eyeRects(in r: NSRect) -> (NSRect, NSRect, NSRect, NSRect) {
+    static func eyeRects(in r: NSRect) -> (NSRect, NSRect, NSRect, NSRect) {
         let ew = r.width * 0.26, eh = r.width * 0.34
         let cy = r.midY + r.height * 0.12
         let dx = r.width * 0.17
