@@ -83,15 +83,35 @@ struct Config: Codable {
     /// nothing changes.
     var codeSwitch: CodeSwitchConfig = CodeSwitchConfig()
 
-    // MARK: Summarization (via the Claude Code CLI — no API key needed)
+    // MARK: Summarization
+
+    /// Which backend writes the meeting note. `"claude"` shells out to the
+    /// Claude Code CLI (default, cloud — best quality). `"ollama"` posts to a
+    /// local Ollama server so the transcript never leaves the machine. The
+    /// chosen provider is honored strictly — failures backlog, they don't
+    /// silently fall back to the other one.
+    var summaryProvider: String = "claude"
 
     /// Model passed to `claude -p --model`. An alias ("sonnet", "opus",
-    /// "haiku") or a full id ("claude-sonnet-4-6").
+    /// "haiku") or a full id ("claude-sonnet-4-6"). Only used when
+    /// `summaryProvider == "claude"`.
     var summaryModel: String = "claude-sonnet-4-6"
 
     /// Path to the `claude` binary. Auto-detected if empty. Summarization uses
     /// your existing Claude Code login (subscription/OAuth) — no API key.
+    /// Only used when `summaryProvider == "claude"`.
     var claudeBinary: String = ""
+
+    /// Base URL of the Ollama HTTP server. Default targets the standard local
+    /// install; a LAN host is also fine (e.g. `http://mac-mini.local:11434`).
+    /// Only used when `summaryProvider == "ollama"`.
+    var ollamaUrl: String = "http://localhost:11434"
+
+    /// Ollama model name as it appears in `ollama list` (e.g. `llama3.1:8b`).
+    /// Empty by default so a fresh user is nudged into Settings to pick one
+    /// rather than hitting a 404 mid-call. Only used when
+    /// `summaryProvider == "ollama"`.
+    var ollamaModel: String = ""
 
     // MARK: Updates (in-app OTA — see Updater.swift)
 
@@ -127,7 +147,9 @@ struct Config: Codable {
         case triggerBundleIds
         case requireTriggerApp, pollIntervalSeconds, endGraceSeconds, minCallSeconds
         case whisperBinary, whisperModel, language, initialPrompt, vadModel
-        case cleanTranscript, codeSwitch, summaryModel, claudeBinary, workDir
+        case cleanTranscript, codeSwitch
+        case summaryProvider, summaryModel, claudeBinary, ollamaUrl, ollamaModel
+        case workDir
         case autoCheckUpdates, lastUpdateCheck, updateFeedOverride
     }
 
@@ -155,8 +177,11 @@ struct Config: Codable {
         vadModel = g(.vadModel, d.vadModel)
         cleanTranscript = g(.cleanTranscript, d.cleanTranscript)
         codeSwitch = g(.codeSwitch, d.codeSwitch)
+        summaryProvider = g(.summaryProvider, d.summaryProvider)
         summaryModel = g(.summaryModel, d.summaryModel)
         claudeBinary = g(.claudeBinary, d.claudeBinary)
+        ollamaUrl = g(.ollamaUrl, d.ollamaUrl)
+        ollamaModel = g(.ollamaModel, d.ollamaModel)
         workDir = g(.workDir, d.workDir)
         autoCheckUpdates = g(.autoCheckUpdates, d.autoCheckUpdates)
         lastUpdateCheck = g(.lastUpdateCheck, d.lastUpdateCheck)
@@ -197,6 +222,9 @@ struct Config: Codable {
         if let f = env["GHOSTIE_NOTES_FOLDER"], !f.isEmpty { cfg.notesFolder = f }
         if let m = env["GHOSTIE_WHISPER_MODEL"], !m.isEmpty { cfg.whisperModel = m }
         if let s = env["GHOSTIE_SUMMARY_MODEL"], !s.isEmpty { cfg.summaryModel = s }
+        if let p = env["GHOSTIE_SUMMARY_PROVIDER"], !p.isEmpty { cfg.summaryProvider = p }
+        if let u = env["GHOSTIE_OLLAMA_URL"], !u.isEmpty { cfg.ollamaUrl = u }
+        if let m = env["GHOSTIE_OLLAMA_MODEL"], !m.isEmpty { cfg.ollamaModel = m }
         if let f = env["GHOSTIE_UPDATE_FEED"], !f.isEmpty { cfg.updateFeedOverride = f }
         // Whisper binary: a copy bundled in the .app (self-contained .dmg)
         // always wins; then a still-valid explicit override; then detection.

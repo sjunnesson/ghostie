@@ -274,8 +274,17 @@ func cmdDoctor(_ config: Config) {
         config.cleanTranscript ? "on (run `ghostie selftest` to verify)" : "disabled in config")
     let vadOn = !config.vadModel.isEmpty && FileManager.default.fileExists(atPath: config.vadModel)
     row(vadOn, "Silero VAD model", vadOn ? config.vadModel : "optional — ./scripts/setup.sh --vad")
-    row(s.isConfigured, "Claude Code CLI (`claude -p`)",
-        s.isConfigured ? s.claudeBinary : "not found — install Claude Code and run `claude` once to log in")
+    switch config.summaryProvider {
+    case "ollama":
+        let detail = s.isConfigured
+            ? "\(config.ollamaUrl) — model \(config.ollamaModel)"
+            : "not ready — set the server URL and model in Settings (or pull a model with `ollama pull`)"
+        row(s.isConfigured, "Ollama (local, `/api/chat`)", detail)
+    default:
+        let claudePath = config.claudeBinary.isEmpty ? Config.findClaudeBinary() : config.claudeBinary
+        row(s.isConfigured, "Claude Code CLI (`claude -p`)",
+            s.isConfigured ? claudePath : "not found — install Claude Code and run `claude` once to log in")
+    }
     let cs = config.codeSwitch
     if cs.enabled {
         row(true, "code-switching", "ENABLED — \(cs.languages.joined(separator: "+")), dominant \(cs.dominantLanguage), KB variant \(cs.kbWhisperVariant)")

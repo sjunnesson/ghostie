@@ -88,11 +88,17 @@ the same code drives the menu-bar app and the headless daemon.
   `~/.ghostie/models/` (shared by the Settings “Download models” button and
   `ghostie fetch-models`; variant→URL/filename mapping kept in lockstep with
   `setup.sh` and `CodeSwitchConfig.modelPath`).
-- **`Summarizer.swift`** — shells out to `claude -p` using the user's existing
-  Claude Code login (**no API key**). Replaces Claude Code's agentic system
-  prompt with an analyst prompt and runs with cwd = `NSTemporaryDirectory()`
-  **specifically so it does not pick up any project CLAUDE.md** — note that
-  *this file does not affect generated summaries*.
+- **Summarization** — `Summarizer.swift` is a thin façade that dispatches to a
+  `SummarizationProvider` based on `config.summaryProvider`. Two providers
+  ship: `ClaudeSummarizationProvider` (shells out to `claude -p` using the
+  user's existing Claude Code login — **no API key**; cwd =
+  `NSTemporaryDirectory()` **so it does not pick up any project CLAUDE.md**,
+  meaning *this file does not affect generated summaries*), and
+  `OllamaSummarizationProvider` (POSTs to `/api/chat` on a local Ollama
+  server, for fully-on-device notes). The analyst system prompt lives in
+  `SummarizerPrompt.swift` so both providers produce notes with the same
+  structure. Provider selection is honored strictly — a failure backlogs the
+  transcript, it never silently falls back to the other provider.
 - **`Backlog.swift`** — durable retry queue at `~/.ghostie/backlog/`. Two
   stages: `transcribe` (audio kept) and `summarize` (transcript kept, audio
   dropped so it's never re-transcribed). A note is always written immediately
@@ -112,8 +118,10 @@ the same code drives the menu-bar app and the headless daemon.
 - **Swift 5 language mode** is set intentionally in `Package.swift` to avoid
   Swift 6 strict-concurrency friction with the many CoreAudio / ScreenCaptureKit
   C callbacks. Don't switch to `.v6`.
-- Audio + transcription are 100% local; only the **text transcript** ever
-  leaves the machine (to Anthropic, via the user's own Claude Code login).
+- Audio + transcription are 100% local. The **text transcript** only leaves
+  the machine when the Claude provider is selected (to Anthropic, via the
+  user's own Claude Code login). With the Ollama provider, summarization is
+  also fully local — nothing leaves the machine running Ollama.
 - Recordings, notes, and `config.json` are gitignored. Never commit `*.wav`,
   `recordings/`, or `config.json`.
 - New self-contained features must keep the `.dmg` path working: bundle
