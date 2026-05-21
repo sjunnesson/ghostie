@@ -1100,6 +1100,8 @@ private final class RowBuilder {
     static func row(label: String,
                     sub: String? = nil,
                     leadingSymbol: String? = nil,
+                    leadingImage: NSImage? = nil,
+                    leadingImageBare: Bool = false,
                     leadingTint: NSColor? = nil,
                     control: NSView? = nil,
                     danger: Bool = false) -> NSView {
@@ -1108,30 +1110,53 @@ private final class RowBuilder {
 
         var leading: NSView = row
         var leadingConstant: CGFloat = 14
-        if let leadingSymbol {
+        // Either an SF Symbol name or a pre-made template image gets the same
+        // leading-tile treatment. `leadingImage` wins if both are supplied.
+        let symbolImage = leadingSymbol.flatMap {
+            NSImage(systemSymbolName: $0, accessibilityDescription: nil)?
+                .withSymbolConfiguration(.init(pointSize: 13, weight: .regular))
+        }
+        if let image = leadingImage ?? symbolImage {
             let tile = NSView()
             tile.translatesAutoresizingMaskIntoConstraints = false
-            tile.wantsLayer = true
-            tile.layer?.backgroundColor = (leadingTint ?? Theme.chipBg).cgColor
-            tile.layer?.cornerRadius = 6
             let iv = NSImageView()
             iv.translatesAutoresizingMaskIntoConstraints = false
-            iv.image = NSImage(systemSymbolName: leadingSymbol,
-                               accessibilityDescription: nil)?
-                .withSymbolConfiguration(.init(pointSize: 13, weight: .regular))
-            iv.contentTintColor = leadingTint != nil ? .white : Theme.text2
+            iv.image = image
+            iv.contentTintColor = leadingTint != nil ? .white : .secondaryLabelColor
             tile.addSubview(iv)
             row.addSubview(tile)
-            NSLayoutConstraint.activate([
-                tile.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 14),
-                tile.centerYAnchor.constraint(equalTo: row.centerYAnchor),
-                tile.widthAnchor.constraint(equalToConstant: 26),
-                tile.heightAnchor.constraint(equalToConstant: 26),
-                iv.centerXAnchor.constraint(equalTo: tile.centerXAnchor),
-                iv.centerYAnchor.constraint(equalTo: tile.centerYAnchor),
-                iv.widthAnchor.constraint(equalToConstant: 15),
-                iv.heightAnchor.constraint(equalToConstant: 15)
-            ])
+
+            if leadingImageBare {
+                // No tile background, no chrome. The image fills the leading
+                // area at its native aspect ratio (height pinned, width
+                // proportionally scaled by NSImageView).
+                iv.imageScaling = .scaleProportionallyUpOrDown
+                iv.imageAlignment = .alignCenter
+                NSLayoutConstraint.activate([
+                    tile.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 14),
+                    tile.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+                    tile.widthAnchor.constraint(equalToConstant: 26),
+                    tile.heightAnchor.constraint(equalToConstant: 26),
+                    iv.topAnchor.constraint(equalTo: tile.topAnchor),
+                    iv.bottomAnchor.constraint(equalTo: tile.bottomAnchor),
+                    iv.leadingAnchor.constraint(equalTo: tile.leadingAnchor),
+                    iv.trailingAnchor.constraint(equalTo: tile.trailingAnchor)
+                ])
+            } else {
+                tile.wantsLayer = true
+                tile.layer?.backgroundColor = (leadingTint ?? Theme.chipBg).cgColor
+                tile.layer?.cornerRadius = 6
+                NSLayoutConstraint.activate([
+                    tile.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 14),
+                    tile.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+                    tile.widthAnchor.constraint(equalToConstant: 26),
+                    tile.heightAnchor.constraint(equalToConstant: 26),
+                    iv.centerXAnchor.constraint(equalTo: tile.centerXAnchor),
+                    iv.centerYAnchor.constraint(equalTo: tile.centerYAnchor),
+                    iv.widthAnchor.constraint(equalToConstant: 15),
+                    iv.heightAnchor.constraint(equalToConstant: 15)
+                ])
+            }
             leading = tile
             leadingConstant = 12
         }
@@ -1172,7 +1197,8 @@ private final class RowBuilder {
         labelStack.insertArrangedSubview(l, at: 0)
 
         var constraints: [NSLayoutConstraint] = []
-        if leadingSymbol != nil {
+        if leading !== row {
+            // A leading tile (icon) was added — anchor the label stack to it.
             constraints += [
                 labelStack.leadingAnchor.constraint(equalTo: leading.trailingAnchor, constant: leadingConstant)
             ]
@@ -3123,7 +3149,8 @@ private final class SummaryPane: NSView {
             sub: reachable
                 ? "Reachable at \(displayURL) — \(models.count) model\(models.count == 1 ? "" : "s") installed."
                 : "Couldn't reach \(displayURL). Install Ollama and run `ollama serve`, or pull a model first.",
-            leadingSymbol: "bolt.horizontal", leadingTint: Theme.text2,
+            leadingImage: OllamaIcon.templateImage(),
+            leadingImageBare: true,
             control: StatusBadgeView(kind: reachable ? .ok : .warn,
                                      label: reachable ? "Reachable" : "Not reachable")))
 

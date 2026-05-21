@@ -109,6 +109,11 @@ cp "$ROOT/LICENSE" "$APP/Contents/Resources/LICENSE"
 [ -f "$ROOT/THIRD-PARTY-NOTICES.md" ] \
   && cp "$ROOT/THIRD-PARTY-NOTICES.md" "$APP/Contents/Resources/THIRD-PARTY-NOTICES.md"
 
+# Ollama mascot PNG used by the Summary pane's Ollama row. Looked up by
+# OllamaIcon via Bundle.main.resourceURL.
+[ -f "$ROOT/Sources/ghostie/Resources/ollama.png" ] \
+  && cp "$ROOT/Sources/ghostie/Resources/ollama.png" "$APP/Contents/Resources/ollama.png"
+
 # ---- Self-contained: bundle a static whisper-cli + the model ----------------
 NESTED_BINS=()
 if [ "$SELFCONTAINED" = "1" ]; then

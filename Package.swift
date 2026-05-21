@@ -12,6 +12,12 @@ let package = Package(
         .executableTarget(
             name: "ghostie",
             path: "Sources/ghostie",
+            resources: [
+                // Bundled assets shipped in the SwiftPM resource bundle. The
+                // built .app picks this up automatically; `swift run` /
+                // `swift build` get it via `Bundle.module`.
+                .process("Resources")
+            ],
             swiftSettings: [
                 // Avoid Swift 6 strict-concurrency friction with the many
                 // CoreAudio / ScreenCaptureKit C callbacks.
