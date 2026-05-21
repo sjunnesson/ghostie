@@ -63,11 +63,13 @@ Build a distributable disk image once:
 ./scripts/build-app.sh --dmg --notarize   # also notarized & stapled
 ```
 
-`--dmg` bundles a statically-built `whisper-cli` **and** the speech model
-inside `Ghostie.app`, so the only requirement on the receiving Mac is
-**macOS 15+**. Copy `build/Ghostie.dmg` to the other Mac, open it, drag
-**Ghostie** to **Applications**, launch it. If you didn't notarize, the first
-launch is **right-click ▸ Open** (one time).
+`--dmg` bundles a statically-built `whisper-cli` and the small Silero VAD
+model inside `Ghostie.app`. The Whisper speech model (~140 MB) is **not**
+bundled — on first launch Ghostie opens Settings and downloads it from
+Hugging Face into `~/.ghostie/models/` (SHA256-verified). The only
+requirement on the receiving Mac is **macOS 15+**. Copy `build/Ghostie.dmg`
+to the other Mac, open it, drag **Ghostie** to **Applications**, launch it.
+If you didn't notarize, the first launch is **right-click ▸ Open** (one time).
 
 > Summaries use *your* Claude Code login, which can't be bundled. Until you run
 > `claude` once on that Mac to sign in, calls still record + transcribe and are

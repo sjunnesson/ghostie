@@ -13,10 +13,12 @@
 # --notarize also emits build/Ghostie-<version>.zip + .sha256 — the OTA
 # self-update payload the in-app updater downloads (see publish-release.sh).
 #
-# --dmg makes the app self-contained: a statically-built whisper-cli and the
-# speech model are bundled inside Ghostie.app, so the target Mac needs nothing
-# but macOS 15+. (Summaries still use the user's own Claude Code login; until
-# they run `claude` once, calls transcribe and queue in the backlog.)
+# --dmg makes the app self-contained for transcription tooling: a statically-
+# built whisper-cli and the Silero VAD model are bundled inside Ghostie.app.
+# The Whisper speech model is NOT bundled — it's downloaded from Hugging Face
+# on first launch (saves ~140 MB in the .dmg / OTA zip). The target Mac needs
+# macOS 15+. (Summaries still use the user's own Claude Code login; until they
+# run `claude` once, calls transcribe and queue in the backlog.)
 #
 # Signing identity is auto-detected: Developer ID Application (notarizable,
 # permissions persist) → Apple Development → stable self-signed
@@ -137,19 +139,19 @@ if [ "$SELFCONTAINED" = "1" ]; then
   echo "    bundled whisper-cli ($(otool -L "$APP/Contents/Resources/whisper-cli" | grep -c dylib) dynamic libs)"
   NESTED_BINS+=("$APP/Contents/Resources/whisper-cli")
 
-  echo "==> Bundling speech model (ggml-base.en.bin)"
+  # Whisper speech model (ggml-base.en.bin, ~140 MB) is intentionally NOT
+  # bundled — it's downloaded on first launch from Hugging Face by
+  # ModelDownloader and verified via the x-linked-etag SHA256. Keeps the .dmg
+  # and OTA update zip ~6 MB instead of ~140 MB.
+
+  echo "==> Bundling Silero VAD model (~900 KB)"
   mkdir -p "$MODEL_CACHE"
-  if [ ! -f "$MODEL_CACHE/ggml-base.en.bin" ]; then
+  if [ ! -f "$MODEL_CACHE/ggml-silero-v5.1.2.bin" ]; then
     curl -fL --progress-bar \
-      "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin" \
-      -o "$MODEL_CACHE/ggml-base.en.bin"
+      "https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v5.1.2.bin" \
+      -o "$MODEL_CACHE/ggml-silero-v5.1.2.bin"
   fi
-  cp "$MODEL_CACHE/ggml-base.en.bin" "$APP/Contents/Resources/ggml-base.en.bin"
-  # Optional VAD model — only if it's already cached.
-  if [ -f "$MODEL_CACHE/ggml-silero-v5.1.2.bin" ]; then
-    cp "$MODEL_CACHE/ggml-silero-v5.1.2.bin" "$APP/Contents/Resources/"
-    echo "    bundled Silero VAD model"
-  fi
+  cp "$MODEL_CACHE/ggml-silero-v5.1.2.bin" "$APP/Contents/Resources/"
 fi
 
 # ---- Code signing -----------------------------------------------------------
@@ -265,7 +267,8 @@ if [ "$SIGNED" = "adhoc" ]; then
 fi
 if [ "$MAKE_DMG" = "1" ]; then
   echo "Share Ghostie.dmg → on the other Mac: open it, drag Ghostie to"
-  echo "Applications, launch it. Transcription is fully bundled (no setup)."
+  echo "Applications, launch it. First launch opens Settings and downloads"
+  echo "the Whisper speech model (~140 MB) from Hugging Face."
   [ "$NOTARIZE" = "1" ] || echo "Not notarized: first open via right-click ▸ Open (or run --notarize)."
 fi
 echo "Menu-bar 👻 icon, no Dock icon. First Teams call → grant Screen"

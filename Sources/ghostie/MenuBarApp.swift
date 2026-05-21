@@ -57,6 +57,15 @@ final class MenuBarApp: NSObject, NSApplicationDelegate {
         engine.startListening()
         render(engine.state)
 
+        // First-launch / missing-model nudge: the speech model is no longer
+        // bundled in the .dmg (~140 MB saved), so a fresh install needs to
+        // download it from Hugging Face on first run. Open Settings to the
+        // Transcription pane and auto-start the download. No-op if every
+        // required model is already on disk.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+            self?.openSettingsIfModelsMissing()
+        }
+
         // Refresh the recording timer + AX warning visibility every second.
         // AX permission can be revoked at any moment via System Settings, so
         // the warning must follow on its own cadence rather than only on
@@ -213,16 +222,30 @@ final class MenuBarApp: NSObject, NSApplicationDelegate {
     }
 
     @objc private func openSettings() {
-        if settings == nil {
-            settings = SettingsWindow(engine: engine) { [weak self] newConfig in
-                guard let self else { return }
-                self.engine.applyConfig(newConfig)
-                self.render(self.engine.state)
-                self.refreshLastNote()
-                self.notify("Ghostie", "Settings saved.")
-            }
+        ensureSettings().show()
+    }
+
+    private func ensureSettings() -> SettingsWindow {
+        if let s = settings { return s }
+        let s = SettingsWindow(engine: engine) { [weak self] newConfig in
+            guard let self else { return }
+            self.engine.applyConfig(newConfig)
+            self.render(self.engine.state)
+            self.refreshLastNote()
+            self.notify("Ghostie", "Settings saved.")
         }
-        settings?.show()
+        settings = s
+        return s
+    }
+
+    private func openSettingsIfModelsMissing() {
+        let required = Models.required(for: engine.config)
+        let anyMissing = required.contains { m in
+            if case .missing = ModelDownloader.health(for: [m])[0].state { return true }
+            return false
+        }
+        guard anyMissing else { return }
+        ensureSettings().showOnTranscriptionForMissingModels()
     }
 
 

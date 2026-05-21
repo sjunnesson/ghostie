@@ -19,27 +19,28 @@ redistributed with Ghostie:
   a statically linked copy is bundled. The upstream `LICENSE` file is copied
   next to it in `Contents/Resources/whisper.cpp.LICENSE`.
 
-### `ggml-base.en.bin` speech model
+### Silero VAD (`ggml-silero-v5.1.2.bin`)
 
-- Source: https://huggingface.co/ggerganov/whisper.cpp
-- Origin: OpenAI Whisper model weights converted to the GGML format.
-- License: **MIT** (OpenAI Whisper). See the OpenAI Whisper repository:
-  https://github.com/openai/whisper
-- Bundled into the `.dmg` so first-run transcription works with no download.
+- Source: https://huggingface.co/ggml-org/whisper-vad (mirrored from
+  https://github.com/snakers4/silero-vad)
+- License: **MIT** — see the Silero VAD repository for authoritative terms
+- Voice-activity detection that suppresses silence-driven whisper hallucination.
+  Small (~900 KB), so bundled directly rather than downloaded.
 
 ## Downloaded at runtime by the user (not redistributed by this project)
 
-These are fetched on demand into `~/.ghostie/models/` by the user (Settings ▸
-Download models, `ghostie fetch-models`, or `scripts/setup.sh`). Ghostie does
-not redistribute them; the user obtains them directly from the source under
-that source's license. The license noted is best-effort — the model card is
-the authoritative terms.
+These are fetched on demand from their upstream source into
+`~/.ghostie/models/`. Ghostie does not redistribute them; the user obtains
+each file directly from the linked source under that source's license. The
+download is SHA256-verified against the source's signed etag at download
+time. The license noted is best-effort — the model card is the authoritative
+terms.
 
-| Component | Used for | Source | License |
-|-----------|----------|--------|---------|
-| whisper-large-v3 (GGML) | English decode in code-switching | huggingface.co/ggerganov/whisper.cpp | MIT (OpenAI Whisper) — see model card for authoritative terms |
-| KB-Whisper-large (GGML) | Swedish decode in code-switching | https://huggingface.co/KBLab/kb-whisper-large (KBLab / National Library of Sweden) | **Apache-2.0** (verified against the model card metadata, 2026-05-19) |
-| Silero VAD (`ggml-silero-*`) | Voice-activity detection | https://github.com/snakers4/silero-vad | MIT — see repository for authoritative terms |
+| Component | Used for | Source | Fetched by | License |
+|-----------|----------|--------|------------|---------|
+| `ggml-base.en.bin` (~140 MB) | Default English transcription | https://huggingface.co/ggerganov/whisper.cpp | First-launch auto-download (Settings ▸ Transcription), `ghostie fetch-models`, or `scripts/setup.sh` | **MIT** (OpenAI Whisper) — https://github.com/openai/whisper |
+| whisper-large-v3 (GGML) | English decode in code-switching | https://huggingface.co/ggerganov/whisper.cpp | Settings ▸ Download models, `ghostie fetch-models` | MIT (OpenAI Whisper) — see model card for authoritative terms |
+| KB-Whisper-large (GGML) | Swedish decode in code-switching | https://huggingface.co/KBLab/kb-whisper-large (KBLab / National Library of Sweden) | Settings ▸ Download models, `ghostie fetch-models` | **Apache-2.0** (verified against the model card metadata, 2026-05-19) |
 
 ## Invoked, not bundled
 

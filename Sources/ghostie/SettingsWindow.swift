@@ -29,6 +29,48 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         rebuildWindow()
     }
 
+    /// First-launch entry point used by MenuBarApp when a required model is
+    /// missing locally. Opens to the Transcription pane and auto-starts the
+    /// first missing download so the user sees progress immediately rather
+    /// than hunting for the right button. Subsequent missing models keep
+    /// their manual Download buttons (the downloader processes one at a time
+    /// and the per-row UI tracks inflight by key).
+    func showOnTranscriptionForMissingModels() {
+        if window == nil {
+            currentPaneId = .transcription
+            show()
+        } else {
+            show()
+            select(.transcription, animated: false)
+        }
+        DispatchQueue.main.async { [weak self] in
+            self?.startFirstMissingRequiredDownload()
+        }
+    }
+
+    private func startFirstMissingRequiredDownload() {
+        guard inflightModelKey == nil else { return }
+        for m in Models.required(for: cfg) {
+            guard let key = rowKey(for: m) else { continue }
+            if case .missing = ModelDownloader.health(for: [m])[0].state {
+                startDownload(m, key: key)
+                return
+            }
+        }
+    }
+
+    private func rowKey(for model: Model) -> String? {
+        switch model.filename {
+        case Models.baseEnglish.filename: return "base"
+        case Models.sileroVAD.filename:   return "vad"
+        case Models.largeV3.filename:     return "large-v3"
+        default:
+            if let kb = Models.kbWhisperLarge(variant: cfg.codeSwitch.kbWhisperVariant),
+               model.filename == kb.filename { return "kb" }
+            return nil
+        }
+    }
+
     // MARK: Stored references
 
     private weak var engine: Engine?
