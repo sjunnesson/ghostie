@@ -387,8 +387,12 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         flipped.layer?.backgroundColor = Theme.contentBg.cgColor
         flipped.addSubview(doc)
         doc.translatesAutoresizingMaskIntoConstraints = false
+        // 4 pt top inset so the page title sits at the same y as the
+        // sidebar's brand row (which is itself 4 pt below the 38 pt drag
+        // region). Anything bigger drops the header noticeably lower than
+        // "Ghostie" in the sidebar.
         NSLayoutConstraint.activate([
-            doc.topAnchor.constraint(equalTo: flipped.topAnchor, constant: 24),
+            doc.topAnchor.constraint(equalTo: flipped.topAnchor, constant: 4),
             doc.leadingAnchor.constraint(equalTo: flipped.leadingAnchor, constant: 28),
             doc.trailingAnchor.constraint(equalTo: flipped.trailingAnchor, constant: -28),
             doc.bottomAnchor.constraint(lessThanOrEqualTo: flipped.bottomAnchor, constant: -32)
@@ -2716,14 +2720,16 @@ private final class ModelRowView: NSView {
         progressBar.translatesAutoresizingMaskIntoConstraints = false
         progressBar.isHidden = true
 
-        // Title + badge on one line. `.centerY` puts them on the same visual
-        // line; `.firstBaseline` would resolve the badge's baseline to its
-        // top edge (StatusBadgeView has no text baseline of its own) and
-        // push the pill under the title.
-        let titleLine = NSStackView(views: [self.title, badge])
-        titleLine.orientation = .horizontal
-        titleLine.spacing = 8
-        titleLine.alignment = .centerY
+        // Pin the action button to a fixed width so the badge column to its
+        // left lands at a consistent X across all four rows. Long-enough to
+        // fit the widest label ("Re-download") without truncating.
+        action.widthAnchor.constraint(equalToConstant: 110).isActive = true
+        badge.translatesAutoresizingMaskIntoConstraints = false
+
+        // The title sits alone now (badge moved out to a right-aligned
+        // column). `.required` hugging keeps it at its intrinsic width so
+        // a shorter model name doesn't stretch into the badge column.
+        let titleLine = self.title
         titleLine.translatesAutoresizingMaskIntoConstraints = false
 
         radio.translatesAutoresizingMaskIntoConstraints = false
@@ -2736,6 +2742,7 @@ private final class ModelRowView: NSView {
         addSubview(radio)
         addSubview(titleLine)
         addSubview(self.subtitle)
+        addSubview(badge)
         addSubview(action)
         addSubview(progressBar)
         addSubview(statusLine)
@@ -2760,11 +2767,18 @@ private final class ModelRowView: NSView {
 
             titleLine.leadingAnchor.constraint(equalTo: radio.trailingAnchor, constant: 12),
             titleLine.topAnchor.constraint(equalTo: topAnchor, constant: 11),
-            titleLine.trailingAnchor.constraint(lessThanOrEqualTo: action.leadingAnchor, constant: -12),
+            titleLine.trailingAnchor.constraint(lessThanOrEqualTo: badge.leadingAnchor, constant: -10),
 
             self.subtitle.leadingAnchor.constraint(equalTo: titleLine.leadingAnchor),
             self.subtitle.topAnchor.constraint(equalTo: titleLine.bottomAnchor, constant: 2),
-            self.subtitle.trailingAnchor.constraint(lessThanOrEqualTo: action.leadingAnchor, constant: -12),
+            self.subtitle.trailingAnchor.constraint(lessThanOrEqualTo: badge.leadingAnchor, constant: -10),
+
+            // Right-aligned badge column. Trailing pinned to a fixed offset
+            // from the action button's leading edge, vertically aligned with
+            // the title — matches the "Granted" column pattern in the
+            // permissions card so all four pills line up on the right.
+            badge.trailingAnchor.constraint(equalTo: action.leadingAnchor, constant: -12),
+            badge.centerYAnchor.constraint(equalTo: titleLine.centerYAnchor),
 
             progressBar.leadingAnchor.constraint(equalTo: titleLine.leadingAnchor),
             progressBar.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
