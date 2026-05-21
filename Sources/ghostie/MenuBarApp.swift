@@ -109,7 +109,7 @@ final class MenuBarApp: NSObject, NSApplicationDelegate {
         lastNoteItem = item("Open Last Summary", #selector(openLastNote))
         lastNoteItem.isEnabled = false
         menu.addItem(lastNoteItem)
-        menu.addItem(item("Run 15-Second Test", #selector(runTest)))
+        menu.addItem(item("Run 30-Second Test", #selector(runTest)))
         backlogItem = item("Backlog: none", #selector(processBacklog))
         backlogItem.isEnabled = false
         menu.addItem(backlogItem)
@@ -217,8 +217,8 @@ final class MenuBarApp: NSObject, NSApplicationDelegate {
     }
 
     @objc private func runTest() {
-        notify("Ghostie", "Recording a 15-second test — speak and play some audio.")
-        engine.runTest(seconds: 15) { [weak self] note in
+        notify("Ghostie", "Recording a 30-second test — speak and play some audio.")
+        engine.runTest(seconds: 30) { [weak self] note in
             DispatchQueue.main.async {
                 self?.refreshLastNote()
                 if let note { NSWorkspace.shared.open(note) }

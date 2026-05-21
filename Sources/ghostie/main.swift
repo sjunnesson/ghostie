@@ -68,7 +68,7 @@ func cmdTestRecord(_ config: Config, seconds: Double) {
         do {
             try await rec.start()
             try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
-            guard let result = await rec.stop() else { Log.error("No result."); return }
+            guard let result = await rec.stop(discardIfBelowMinCallSeconds: false) else { Log.error("No result."); return }
             Log.ok("Captured \(String(format: "%.1f", result.duration))s. Running pipeline…")
             Pipeline(config: config).process(result, startedAt: started)
         } catch {
@@ -91,19 +91,46 @@ func cmdProcess(_ config: Config, dir: String) {
     Pipeline(config: config).process(result, startedAt: Date())
 }
 
-/// Headless equivalent of the Settings “Download models” button — same
-/// `ModelDownloader`, so GUI and CLI/servers fetch identically.
-func cmdFetchModels(_ config: Config, variant: String) {
-    let v = variant.isEmpty ? config.codeSwitch.kbWhisperVariant : variant
-    guard let items = ModelDownloader.items(variant: v) else {
-        Log.error(ModelDownloader.DLError.subtitleUnavailable.localizedDescription)
-        exit(1)
+/// Headless equivalent of the Settings "Download models" button. Uses the
+/// `Models` manifest so GUI and CLI/servers fetch identical artifacts.
+///
+/// Selection rules (priority order):
+///   - `--all`           → every model Ghostie can use, regardless of config.
+///   - `--codeswitch`    → the codeswitch set (KB-Whisper + large-v3 + VAD).
+///   - `--vad`           → just the Silero VAD model.
+///   - explicit variant  → codeswitch set with that KB variant.
+///   - no arg            → whatever `Models.required(for:)` reports for the
+///                         current config (codeswitch or single-mode).
+func cmdFetchModels(_ config: Config, args: [String]) {
+    let wantsAll = args.contains("--all")
+    let wantsCodeswitch = args.contains("--codeswitch")
+    let wantsVAD = args.contains("--vad")
+    let explicitVariant = args.first { !$0.hasPrefix("--") }
+    let variant = explicitVariant ?? config.codeSwitch.kbWhisperVariant
+
+    var models: [Model] = []
+    if wantsAll {
+        models = [Models.baseEnglish, Models.largeV3, Models.sileroVAD]
+        if let kb = Models.kbWhisperLarge(variant: variant) { models.insert(kb, at: 1) }
+    } else if wantsCodeswitch || explicitVariant != nil {
+        guard let kb = Models.kbWhisperLarge(variant: variant) else {
+            Log.error(ModelDownloader.DLError.subtitleUnavailable.localizedDescription)
+            exit(1)
+        }
+        models = [kb, Models.largeV3, Models.sileroVAD]
+    } else if wantsVAD {
+        models = [Models.sileroVAD]
+    } else {
+        models = Models.required(for: config)
     }
-    Log.info("Fetching code-switching models (\(v)) → \(Config.modelsDir)")
+
+    Log.info("Fetching \(models.count) model(s) → \(Config.modelsDir)")
     let dl = ModelDownloader()
     var failure: Error?
     var done = false
-    dl.start(items, status: { Log.info($0) }, finish: { err in failure = err; done = true })
+    dl.start(models: models,
+             status: { Log.info($0) },
+             finish: { err in failure = err; done = true })
     while !done {
         RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.2))
     }
@@ -111,7 +138,59 @@ func cmdFetchModels(_ config: Config, variant: String) {
         Log.error("Download failed: \(failure.localizedDescription)")
         exit(1)
     }
-    Log.ok("Code-switching models ready. Enable it in Settings or set codeSwitch.enabled=true.")
+    Log.ok("Done. Run `ghostie doctor models` to re-verify on demand.")
+}
+
+/// `ghostie doctor models` — hash every required model against the SHA256
+/// captured at download time (sidecar `<model>.meta`). On-demand, not on
+/// launch: hashing a 1 GB file is ~3 sec on Apple Silicon.
+///
+/// Files that exist but pre-date the sidecar are *adopted* in-place: HEAD
+/// the URL to learn the upstream SHA256, hash the local file, and if they
+/// match write the sidecar so future runs are offline-fast. This means
+/// upgrading from older Ghostie builds doesn't force a 2 GB re-download.
+func cmdDoctorModels(_ config: Config) {
+    print("Ghostie doctor: models\n==================")
+    let models = Models.required(for: config)
+    if models.isEmpty {
+        print("  (no models required for current config)"); return
+    }
+    var healths = ModelDownloader.health(for: models)
+
+    // Adopt legacy files (no sidecar) by HEAD-ing the URL and hashing on disk.
+    let needsAdoption = healths.contains { h in
+        if case .noSidecar = h.state { return true } else { return false }
+    }
+    if needsAdoption {
+        print("  Adopting \(healths.filter { if case .noSidecar = $0.state { return true } else { return false } }.count) legacy file(s) (HEAD + SHA256)…")
+        healths = healths.map { h in
+            if case .noSidecar = h.state {
+                return ModelDownloader.Health(model: h.model,
+                                              state: ModelDownloader.adopt(h.model))
+            }
+            return h
+        }
+        print("")
+    }
+
+    var allOK = true
+    for h in healths {
+        let mark = h.state.isOK ? "✓" : "✗"
+        if !h.state.isOK { allOK = false }
+        print("  \(mark) \(h.model.filename)  — \(h.state.summary)")
+        if !h.state.isOK {
+            print("      URL: \(h.model.url.absoluteString)")
+        }
+    }
+    print("")
+    if allOK {
+        print("All required models verified.")
+    } else {
+        print("Some models need repair. Run:")
+        print("  ghostie fetch-models --all")
+        print("to re-download anything missing or mismatched (intact files are skipped).")
+        exit(1)
+    }
 }
 
 /// `ghostie update [--install]` — check GitHub Releases; with `--install`
@@ -592,14 +671,20 @@ func printHelp() {
       menubar             Run as a macOS menu bar app (default when launched
                           as Ghostie.app).
       run                 Headless watch loop (launchd / servers).
-      test-record [secs]  Record N seconds (default 15) → full pipeline.
+      test-record [secs]  Record N seconds (default 30) → full pipeline.
       process <dir>       Re-run transcription+summary on a recording dir.
       doctor              Check dependencies & permissions.
+      doctor models       SHA256-verify every required model against the
+                          sidecar from its last successful download.
       diagnose-detect [--duration N] [--json]
                           Live readout of the call detector. 30s default,
                           500ms refresh. --json emits line-delimited JSON.
-      fetch-models [v]    Download code-switching models (KB variant v +
-                          large-v3 + VAD). Same as the Settings button.
+      fetch-models [variant] [--all|--codeswitch|--vad]
+                          Download the model set Ghostie needs. With no flag,
+                          fetches exactly what current config requires (single
+                          mode → base.en + VAD; codeswitch on → KB + large-v3
+                          + VAD). Each download is SHA256-verified against
+                          Hugging Face's `x-linked-etag`; intact files skip.
       process-backlog     Process recordings queued while deps were unavailable.
       update [--install]  Check for a newer release; --install downloads,
                           verifies (notarization + SHA-256) and swaps the app.
@@ -631,14 +716,18 @@ case "menubar":
 case "run":
     HeadlessRunner(config: config).run()
 case "test-record":
-    cmdTestRecord(config, seconds: Double(args.count > 1 ? args[1] : "") ?? 15)
+    cmdTestRecord(config, seconds: Double(args.count > 1 ? args[1] : "") ?? 30)
 case "process":
     guard args.count > 1 else { Log.error("Usage: ghostie process <dir>"); exit(1) }
     cmdProcess(config, dir: args[1])
 case "fetch-models":
-    cmdFetchModels(config, variant: args.count > 1 ? args[1] : "")
+    cmdFetchModels(config, args: Array(args.dropFirst()))
 case "doctor":
-    cmdDoctor(config)
+    if args.count > 1 && args[1] == "models" {
+        cmdDoctorModels(config)
+    } else {
+        cmdDoctor(config)
+    }
 case "diagnose-detect":
     var dur = 30.0
     if let i = args.firstIndex(of: "--duration"), i + 1 < args.count,

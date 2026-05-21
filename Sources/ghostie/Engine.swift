@@ -163,7 +163,9 @@ final class Engine: @unchecked Sendable {
         }
     }
 
-    /// One-shot N-second capture + full pipeline (menu "Run Test").
+    /// One-shot N-second capture + full pipeline (menu "Run Test"). The
+    /// short-call discard is bypassed so a sub-`minCallSeconds` test still
+    /// produces a note instead of silently dropping the audio.
     func runTest(seconds: Double, completion: @escaping (URL?) -> Void) {
         let rec = AudioRecorder(config: config)
         let started = Date()
@@ -172,7 +174,11 @@ final class Engine: @unchecked Sendable {
                 try await rec.start()
                 self.state = .recording(since: started)
                 try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
-                guard let result = await rec.stop() else { completion(nil); return }
+                guard let result = await rec.stop(discardIfBelowMinCallSeconds: false) else {
+                    self.state = self.listening ? .watching : .paused
+                    completion(nil)
+                    return
+                }
                 self.state = .processing
                 self.work.async {
                     let note = Pipeline(config: Config.load()).process(result, startedAt: started)

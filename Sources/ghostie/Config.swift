@@ -42,9 +42,11 @@ struct Config: Codable {
     /// How often to poll for call start/stop, in seconds.
     var pollIntervalSeconds: Double = 2.0
 
-    /// The microphone must be continuously idle for this long before a call is
-    /// considered finished (rides over short pauses / mute toggles).
-    var endGraceSeconds: Double = 12.0
+    /// Teams must continuously not be holding the mic for this long before a
+    /// call is considered finished (rides over mute toggles, AirPods reconnects,
+    /// brief Teams crashes). Matches the state-machine grace window in
+    /// detector-rearchitecture.md.
+    var endGraceSeconds: Double = 30.0
 
     /// Ignore "calls" shorter than this (avoids ringtones / accidental clicks).
     var minCallSeconds: Double = 20.0
@@ -386,22 +388,21 @@ struct CodeSwitchConfig: Codable {
         promptEn = g(.promptEn, d.promptEn)
     }
 
-    /// Resolve the logical model name for `lang` to a GGML file path.
-    /// An absolute path is used verbatim (advanced users); the well-known
-    /// names map to setup.sh's on-disk filenames; a bare ggml name resolves
-    /// under `~/.ghostie/models/`.
+    /// Resolve the logical model name for `lang` to a GGML file path. Defers
+    /// to `Models` for the well-known names (single source of truth with
+    /// `ModelDownloader`); falls back to legacy resolution for bare GGML
+    /// filenames or absolute overrides.
     func modelPath(for lang: String) -> String {
         let raw = (modelPerLanguage[lang] ?? "").trimmingCharacters(in: .whitespaces)
+        if raw.isEmpty { return "" }
         if raw.hasPrefix("/") { return raw }
-        let dir = Config.modelsDir
         switch raw {
         case "kb-whisper-large":
-            return "\(dir)/ggml-kb-whisper-large-\(kbWhisperVariant)-q5_0.bin"
+            return Models.kbWhisperLarge(variant: kbWhisperVariant)?.destPath ?? ""
         case "whisper-large-v3":
-            return "\(dir)/ggml-large-v3-q5_0.bin"
-        case "":
-            return ""
+            return Models.largeV3.destPath
         default:
+            let dir = Config.modelsDir
             return raw.hasSuffix(".bin") ? "\(dir)/\(raw)" : "\(dir)/ggml-\(raw).bin"
         }
     }

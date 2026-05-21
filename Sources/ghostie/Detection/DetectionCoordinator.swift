@@ -64,7 +64,9 @@ final class DetectionCoordinator {
         self.camera = camera
         self.device = device
         self.clock = clock
-        self.stateMachine = CallStateMachine(clock: clock)
+        var smConfig = CallStateMachine.Config()
+        smConfig.endGraceSeconds = config.endGraceSeconds
+        self.stateMachine = CallStateMachine(config: smConfig, clock: clock)
         let mainIds = config.triggerBundleIds.map { $0.lowercased() }
         self.teamsBundleMatchers = mainIds
         self.presence = presence ?? WorkspaceAppPresenceProvider(triggerBundleIds: mainIds)

@@ -39,10 +39,28 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
     private let csMinSwitch = NSTextField()
     private let csWindowMe = NSTextField()
     private let csWindowPart = NSTextField()
-    private let csDownloadBtn = NSButton(title: "Download models (~2 GB)…",
-                                         target: nil, action: nil)
-    private let csDownloadStatus = NSTextField(wrappingLabelWithString: "")
     private let downloader = ModelDownloader()
+
+    // Transcription tab v2. One column, three sections (Mode, Quality, Models
+    // on disk). Advanced knobs and prompt edits live in config.json — kept off
+    // the UI deliberately. The hidden NSTextFields below still hold their
+    // values so Save round-trips them unchanged.
+    private let modePopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let whisperModelPopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let singleModeBlock = NSStackView()
+    private let codeswitchModeBlock = NSStackView()
+
+    // Per-model row UI. Keyed by a stable identifier ("base", "large-v3",
+    // "kb", "vad") rather than filename so the KB row survives a variant
+    // change. Built on Settings open; updated by `refreshModelRow(_:)`.
+    private struct ModelRowViews {
+        let status: NSTextField
+        let action: NSButton
+    }
+    private var modelRows: [String: ModelRowViews] = [:]
+    /// Set to a key while that single row's download is in flight, so
+    /// per-row downloads serialize without a global "everything disabled".
+    private var inflightModelKey: String?
 
     // Updates.
     private let autoUpdateCheck = NSButton(
@@ -105,10 +123,14 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         cleanTranscript.state = cfg.cleanTranscript ? .on : .off
         vadField.stringValue = cfg.vadModel
 
+        // `removeAllItems` first — `buildForm` re-runs on every Settings reopen
+        // and `addItems` appends, so without this the lists grow each time.
+        languageBox.removeAllItems()
         languageBox.addItems(withObjectValues: ["en", "auto", "sv", "de", "fr", "es", "it", "nl", "pt"])
         languageBox.stringValue = cfg.language
         languageBox.completes = true
 
+        summaryBox.removeAllItems()
         summaryBox.addItems(withObjectValues: ["claude-sonnet-4-6", "claude-opus-4-7", "claude-haiku-4-5-20251001"])
         summaryBox.stringValue = cfg.summaryModel
         summaryBox.completes = true
@@ -121,11 +143,13 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         let csc = cfg.codeSwitch
         csEnable.state = csc.enabled ? .on : .off
         csLanguages.stringValue = csc.languages.joined(separator: ", ")
+        csDominant.removeAllItems()
         csDominant.addItems(withObjectValues: ["en", "sv"])
         csDominant.stringValue = csc.dominantLanguage
         csDominant.completes = true
         csSvModel.stringValue = csc.modelPerLanguage["sv"] ?? "kb-whisper-large"
         csEnModel.stringValue = csc.modelPerLanguage["en"] ?? "whisper-large-v3"
+        csVariant.removeAllItems()
         csVariant.addItems(withObjectValues: ["standard", "subtitle", "strict"])
         csVariant.stringValue = csc.kbWhisperVariant
         csVariant.completes = true
@@ -190,58 +214,38 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         ]))
         tabs.addTabViewItem(tab("Detection", [
             requireTeams,
-            field("End call after mic idle", leftWrap(suffixed(endGrace, "seconds", width: 70))),
+            field("End call after Teams releases the mic", leftWrap(suffixed(endGrace, "seconds", width: 70))),
             field("Ignore calls shorter than", leftWrap(suffixed(minCall, "seconds", width: 70))),
-            caption("A call is detected from microphone use; it ends after the mic is idle for the grace period.")
+            caption("A call ends when Teams continuously stops holding the microphone for this long. The grace window rides over brief drops — mute toggles, AirPods reconnecting, a quick Teams restart. This is not voice-activity detection; your own pauses do not count as the mic being released.")
         ]))
         tabs.addTabViewItem(tab("Permissions", permissionsTabContents()))
-        csDownloadStatus.font = .systemFont(ofSize: 11)
-        csDownloadStatus.textColor = .secondaryLabelColor
-        csDownloadBtn.bezelStyle = .rounded
-        csDownloadBtn.target = self
-        csDownloadBtn.action = #selector(downloadModels)
 
-        // One tab. Single-language and code-switching are mutually exclusive
-        // (code-switching replaces the single-language pass when enabled), so
-        // they live together under clearly grouped headers; the two settings
-        // that apply to *both* modes are pulled out on top so they aren't
-        // hidden from code-switching users.
+        // Mode-specific UI is built in two containers; the popup toggles which
+        // is visible. The variant dropdown drives the KB row's status.
+        csVariant.target = self
+        csVariant.action = #selector(variantChanged)
+        buildModeControls(currentlyCodeswitch: cfg.codeSwitch.enabled,
+                          currentWhisperModelPath: cfg.whisperModel)
+
         tabs.addTabViewItem(tab("Transcription", [
-            section("Applies to every transcription"),
+            section("Mode"),
+            leftWrap(sized(modePopup, 260)),
+
+            singleModeBlock,
+            codeswitchModeBlock,
+
+            section("Quality"),
             cleanTranscript,
-            field("Silero VAD model", pathControl(vadField, chooseDir: false)),
-            caption("Required for code-switching; recommended otherwise (biggest reducer of silence hallucinations). ./scripts/setup.sh --vad fetches it."),
+            caption("Silero VAD is used automatically when its model is on disk."),
 
-            section("Single-language mode"),
-            caption("Used when code-switching (below) is OFF — one model for the whole call."),
-            field("Whisper model", pathControl(whisperModelField, chooseDir: false)),
-            field("Language", leftWrap(sized(languageBox, 120))),
-            field("Initial prompt (biases whisper toward clean, punctuated speech)",
-                  promptBox(cfg.initialPrompt)),
+            section("Models on disk"),
+            makeModelRow(key: "base",     title: "Whisper base (English) · ~150 MB"),
+            makeModelRow(key: "kb",       title: "KB-Whisper-large (Swedish) · ~1.1 GB"),
+            makeModelRow(key: "large-v3", title: "Whisper large-v3 (English) · ~1.1 GB"),
+            makeModelRow(key: "vad",      title: "Silero VAD · ~900 KB"),
+            caption("Status comes from the verification sidecar written at download time. Hashes match Hugging Face's published SHA256."),
 
-            section("Code-switching (Swedish ↔ English)"),
-            csEnable,
-            caption("When ON this REPLACES single-language mode: each speech run is decoded by the best model for its language — KB-Whisper for Swedish, whisper-large-v3 for English. The model/language/prompt above are then unused."),
-            field("Languages (comma-separated; first two are used)",
-                  leftWrap(sized(csLanguages, 160))),
-            field("Dominant language (tiebreaker)", leftWrap(sized(csDominant, 120))),
-            field("Swedish model", pathControl(csSvModel, chooseDir: false)),
-            field("English model", pathControl(csEnModel, chooseDir: false)),
-            caption("A known name (kb-whisper-large, whisper-large-v3) resolves under ~/.ghostie/models/, or Choose… a specific .bin file."),
-            field("Swedish transcription style", leftWrap(sized(csVariant, 160))),
-            caption("standard = balanced (best for notes) · subtitle = condensed · strict = verbatim, keeps filler. (‘subtitle’ has no downloadable model — use standard or strict.)"),
-            leftWrap(csDownloadBtn),
-            csDownloadStatus,
-            caption("Downloads the chosen Swedish model + whisper-large-v3 + VAD into ~/.ghostie/models/ (≈2 GB; skips files already there). Or run  ./scripts/setup.sh --codeswitch."),
-            field("Swedish prompt", csPromptSv),
-            field("English prompt", csPromptEn),
-            field("Cross-track prior strength (0.5 disables · 1.0 absolute)",
-                  leftWrap(sized(csPriorStrength, 70))),
-            field("Min consecutive segments to switch language",
-                  leftWrap(sized(csMinSwitch, 70))),
-            field("Smoothing window — Me / Participants",
-                  leftWrap(pair(csWindowMe, csWindowPart))),
-            caption("Other advanced knobs (fill gap, run/silence padding, min detect ms, prior lookback) are in config.json.")
+            caption("Prompts, smoothing and other tuning live in config.json — open with the button below.")
         ]))
         tabs.addTabViewItem(tab("Summary", [
             field("Claude CLI", pathControl(claudeField, chooseDir: false)),
@@ -615,51 +619,220 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         }
     }
 
-    @objc private func downloadModels() {
-        if downloader.isRunning { return }
-        let variant = csVariant.stringValue.trimmingCharacters(in: .whitespaces)
-        guard let items = ModelDownloader.items(variant: variant) else {
-            alert(.warning, "‘\(variant)’ has no downloadable model",
-                  ModelDownloader.DLError.subtitleUnavailable.localizedDescription)
+    // MARK: - Mode controls (Single language ↔ Code-switching)
+
+    /// Populate the mode popup + the two per-mode blocks. Called once during
+    /// `buildForm`. The mode popup drives which block is visible; the rest is
+    /// just layout.
+    private func buildModeControls(currentlyCodeswitch: Bool,
+                                   currentWhisperModelPath: String) {
+        modePopup.removeAllItems()
+        modePopup.addItems(withTitles: ["Single language", "Code-switching (Swedish ↔ English)"])
+        modePopup.target = self
+        modePopup.action = #selector(modeChanged)
+        modePopup.selectItem(at: currentlyCodeswitch ? 1 : 0)
+
+        // Single-mode whisper model popup. Each item carries its `Model` (or
+        // nil for the "Custom" sentinel) via `representedObject`, so save just
+        // reads model.destPath without re-mapping titles.
+        whisperModelPopup.removeAllItems()
+        func addModelItem(_ title: String, _ model: Model?) {
+            let mi = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+            mi.representedObject = model
+            whisperModelPopup.menu?.addItem(mi)
+        }
+        addModelItem("Whisper base (English) · 150 MB", Models.baseEnglish)
+        addModelItem("Whisper large-v3 (multilingual) · 1.1 GB", Models.largeV3)
+        // If the user's config points at something unrecognized, surface it as
+        // "Custom" so they don't get silently overwritten on save.
+        let isKnown = currentWhisperModelPath == Models.baseEnglish.destPath
+                   || currentWhisperModelPath == Models.largeV3.destPath
+        if !isKnown && !currentWhisperModelPath.isEmpty {
+            addModelItem("Custom (\(URL(fileURLWithPath: currentWhisperModelPath).lastPathComponent))", nil)
+            whisperModelPopup.selectItem(at: 2)
+        } else if currentWhisperModelPath == Models.largeV3.destPath {
+            whisperModelPopup.selectItem(at: 1)
+        } else {
+            whisperModelPopup.selectItem(at: 0)
+        }
+        whisperModelPopup.target = self
+        whisperModelPopup.action = #selector(whisperModelChanged)
+
+        // ---- Single-language block --------------------------------------
+        singleModeBlock.orientation = .vertical
+        singleModeBlock.alignment = .leading
+        singleModeBlock.spacing = 12
+        singleModeBlock.setHuggingPriority(.defaultLow, for: .horizontal)
+        singleModeBlock.addArrangedSubview(field("Model", leftWrap(sized(whisperModelPopup, 360))))
+        singleModeBlock.addArrangedSubview(field("Language", leftWrap(sized(languageBox, 120))))
+
+        // ---- Code-switching block ---------------------------------------
+        codeswitchModeBlock.orientation = .vertical
+        codeswitchModeBlock.alignment = .leading
+        codeswitchModeBlock.spacing = 12
+        codeswitchModeBlock.setHuggingPriority(.defaultLow, for: .horizontal)
+        codeswitchModeBlock.addArrangedSubview(
+            field("Tie-breaker language", leftWrap(sized(csDominant, 120))))
+        codeswitchModeBlock.addArrangedSubview(
+            field("Swedish transcription style", leftWrap(sized(csVariant, 160))))
+        codeswitchModeBlock.addArrangedSubview(
+            caption("standard, balanced for notes · strict, verbatim with filler · subtitle has no GGML upstream."))
+
+        // Both blocks are always in the tab; toggle visibility based on mode.
+        applyModeVisibility()
+    }
+
+    private func applyModeVisibility() {
+        let codeswitch = modePopup.indexOfSelectedItem == 1
+        singleModeBlock.isHidden = codeswitch
+        codeswitchModeBlock.isHidden = !codeswitch
+    }
+
+    @objc private func modeChanged() {
+        applyModeVisibility()
+    }
+
+    @objc private func whisperModelChanged() {
+        // No-op for now; save() reads the popup's current representedObject.
+        // The handler exists so future UX (e.g. live status under the picker)
+        // can hang off it without restructuring.
+    }
+
+    // MARK: - Per-model rows (Models on disk)
+
+    /// Resolve the row key to the Model it currently represents. The "kb"
+    /// row depends on the variant dropdown, so it has to recompute each time.
+    private func modelForKey(_ key: String) -> Model? {
+        switch key {
+        case "base":     return Models.baseEnglish
+        case "large-v3": return Models.largeV3
+        case "vad":      return Models.sileroVAD
+        case "kb":
+            let variant = csVariant.stringValue.trimmingCharacters(in: .whitespaces)
+            return Models.kbWhisperLarge(variant: variant.isEmpty ? "standard" : variant)
+        default:         return nil
+        }
+    }
+
+    /// Build a row: title on the left, status in the middle, action button on
+    /// the right. Same pattern for every model. Stored in `modelRows` by key.
+    private func makeModelRow(key: String, title: String) -> NSView {
+        let name = NSTextField(labelWithString: title)
+        name.font = .systemFont(ofSize: 12)
+        let status = NSTextField(labelWithString: "—")
+        status.font = .systemFont(ofSize: 11)
+        status.textColor = .secondaryLabelColor
+        status.lineBreakMode = .byTruncatingTail
+        let action = NSButton(title: "—", target: self,
+                              action: #selector(modelRowAction(_:)))
+        action.bezelStyle = .rounded
+        action.identifier = NSUserInterfaceItemIdentifier(key)
+        modelRows[key] = ModelRowViews(status: status, action: action)
+
+        let row = NSStackView(views: [name, status, action])
+        row.orientation = .horizontal
+        row.spacing = 12
+        row.alignment = .centerY
+        row.distribution = .fill
+        name.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        name.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        status.setContentHuggingPriority(.defaultHigh, for: .horizontal)
+        action.setContentHuggingPriority(.required, for: .horizontal)
+        DispatchQueue.main.async { [weak self] in self?.refreshModelRow(key) }
+        return row
+    }
+
+    /// Synchronously read the on-disk state via the sidecar and update the row.
+    /// No network and no full re-hash here — that's what the action button is
+    /// for (Verify / Re-verify do the heavy work in the background).
+    private func refreshModelRow(_ key: String) {
+        guard let row = modelRows[key] else { return }
+        if inflightModelKey == key { return }   // mid-download; leave as-is
+        guard let model = modelForKey(key) else {
+            row.status.stringValue = "no downloadable model for this variant"
+            row.action.title = "—"
+            row.action.isEnabled = false
             return
         }
-        let confirm = NSAlert()
-        confirm.messageText = "Download code-switching models?"
-        confirm.informativeText = "Fetches the \(variant) Swedish model, whisper-large-v3, and the VAD model (≈2 GB total) into ~/.ghostie/models/. Files already present are skipped. You can keep using Settings while it runs; closing this window cancels it."
-        confirm.addButton(withTitle: "Download")
-        confirm.addButton(withTitle: "Cancel")
-        guard confirm.runModal() == .alertFirstButtonReturn else { return }
+        let h = ModelDownloader.health(for: [model])[0]
+        row.status.stringValue = h.state.summary
+        row.action.isEnabled = inflightModelKey == nil
+        switch h.state {
+        case .ok:                              row.action.title = "Re-verify"
+        case .missing:                         row.action.title = "Download"
+        case .noSidecar:                       row.action.title = "Verify"
+        case .sizeWrong, .hashMismatch:        row.action.title = "Re-download"
+        }
+    }
 
-        csDownloadBtn.isEnabled = false
-        csDownloadBtn.title = "Downloading…"
-        csDownloadStatus.stringValue = "Starting…"
-        downloader.start(items, status: { [weak self] s in
-            self?.csDownloadStatus.stringValue = s
+    private func refreshAllModelRows() {
+        for key in modelRows.keys { refreshModelRow(key) }
+    }
+
+    @objc private func variantChanged() {
+        // The kb row's filename + status both depend on the variant.
+        refreshModelRow("kb")
+    }
+
+    @objc private func modelRowAction(_ sender: NSButton) {
+        guard let key = sender.identifier?.rawValue,
+              let model = modelForKey(key) else { return }
+        let h = ModelDownloader.health(for: [model])[0]
+        switch h.state {
+        case .missing, .sizeWrong, .hashMismatch:
+            startDownload(model, key: key)
+        case .noSidecar:
+            startAdopt(model, key: key)
+        case .ok:
+            startReverify(model, key: key)
+        }
+    }
+
+    private func startDownload(_ model: Model, key: String) {
+        guard inflightModelKey == nil else { return }
+        inflightModelKey = key
+        for k in modelRows.keys where k != key {
+            modelRows[k]?.action.isEnabled = false
+        }
+        modelRows[key]?.status.stringValue = "Starting…"
+        modelRows[key]?.action.title = "Downloading…"
+        modelRows[key]?.action.isEnabled = false
+        downloader.start(models: [model], status: { [weak self] s in
+            self?.modelRows[key]?.status.stringValue = s
         }, finish: { [weak self] err in
             guard let self else { return }
-            self.csDownloadBtn.isEnabled = true
-            self.csDownloadBtn.title = "Download models (~2 GB)…"
+            self.inflightModelKey = nil
             if let err {
-                self.csDownloadStatus.stringValue = "Download failed."
-                self.alert(.critical, "Model download failed", err.localizedDescription)
-                return
+                self.alert(.critical, "Download failed", err.localizedDescription)
             }
-            // Point the model fields at the canonical logical names so
-            // resolution finds what we just downloaded.
-            if self.csSvModel.stringValue.trimmingCharacters(in: .whitespaces).isEmpty
-                || self.csSvModel.stringValue == "kb-whisper-large" {
-                self.csSvModel.stringValue = "kb-whisper-large"
-            }
-            if self.csEnModel.stringValue.trimmingCharacters(in: .whitespaces).isEmpty
-                || self.csEnModel.stringValue == "whisper-large-v3" {
-                self.csEnModel.stringValue = "whisper-large-v3"
-            }
-            if self.vadField.stringValue.trimmingCharacters(in: .whitespaces).isEmpty {
-                self.vadField.stringValue = "\(Config.modelsDir)/ggml-silero-v5.1.2.bin"
-            }
-            self.csDownloadStatus.stringValue =
-                "✓ Models ready. Tick “Enable code-switching” above, then Save."
+            self.refreshAllModelRows()
         })
+    }
+
+    /// HEAD + hash the existing on-disk file and write the sidecar if it
+    /// matches. No re-download. Runs off the main queue because hashing 1 GB
+    /// is a few seconds.
+    private func startAdopt(_ model: Model, key: String) {
+        guard inflightModelKey == nil else { return }
+        modelRows[key]?.status.stringValue = "Verifying (HEAD + SHA256)…"
+        modelRows[key]?.action.isEnabled = false
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            _ = ModelDownloader.adopt(model)
+            DispatchQueue.main.async { self?.refreshModelRow(key) }
+        }
+    }
+
+    /// Re-hash an already-verified file against the cached sidecar etag.
+    /// Catches local file corruption since the last verify. Same background
+    /// dispatch as adopt.
+    private func startReverify(_ model: Model, key: String) {
+        guard inflightModelKey == nil else { return }
+        modelRows[key]?.status.stringValue = "Re-hashing…"
+        modelRows[key]?.action.isEnabled = false
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            _ = ModelDownloader.health(for: [model])
+            DispatchQueue.main.async { self?.refreshModelRow(key) }
+        }
     }
 
     @objc private func checkForUpdates() {
@@ -739,33 +912,29 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         cfg.requireTriggerApp = requireTeams.state == .on
         cfg.endGraceSeconds = Double(endGrace.stringValue) ?? cfg.endGraceSeconds
         cfg.minCallSeconds = Double(minCall.stringValue) ?? cfg.minCallSeconds
-        cfg.whisperModel = whisperModelField.stringValue.trimmingCharacters(in: .whitespaces)
+        // Single-mode whisper model comes from the popup; falls back to the
+        // existing config value if the user selected the "Custom" sentinel.
+        if let m = whisperModelPopup.selectedItem?.representedObject as? Model {
+            cfg.whisperModel = m.destPath
+        }
         cfg.language = languageBox.stringValue.trimmingCharacters(in: .whitespaces)
         cfg.cleanTranscript = cleanTranscript.state == .on
         cfg.initialPrompt = promptView.string
-        cfg.vadModel = vadField.stringValue.trimmingCharacters(in: .whitespaces)
+        // VAD model is always the manifest path now (single source of truth).
+        cfg.vadModel = Models.sileroVAD.destPath
         cfg.summaryModel = summaryBox.stringValue.trimmingCharacters(in: .whitespaces)
         cfg.claudeBinary = claudeField.stringValue.trimmingCharacters(in: .whitespaces)
         cfg.autoCheckUpdates = autoUpdateCheck.state == .on
 
-        // Code-switching (start from loadRaw so advanced keys are preserved).
-        cfg.codeSwitch.enabled = csEnable.state == .on
-        let langs = csLanguages.stringValue
-            .split(whereSeparator: { $0 == "," || $0 == " " })
-            .map { $0.lowercased() }.filter { !$0.isEmpty }
-        if langs.count >= 2 { cfg.codeSwitch.languages = langs }
+        // Mode toggles codeSwitch.enabled. The advanced codeswitch values
+        // (prompts, smoothing knobs) are preserved untouched — they round-trip
+        // through cfg loaded above. Only the user-facing knobs are written here.
+        cfg.codeSwitch.enabled = modePopup.indexOfSelectedItem == 1
+        cfg.codeSwitch.languages = ["sv", "en"]
         cfg.codeSwitch.dominantLanguage = csDominant.stringValue.trimmingCharacters(in: .whitespaces)
-        cfg.codeSwitch.modelPerLanguage["sv"] = csSvModel.stringValue.trimmingCharacters(in: .whitespaces)
-        cfg.codeSwitch.modelPerLanguage["en"] = csEnModel.stringValue.trimmingCharacters(in: .whitespaces)
+        cfg.codeSwitch.modelPerLanguage["sv"] = "kb-whisper-large"
+        cfg.codeSwitch.modelPerLanguage["en"] = "whisper-large-v3"
         cfg.codeSwitch.kbWhisperVariant = csVariant.stringValue.trimmingCharacters(in: .whitespaces)
-        cfg.codeSwitch.promptSv = csPromptSv.stringValue
-        cfg.codeSwitch.promptEn = csPromptEn.stringValue
-        if let v = Double(csPriorStrength.stringValue) {
-            cfg.codeSwitch.crossTrackPriorStrength = min(1.0, max(0.5, v))
-        }
-        if let v = Int(csMinSwitch.stringValue) { cfg.codeSwitch.minSwitchSegments = max(1, v) }
-        if let v = Int(csWindowMe.stringValue) { cfg.codeSwitch.smoothingWindowMe = max(1, v) }
-        if let v = Int(csWindowPart.stringValue) { cfg.codeSwitch.smoothingWindowParticipants = max(1, v) }
 
         if cfg.save() {
             onSave(Config.load())

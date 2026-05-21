@@ -112,7 +112,11 @@ final class AudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
     /// and the buffer never flushed to disk (the in-memory PCM is dropped
     /// and the session dir, if any, is removed). Replaces the post-hoc
     /// Engine-side `minCallSeconds` discard.
-    func stop() async -> Result? {
+    ///
+    /// Pass `discardIfBelowMinCallSeconds: false` for explicit-test paths
+    /// (`Engine.runTest`, `test-record`) where the user wants the captured
+    /// audio regardless of the short-call guard.
+    func stop(discardIfBelowMinCallSeconds: Bool = true) async -> Result? {
         if let s = stream { try? await s.stopCapture() }
         stream = nil
         // Fence in three stages: drain the SCK sample-handler queues so all
@@ -129,7 +133,7 @@ final class AudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
             let micDur = Double(bufferedMicFrames) / Double(outputSampleRate)
             let sysDur = Double(bufferedSystemFrames) / Double(outputSampleRate)
             let dur = max(micDur, sysDur)
-            if dur < config.minCallSeconds {
+            if discardIfBelowMinCallSeconds && dur < config.minCallSeconds {
                 bufferQueue.sync {
                     bufferedMicSamples.removeAll(keepingCapacity: false)
                     bufferedSystemSamples.removeAll(keepingCapacity: false)
@@ -137,9 +141,10 @@ final class AudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
                 Log.info("Call too short (\(Int(dur))s) — discarded from memory; nothing written to disk.")
                 return nil
             }
-            // Crossed the threshold: flush now. The flush itself pre-pads
-            // the shorter side with silence so me.wav and participants.wav
-            // start at the same wall-clock instant.
+            // Either crossed the threshold or the caller asked us not to
+            // discard. Flush now; the flush itself pre-pads the shorter side
+            // with silence so me.wav and participants.wav start at the same
+            // wall-clock instant.
             bufferQueue.sync { flushBufferToDiskLocked() }
         }
 
