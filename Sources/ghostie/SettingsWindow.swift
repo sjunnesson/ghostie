@@ -238,12 +238,18 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
 
     private func startSidebarTick() {
         sidebarTick?.invalidate()
-        sidebarTick = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+        // `.common` mode (not the default `.default`-only mode that
+        // `Timer.scheduledTimer` installs) so the tick keeps firing when the
+        // window isn't key — e.g. user clicks into another app while the
+        // Settings window is still visible on screen.
+        let t = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
             guard let self, let engine = self.engine else { return }
             if case .recording = engine.state {
                 self.sidebar?.refreshStatus(engine.state, perms: PermissionsState.current)
             }
         }
+        RunLoop.main.add(t, forMode: .common)
+        sidebarTick = t
     }
 
     /// Block any resize that isn't the user dragging the corner handle.
@@ -1879,10 +1885,15 @@ private final class ListeningPane: NSView {
         refreshAdvanced()
 
         // Per-second tick to keep the elapsed time accurate while recording.
-        timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+        // `.common` mode so the tile keeps updating when the window isn't
+        // key (e.g. the user clicks into another app with Settings still
+        // visible). `Timer.scheduledTimer` would install on `.default` only.
+        let t = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
             guard let self else { return }
             self.refreshLiveStatus(self.engineState())
         }
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
     }
 
     func refreshPermissions() {
