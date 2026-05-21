@@ -123,9 +123,21 @@ final class MenuBarApp: NSObject, NSApplicationDelegate {
         refreshLastNote()
     }
 
+    /// Transparent 1×1 placeholder. Assigning this as a menu item's image
+    /// overrides macOS Sonoma+'s auto-attached glyphs (the gear that gets
+    /// stuck onto the Settings… item via title + `,` heuristics). `image =
+    /// nil` leaves the system glyph in place; an explicit empty NSImage
+    /// wins.
+    private static let blankIcon: NSImage = {
+        let img = NSImage(size: NSSize(width: 1, height: 1))
+        img.lockFocus(); img.unlockFocus()
+        return img
+    }()
+
     private func item(_ title: String, _ sel: Selector, key: String = "") -> NSMenuItem {
         let i = NSMenuItem(title: title, action: sel, keyEquivalent: key)
         i.target = self
+        i.image = Self.blankIcon
         return i
     }
 
@@ -141,7 +153,11 @@ final class MenuBarApp: NSObject, NSApplicationDelegate {
         // re-check on every render so revocation surfaces within a second.
         axWarningItem.isHidden = AXIsProcessTrusted()
 
-        // Always the ghost; its tint conveys state.
+        // Always the ghost; its tint conveys state. Keep it as a template so
+        // `contentTintColor` actually applies — without that the menu-bar
+        // button falls back to the raw black pixels we draw in
+        // `GhostIcon.menuBarImage()`, which were invisible on a dark menu
+        // bar when state was `.processing` (orange tint never took effect).
         let color: NSColor? = {
             switch state {
             case .recording:  return .systemRed
@@ -151,7 +167,7 @@ final class MenuBarApp: NSObject, NSApplicationDelegate {
             }
         }()
         let img = GhostIcon.menuBarImage()
-        img.isTemplate = (color == nil)
+        img.isTemplate = true
         statusItem.button?.image = img
         statusItem.button?.contentTintColor = color
     }
