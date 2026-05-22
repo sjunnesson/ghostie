@@ -3,16 +3,16 @@
   "keepAudio": false,
   "saveTranscript": true,
 
-  "triggerBundlePrefixes": ["com.microsoft.teams"],
+  "triggerBundleIds": ["com.microsoft.teams", "com.microsoft.teams2"],
   "requireTriggerApp": true,
   "pollIntervalSeconds": 2.0,
-  "endGraceSeconds": 12.0,
+  "endGraceSeconds": 30.0,
   "minCallSeconds": 20.0,
 
   "whisperBinary": "",
   "whisperModel": "/Users/YOU/.ghostie/models/ggml-base.en.bin",
   "language": "en",
-  "initialPrompt": "",
+  "initialPrompt": "The following is a professional Microsoft Teams business call with clear punctuation and capitalization.",
   "vadModel": "/Users/YOU/.ghostie/models/ggml-silero-v5.1.2.bin",
   "cleanTranscript": true,
 
@@ -36,8 +36,13 @@
     "promptEn": "Business call in English. Terms: Ingka, Xplore, IKEA, IFB, MCP, ACP."
   },
 
+  "summaryProvider": "claude",
   "summaryModel": "claude-sonnet-4-6",
   "claudeBinary": "",
+  "ollamaUrl": "http://localhost:11434",
+  "ollamaModel": "",
+
+  "autoCheckUpdates": true,
 
   "workDir": "/Users/YOU/.ghostie/recordings"
 }

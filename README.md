@@ -40,10 +40,11 @@ meeting** — automatically transcribes each call and writes a markdown summary
    guard** (see below). The two tracks are merged by timestamp and labelled
    **Me** vs **Participants**.
 
-4. **Summarize.** The transcript is sent through the **Claude Code CLI**
-   (`claude -p`) using your existing Claude Code login (no API key) and
-   turned into a structured markdown note: Context, Participants, Discussion,
-   Decisions, Action Items, Open Questions, Summary.
+4. **Summarize.** The transcript is turned into a structured markdown note —
+   Context, Participants, Discussion, Decisions, Action Items, Open Questions,
+   Summary — by your chosen summarizer: the **Claude Code CLI** (`claude -p`,
+   using your existing Claude Code login, no API key) or a **local Ollama
+   model** (nothing leaves the machine). See [Summarization](#summarization).
 
 5. **Save.** `~/Documents/Teams Call Notes/2026-05-16_14-03_Teams-Call.md`
    (plus a transcript file). Audio is deleted afterwards by default.
@@ -71,10 +72,12 @@ requirement on the receiving Mac is **macOS 15+**. Copy `build/Ghostie.dmg`
 to the other Mac, open it, drag **Ghostie** to **Applications**, launch it.
 If you didn't notarize, the first launch is **right-click ▸ Open** (one time).
 
-> Summaries use *your* Claude Code login, which can't be bundled. Until you run
-> `claude` once on that Mac to sign in, calls still record + transcribe and are
-> held in the [backlog](#never-loses-a-call-backlog); summaries backfill
-> automatically once Claude Code is available. No Anthropic API key needed.
+> With the default **Claude** summarizer, summaries use *your* Claude Code
+> login, which can't be bundled. Until you run `claude` once on that Mac to
+> sign in, calls still record + transcribe and are held in the
+> [backlog](#never-loses-a-call-backlog); summaries backfill automatically once
+> Claude Code is available. No Anthropic API key needed. (Or switch to the
+> local **Ollama** summarizer in Settings — see [Summarization](#summarization).)
 
 Notarizing needs a one-time credential store on the build machine:
 
@@ -129,8 +132,9 @@ and its menu gives quick access to everything:
 - **Run 15-Second Test** (verifies the whole pipeline)
 - **Settings…** (`⌘,`) — a real settings window for the notes folder, audio
   options, detection timing, whisper model/language/prompt, VAD, hallucination
-  guard, and the Claude CLI path & model. Saving applies immediately (no
-  restart) and an *Open config.json* button remains for power users.
+  guard, and the summarizer (Claude CLI path & model, or the Ollama server URL
+  & model). Saving applies immediately (no restart) and an *Open config.json*
+  button remains for power users.
 - **Diagnostics**
 - **Start at Login** (registers a launch item via `SMAppService`)
 - **Quit** (finishes any in-progress summary first)
@@ -247,6 +251,25 @@ models just live in `~/.ghostie/models/` and are larger.
 3-run split, cross-track flip vs. isolated fall-back) with synthetic
 detections — no audio or models required, so it stays green everywhere.
 
+## Summarization
+
+The structured note is written by a **summarization provider**, chosen in
+*Settings ▸ Summary* (or `summaryProvider` in `config.json`). Two ship:
+
+- **Claude** (default) — shells out to the **Claude Code CLI** (`claude -p`)
+  using your existing Claude Code login. No Anthropic API key. Best note
+  quality. The text transcript is sent to Anthropic under your own account.
+- **Ollama** — POSTs the transcript to a local (or LAN)
+  [Ollama](https://ollama.com) server, so it **never leaves the machine**.
+  Set the server URL and pick a pulled model (e.g. `llama3.1:8b`) in Settings;
+  note quality tracks the model you run.
+
+Both providers share the same analyst prompt, so the note structure is
+identical either way. The selected provider is honoured **strictly** — if it
+fails, the call goes to the [backlog](#never-loses-a-call-backlog) and is
+retried; Ghostie never silently falls back to the other one. `ghostie doctor`
+reports whether the active provider is ready.
+
 ## Never loses a call (backlog)
 
 If a call can't be fully processed — whisper isn't set up, Claude Code isn't
@@ -281,8 +304,11 @@ Edit `~/.ghostie/config.json` (created on first run). Notable keys:
 | `cleanTranscript` | `true` | Run the hallucination guard |
 | `initialPrompt` | business-call primer | Biases whisper punctuation; `""` to disable |
 | `vadModel` | `…/ggml-silero-v5.1.2.bin` | Auto-used if present (`setup.sh --vad`) |
-| `summaryModel` | `claude-sonnet-4-6` | Model for `claude -p` (alias or full id) |
-| `claudeBinary` | _(auto-detected)_ | Path to the `claude` CLI |
+| `summaryProvider` | `claude` | Summarizer backend: `claude` (cloud) or `ollama` (local) |
+| `summaryModel` | `claude-sonnet-4-6` | Model for `claude -p` (alias or full id); `claude` provider only |
+| `claudeBinary` | _(auto-detected)_ | Path to the `claude` CLI; `claude` provider only |
+| `ollamaUrl` | `http://localhost:11434` | Ollama server URL (LAN host also fine); `ollama` provider only |
+| `ollamaModel` | _(empty)_ | Ollama model name from `ollama list`; `ollama` provider only |
 | `codeSwitch.enabled` | `false` | Per-segment dual-model sv↔en pipeline |
 | `codeSwitch.kbWhisperVariant` | `standard` | Swedish style: `standard`/`subtitle`/`strict` |
 | `codeSwitch.dominantLanguage` | `en` | Tiebreaker for ambiguous segments |
@@ -292,17 +318,21 @@ Edit `~/.ghostie/config.json` (created on first run). Notable keys:
 Environment overrides: `GHOSTIE_NOTES_FOLDER`, `GHOSTIE_WHISPER_MODEL`,
 `GHOSTIE_SUMMARY_MODEL`.
 
-Summaries use the **Claude Code CLI** (`claude -p`) with your existing Claude
-Code login — no Anthropic API key. Run `claude` once in a terminal to sign in;
-`ghostie doctor` confirms it's detected.
+With the default **Claude** provider, summaries use the Claude Code CLI
+(`claude -p`) and your existing Claude Code login — no Anthropic API key; run
+`claude` once in a terminal to sign in. With the **Ollama** provider they run
+fully locally. Either way `ghostie doctor` confirms the active provider is
+ready. See [Summarization](#summarization).
 
 ## Privacy
 
 - Audio capture and transcription are 100% local.
-- Only the **text transcript** is sent to Anthropic for summarization (via the
-  Claude Code CLI under your own account). Without Claude Code installed/logged
-  in you still get the full local transcript; no AI analysis is produced and
-  nothing leaves the machine.
+- With the default **Claude** summarizer, only the **text transcript** is sent
+  to Anthropic (via the Claude Code CLI under your own account). Without Claude
+  Code installed/logged in you still get the full local transcript; no AI
+  analysis is produced and nothing leaves the machine.
+- With the **Ollama** summarizer, summarization is also 100% local — the
+  transcript never leaves the machine running Ollama.
 - Recordings live in `~/.ghostie/recordings` only while processing and are
   deleted unless `keepAudio` is true.
 - **Be mindful of consent laws and your employer's policy before recording
