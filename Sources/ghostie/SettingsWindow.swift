@@ -173,10 +173,8 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         // from the title bar all the way down. The strip is still kept as a
         // 38 pt high slot so the traffic lights have a drag region and the
         // recording badge has somewhere to sit when a call is live.
-        let toolbar = NSView()
-        toolbar.translatesAutoresizingMaskIntoConstraints = false
-        toolbar.wantsLayer = true
-        toolbar.layer?.backgroundColor = Theme.contentBg.cgColor
+        let toolbar = ThemedLayerView()
+        toolbar.themeApply = { $0.layer?.backgroundColor = Theme.contentBg.cgColor }
         let toolbarBadge = StatusBadgeView(kind: .danger, label: "Recording")
         toolbarBadge.translatesAutoresizingMaskIntoConstraints = false
         toolbarBadge.isHidden = true
@@ -450,8 +448,6 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         // the top, not the bottom (same trick the old form used).
         let flipped = FlippedView()
         flipped.translatesAutoresizingMaskIntoConstraints = false
-        flipped.wantsLayer = true
-        flipped.layer?.backgroundColor = Theme.contentBg.cgColor
         flipped.addSubview(doc)
         doc.translatesAutoresizingMaskIntoConstraints = false
         // 4 pt top inset so the page title sits at the same y as the
@@ -750,49 +746,49 @@ enum Theme {
     static var sidebarBg: NSColor  { dyn(light: 0xF6F6F9, dark: 0x242426) }
     static var cardBorder: NSColor {
         NSColor(name: nil) { ap in
-            ap.name == .darkAqua
+            isDark(ap)
                 ? NSColor(white: 1, alpha: 0.07)
                 : NSColor(red: 60/255, green: 60/255, blue: 67/255, alpha: 0.14)
         }
     }
     static var rowDivider: NSColor {
         NSColor(name: nil) { ap in
-            ap.name == .darkAqua
+            isDark(ap)
                 ? NSColor(white: 1, alpha: 0.07)
                 : NSColor(red: 60/255, green: 60/255, blue: 67/255, alpha: 0.12)
         }
     }
     static var chipBg: NSColor {
         NSColor(name: nil) { ap in
-            ap.name == .darkAqua
+            isDark(ap)
                 ? NSColor(white: 1, alpha: 0.06)
                 : NSColor(red: 60/255, green: 60/255, blue: 67/255, alpha: 0.08)
         }
     }
     static var selectedItem: NSColor {
         NSColor(name: nil) { ap in
-            ap.name == .darkAqua
+            isDark(ap)
                 ? NSColor(white: 1, alpha: 0.10)
                 : NSColor(red: 60/255, green: 60/255, blue: 67/255, alpha: 0.12)
         }
     }
     static var text: NSColor {
         NSColor(name: nil) { ap in
-            ap.name == .darkAqua
+            isDark(ap)
                 ? NSColor(white: 1, alpha: 0.92)
                 : NSColor(white: 0, alpha: 0.86)
         }
     }
     static var text2: NSColor {
         NSColor(name: nil) { ap in
-            ap.name == .darkAqua
+            isDark(ap)
                 ? NSColor(red: 235/255, green: 235/255, blue: 245/255, alpha: 0.60)
                 : NSColor(red: 60/255, green: 60/255, blue: 67/255, alpha: 0.62)
         }
     }
     static var text3: NSColor {
         NSColor(name: nil) { ap in
-            ap.name == .darkAqua
+            isDark(ap)
                 ? NSColor(red: 235/255, green: 235/255, blue: 245/255, alpha: 0.35)
                 : NSColor(red: 60/255, green: 60/255, blue: 67/255, alpha: 0.35)
         }
@@ -815,8 +811,16 @@ enum Theme {
 
     private static func dyn(light: UInt32, dark: UInt32) -> NSColor {
         NSColor(name: nil) { ap in
-            ap.name == .darkAqua ? rgb(dark) : rgb(light)
+            isDark(ap) ? rgb(dark) : rgb(light)
         }
+    }
+    /// True when `ap` is any dark appearance. A plain `ap.name == .darkAqua`
+    /// check misses the *vibrant* variants (`.vibrantDark`) that AppKit hands
+    /// to views inside an `NSVisualEffectView` — e.g. the whole settings
+    /// sidebar, which is a vibrant `NSSplitViewItem` sidebar. `bestMatch`
+    /// collapses every dark/vibrant-dark variant onto `.darkAqua`.
+    private static func isDark(_ ap: NSAppearance) -> Bool {
+        ap.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
     }
     private static func rgb(_ hex: UInt32) -> NSColor {
         NSColor(red: CGFloat((hex >> 16) & 0xff) / 255,
@@ -828,21 +832,80 @@ enum Theme {
         NSColor(name: nil) { ap in
             let base: NSColor
             switch k {
-            case .ok:     base = ap.name == .darkAqua ? rgb(0x30D158) : rgb(0x1F9D55)
-            case .warn:   base = ap.name == .darkAqua ? rgb(0xFF9F0A) : rgb(0xB46300)
-            case .danger: base = ap.name == .darkAqua ? rgb(0xFF453A) : rgb(0xC93B32)
-            case .info:   base = ap.name == .darkAqua ? rgb(0x0A84FF) : rgb(0x0067CC)
-            case .accent: base = ap.name == .darkAqua ? rgb(0x7D7AFF) : rgb(0x5E5CE6)
+            case .ok:     base = isDark(ap) ? rgb(0x30D158) : rgb(0x1F9D55)
+            case .warn:   base = isDark(ap) ? rgb(0xFF9F0A) : rgb(0xB46300)
+            case .danger: base = isDark(ap) ? rgb(0xFF453A) : rgb(0xC93B32)
+            case .info:   base = isDark(ap) ? rgb(0x0A84FF) : rgb(0x0067CC)
+            case .accent: base = isDark(ap) ? rgb(0x7D7AFF) : rgb(0x5E5CE6)
             }
-            return base.withAlphaComponent(ap.name == .darkAqua ? 0.18 : 0.13)
+            return base.withAlphaComponent(isDark(ap) ? 0.18 : 0.13)
         }
     }
 }
 
 // MARK: - Primitives
 
+extension NSView {
+    /// Resolve a (possibly dynamic light/dark) `NSColor` to a `CGColor` in
+    /// *this view's* current effective appearance.
+    ///
+    /// Plain `NSColor.cgColor` snapshots whatever the ambient drawing
+    /// appearance happens to be at the moment of the call. That ambient value
+    /// is correct at launch but is **not** refreshed for you inside
+    /// `viewDidChangeEffectiveAppearance` — so a layer background assigned via
+    /// `Theme.x.cgColor` freezes at whatever mode the window first opened in
+    /// and never follows a system dark/light switch. Dynamic colors used
+    /// *directly* (text colors, image tints, `NSScrollView.backgroundColor`)
+    /// are fine because AppKit re-resolves those itself; only the `cgColor`
+    /// snapshots on `CALayer`s need this. Resolving inside the view's own
+    /// `effectiveAppearance` makes the snapshot track the switch.
+    func themedCG(_ color: NSColor) -> CGColor {
+        var cg = color.cgColor
+        effectiveAppearance.performAsCurrentDrawingAppearance { cg = color.cgColor }
+        return cg
+    }
+}
+
+/// A layer-backed `NSView` whose layer colors are re-resolved on every
+/// light/dark switch. A naked `NSView()` can't react to appearance changes;
+/// this one re-runs `themeApply` — both when first assigned and on every
+/// `viewDidChangeEffectiveAppearance` — with the view's current appearance
+/// installed as the drawing appearance, so plain `.cgColor` inside it resolves
+/// correctly.
+private final class ThemedLayerView: NSView {
+    var themeApply: ((ThemedLayerView) -> Void)? { didSet { refreshTheme() } }
+
+    init() {
+        super.init(frame: .zero)
+        wantsLayer = true
+        translatesAutoresizingMaskIntoConstraints = false
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        refreshTheme()
+    }
+    private func refreshTheme() {
+        guard let themeApply else { return }
+        effectiveAppearance.performAsCurrentDrawingAppearance { themeApply(self) }
+    }
+}
+
 private final class FlippedView: NSView {
     override var isFlipped: Bool { true }
+
+    init() {
+        super.init(frame: .zero)
+        wantsLayer = true
+        layer?.backgroundColor = themedCG(Theme.contentBg)
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        layer?.backgroundColor = themedCG(Theme.contentBg)
+    }
 }
 
 /// The little ghost in the sidebar brand row. Solid black silhouette from
@@ -948,10 +1011,10 @@ private final class GroupCard: NSView {
         stack.spacing = 0
         stack.translatesAutoresizingMaskIntoConstraints = false
         stack.wantsLayer = true
-        stack.layer?.backgroundColor = Theme.cardBg.cgColor
+        stack.layer?.backgroundColor = themedCG(Theme.cardBg)
         stack.layer?.cornerRadius = 10
         stack.layer?.borderWidth = 0.5
-        stack.layer?.borderColor = Theme.cardBorder.cgColor
+        stack.layer?.borderColor = themedCG(Theme.cardBorder)
         stack.layer?.masksToBounds = true
         stack.edgeInsets = .init()
 
@@ -978,8 +1041,8 @@ private final class GroupCard: NSView {
 
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
-        stack.layer?.backgroundColor = Theme.cardBg.cgColor
-        stack.layer?.borderColor = Theme.cardBorder.cgColor
+        stack.layer?.backgroundColor = themedCG(Theme.cardBg)
+        stack.layer?.borderColor = themedCG(Theme.cardBorder)
     }
 
     func addRow(_ row: NSView, last: Bool = false) {
@@ -1001,12 +1064,12 @@ private final class DividerView: NSView {
     init() {
         super.init(frame: .zero)
         wantsLayer = true
-        layer?.backgroundColor = Theme.rowDivider.cgColor
+        layer?.backgroundColor = themedCG(Theme.rowDivider)
     }
     required init?(coder: NSCoder) { fatalError() }
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
-        layer?.backgroundColor = Theme.rowDivider.cgColor
+        layer?.backgroundColor = themedCG(Theme.rowDivider)
     }
 }
 
@@ -1094,8 +1157,8 @@ private final class StatusBadgeView: NSView {
 
     private func apply() {
         let (bg, fg) = colors(for: kind)
-        layer?.backgroundColor = bg.cgColor
-        dot.layer?.backgroundColor = fg.cgColor
+        layer?.backgroundColor = themedCG(bg)
+        dot.layer?.backgroundColor = themedCG(fg)
         dot.layer?.cornerRadius = 3
         // NSTextField redraws on every stringValue/textColor assignment even
         // when the value hasn't changed, which cascades back into our redraw
@@ -1113,8 +1176,8 @@ private final class StatusBadgeView: NSView {
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
         let (bg, fg) = colors(for: kind)
-        layer?.backgroundColor = bg.cgColor
-        dot.layer?.backgroundColor = fg.cgColor
+        layer?.backgroundColor = themedCG(bg)
+        dot.layer?.backgroundColor = themedCG(fg)
         text.textColor = fg
     }
 
@@ -1184,8 +1247,7 @@ private final class RowBuilder {
                 .withSymbolConfiguration(.init(pointSize: 13, weight: .regular))
         }
         if let image = leadingImage ?? symbolImage {
-            let tile = NSView()
-            tile.translatesAutoresizingMaskIntoConstraints = false
+            let tile = ThemedLayerView()
             let iv = NSImageView()
             iv.translatesAutoresizingMaskIntoConstraints = false
             iv.image = image
@@ -1210,8 +1272,7 @@ private final class RowBuilder {
                     iv.trailingAnchor.constraint(equalTo: tile.trailingAnchor)
                 ])
             } else {
-                tile.wantsLayer = true
-                tile.layer?.backgroundColor = (leadingTint ?? Theme.chipBg).cgColor
+                tile.themeApply = { $0.layer?.backgroundColor = (leadingTint ?? Theme.chipBg).cgColor }
                 tile.layer?.cornerRadius = 6
                 NSLayoutConstraint.activate([
                     tile.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 14),
@@ -1375,13 +1436,13 @@ private final class StyledButton: NSButton {
     /// changed, otherwise this would recurse forever — setting `attributedTitle`
     /// inside `updateLayer()` marks the button for redisplay, which re-fires
     /// `updateLayer()`, allocating a new NSAttributedString each loop until the
-    /// process eats all available memory. NSColor.cgColor evaluates in the
-    /// current effective appearance, so calling this from
-    /// `viewDidChangeEffectiveAppearance` is enough for light/dark switching.
+    /// process eats all available memory. Layer colors go through `themedCG`
+    /// so they re-resolve correctly when called from
+    /// `viewDidChangeEffectiveAppearance` on a light/dark switch.
     private func restyle() {
         let (bg, fg, border) = colors()
-        layer?.backgroundColor = bg.cgColor
-        layer?.borderColor = border.cgColor
+        layer?.backgroundColor = themedCG(bg)
+        layer?.borderColor = themedCG(border)
         if cachedTitle != title || cachedFg != fg {
             cachedTitle = title
             cachedFg = fg
@@ -1447,6 +1508,9 @@ private final class Sidebar: NSView {
     private var itemRows: [PaneId: SidebarItem] = [:]
     private let statusDot = NSView()
     private let statusLabel = NSTextField(labelWithString: "")
+    /// Last status-dot color, kept so a light/dark switch can re-resolve the
+    /// `cgColor` snapshot without waiting for the next engine state change.
+    private var statusDotColor: NSColor = Theme.text3
     private weak var engine: Engine?
 
     init(paneOrder: [PaneId], paneBottom: [PaneId], initialPane: PaneId,
@@ -1458,14 +1522,15 @@ private final class Sidebar: NSView {
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
         wantsLayer = true
-        layer?.backgroundColor = Theme.sidebarBg.cgColor
+        layer?.backgroundColor = themedCG(Theme.sidebarBg)
         build(selecting: initialPane)
     }
     required init?(coder: NSCoder) { fatalError() }
 
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
-        layer?.backgroundColor = Theme.sidebarBg.cgColor
+        layer?.backgroundColor = themedCG(Theme.sidebarBg)
+        statusDot.layer?.backgroundColor = themedCG(statusDotColor)
     }
 
     private func build(selecting initial: PaneId) {
@@ -1641,19 +1706,20 @@ private final class Sidebar: NSView {
     func refreshStatus(_ state: EngineState, perms: PermissionsState) {
         switch state {
         case .paused:
-            statusDot.layer?.backgroundColor = Theme.text3.cgColor
+            statusDotColor = Theme.text3
             statusLabel.stringValue = "Paused"
         case .watching:
-            statusDot.layer?.backgroundColor = Theme.ok.cgColor
+            statusDotColor = Theme.ok
             statusLabel.stringValue = "Watching"
         case .recording(let since):
-            statusDot.layer?.backgroundColor = Theme.danger.cgColor
+            statusDotColor = Theme.danger
             let secs = Int(Date().timeIntervalSince(since))
             statusLabel.stringValue = String(format: "Recording · %02d:%02d", secs / 60, secs % 60)
         case .processing:
-            statusDot.layer?.backgroundColor = Theme.info.cgColor
+            statusDotColor = Theme.info
             statusLabel.stringValue = "Summarizing"
         }
+        statusDot.layer?.backgroundColor = themedCG(statusDotColor)
         itemRows[.listening]?.setBadge(perms.allRequiredGranted ? nil : .warn)
     }
 }
@@ -1724,7 +1790,7 @@ private final class SidebarItem: NSView {
     /// sidebar legible whether the user toggles dark mode at launch or
     /// mid-session.
     private func applyTheme() {
-        layer?.backgroundColor = active ? Theme.selectedItem.cgColor : NSColor.clear.cgColor
+        layer?.backgroundColor = active ? themedCG(Theme.selectedItem) : NSColor.clear.cgColor
         icon.contentTintColor = active ? Theme.accent : .secondaryLabelColor
         label.textColor = .labelColor
         label.font = .systemFont(ofSize: 13, weight: active ? .semibold : .medium)
@@ -1741,10 +1807,8 @@ private final class SidebarItem: NSView {
     func setBadge(_ kind: BadgeKind?) {
         badge.subviews.forEach { $0.removeFromSuperview() }
         guard let kind else { return }
-        let dot = NSView()
-        dot.translatesAutoresizingMaskIntoConstraints = false
-        dot.wantsLayer = true
-        dot.layer?.backgroundColor = (kind == .warn ? Theme.warn : Theme.danger).cgColor
+        let dot = ThemedLayerView()
+        dot.themeApply = { $0.layer?.backgroundColor = (kind == .warn ? Theme.warn : Theme.danger).cgColor }
         dot.layer?.cornerRadius = 4
         badge.addSubview(dot)
         NSLayoutConstraint.activate([
@@ -1767,7 +1831,7 @@ private final class SidebarItem: NSView {
         trackingArea = area
     }
     override func mouseEntered(with event: NSEvent) {
-        if !active { layer?.backgroundColor = Theme.chipBg.cgColor }
+        if !active { layer?.backgroundColor = themedCG(Theme.chipBg) }
     }
     override func mouseExited(with event: NSEvent) {
         if !active { layer?.backgroundColor = NSColor.clear.cgColor }
@@ -2045,6 +2109,14 @@ private final class LiveStatusRow: NSView {
     private let tile = NSView()
     private let symbol = NSImageView()
     private var pulseLayer: CAShapeLayer?
+    /// Last tile color, kept so a light/dark switch can re-resolve the
+    /// `cgColor` snapshot — the tile color otherwise only refreshes on the
+    /// next engine state change.
+    private var tileBg: NSColor = Theme.chipBg
+    private func setTileBg(_ c: NSColor) {
+        tileBg = c
+        tile.layer?.backgroundColor = themedCG(c)
+    }
     private let title = NSTextField(labelWithString: "")
     private let timeMono = NSTextField(labelWithString: "")
     private let detail = NSTextField(labelWithString: "")
@@ -2119,7 +2191,7 @@ private final class LiveStatusRow: NSView {
         if case .recording = state { startPulse() } else { stopPulse() }
         switch state {
         case .recording(let since):
-            tile.layer?.backgroundColor = Theme.dangerSoft.cgColor
+            setTileBg(Theme.dangerSoft)
             symbol.image = NSImage(systemSymbolName: "record.circle",
                                    accessibilityDescription: nil)?
                 .withSymbolConfiguration(.init(pointSize: 18, weight: .regular))
@@ -2132,7 +2204,7 @@ private final class LiveStatusRow: NSView {
             button.title = "Pause listening"
             button.kind = .ghost
         case .watching:
-            tile.layer?.backgroundColor = Theme.okSoft.cgColor
+            setTileBg(Theme.okSoft)
             symbol.image = NSImage(systemSymbolName: "mic",
                                    accessibilityDescription: nil)?
                 .withSymbolConfiguration(.init(pointSize: 18, weight: .regular))
@@ -2144,7 +2216,7 @@ private final class LiveStatusRow: NSView {
             button.title = "Pause listening"
             button.kind = .ghost
         case .processing:
-            tile.layer?.backgroundColor = Theme.infoSoft.cgColor
+            setTileBg(Theme.infoSoft)
             symbol.image = NSImage(systemSymbolName: "sparkles",
                                    accessibilityDescription: nil)?
                 .withSymbolConfiguration(.init(pointSize: 18, weight: .regular))
@@ -2156,7 +2228,7 @@ private final class LiveStatusRow: NSView {
             button.title = "Pause listening"
             button.kind = .ghost
         case .paused:
-            tile.layer?.backgroundColor = Theme.chipBg.cgColor
+            setTileBg(Theme.chipBg)
             symbol.image = NSImage(systemSymbolName: "pause.fill",
                                    accessibilityDescription: nil)?
                 .withSymbolConfiguration(.init(pointSize: 18, weight: .regular))
@@ -2202,6 +2274,11 @@ private final class LiveStatusRow: NSView {
         pulseLayer?.removeFromSuperlayer()
         pulseLayer = nil
     }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        tile.layer?.backgroundColor = themedCG(tileBg)
+    }
 }
 
 private final class ActionTarget {
@@ -2214,14 +2291,23 @@ private final class ActionTarget {
 // MARK: - Permissions banner
 
 private final class PermissionsBanner: NSView {
+    /// Re-resolves every layer `cgColor` in the banner — its own border/fill
+    /// plus the warning badge and the inner card — on a light/dark switch.
+    private var themeRefresh: (() -> Void)?
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        effectiveAppearance.performAsCurrentDrawingAppearance { themeRefresh?() }
+    }
+
     init(state: PermissionsState) {
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
         wantsLayer = true
         layer?.cornerRadius = 12
         layer?.borderWidth = 0.5
-        layer?.borderColor = Theme.warn.cgColor
-        layer?.backgroundColor = Theme.warnSoft.cgColor
+        layer?.borderColor = themedCG(Theme.warn)
+        layer?.backgroundColor = themedCG(Theme.warnSoft)
         layer?.masksToBounds = true
 
         // Header.
@@ -2231,7 +2317,7 @@ private final class PermissionsBanner: NSView {
         badge.translatesAutoresizingMaskIntoConstraints = false
         badge.wantsLayer = true
         badge.layer?.cornerRadius = 13
-        badge.layer?.backgroundColor = Theme.warn.cgColor
+        badge.layer?.backgroundColor = themedCG(Theme.warn)
         let bang = NSImageView()
         bang.translatesAutoresizingMaskIntoConstraints = false
         bang.image = NSImage(systemSymbolName: "exclamationmark.triangle.fill",
@@ -2274,8 +2360,15 @@ private final class PermissionsBanner: NSView {
         inner.spacing = 0
         inner.translatesAutoresizingMaskIntoConstraints = false
         inner.wantsLayer = true
-        inner.layer?.backgroundColor = Theme.cardBg.cgColor
+        inner.layer?.backgroundColor = themedCG(Theme.cardBg)
         addSubview(inner)
+
+        themeRefresh = { [weak self, weak badge, weak inner] in
+            self?.layer?.borderColor = Theme.warn.cgColor
+            self?.layer?.backgroundColor = Theme.warnSoft.cgColor
+            badge?.layer?.backgroundColor = Theme.warn.cgColor
+            inner?.layer?.backgroundColor = Theme.cardBg.cgColor
+        }
 
         NSLayoutConstraint.activate([
             header.leadingAnchor.constraint(equalTo: leadingAnchor),
@@ -2407,8 +2500,8 @@ private final class WarningCard: NSView {
         wantsLayer = true
         layer?.cornerRadius = 10
         layer?.borderWidth = 0.5
-        layer?.borderColor = Theme.warn.cgColor
-        layer?.backgroundColor = Theme.warnSoft.cgColor
+        layer?.borderColor = themedCG(Theme.warn)
+        layer?.backgroundColor = themedCG(Theme.warnSoft)
         let t = NSTextField(labelWithString: title)
         t.font = .systemFont(ofSize: 13, weight: .semibold)
         t.textColor = Theme.text
@@ -2430,6 +2523,12 @@ private final class WarningCard: NSView {
         ])
     }
     required init?(coder: NSCoder) { fatalError() }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        layer?.borderColor = themedCG(Theme.warn)
+        layer?.backgroundColor = themedCG(Theme.warnSoft)
+    }
 }
 
 // MARK: - Pane: Notes
@@ -3034,9 +3133,9 @@ private final class ProgressBar: NSView {
         super.init(frame: .zero)
         wantsLayer = true
         layer?.cornerRadius = 2
-        layer?.backgroundColor = Theme.chipBg.cgColor
+        layer?.backgroundColor = themedCG(Theme.chipBg)
         layer?.masksToBounds = true
-        fillLayer.backgroundColor = Theme.accent.cgColor
+        fillLayer.backgroundColor = themedCG(Theme.accent)
         fillLayer.cornerRadius = 2
         layer?.addSublayer(fillLayer)
     }
@@ -3055,8 +3154,8 @@ private final class ProgressBar: NSView {
     }
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
-        layer?.backgroundColor = Theme.chipBg.cgColor
-        fillLayer.backgroundColor = Theme.accent.cgColor
+        layer?.backgroundColor = themedCG(Theme.chipBg)
+        fillLayer.backgroundColor = themedCG(Theme.accent)
     }
     func set(progress: Double) {
         let p = CGFloat(max(0, min(1, progress)))
@@ -3386,6 +3485,17 @@ private final class UpdatesPane: NSView {
     private let changes: ((inout Config) -> Void) -> Void
 
     private let heroTile = NSView()
+    /// Last hero-tile color, kept so a light/dark switch can re-resolve the
+    /// `cgColor` snapshot without waiting for the next `show(status:)`.
+    private var heroBg: NSColor = Theme.chipBg
+    private func setHeroBg(_ c: NSColor) {
+        heroBg = c
+        heroTile.layer?.backgroundColor = themedCG(c)
+    }
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        heroTile.layer?.backgroundColor = themedCG(heroBg)
+    }
     private let heroSymbol = NSImageView()
     private let heroTitle = NSTextField(labelWithString: "")
     // Wrapping label — when the unsupported-build hero subtitle is set
@@ -3554,7 +3664,7 @@ private final class UpdatesPane: NSView {
     func show(status: DisplayStatus) {
         switch status {
         case .unknown(let v):
-            heroTile.layer?.backgroundColor = Theme.chipBg.cgColor
+            setHeroBg(Theme.chipBg)
             heroSymbol.image = NSImage(systemSymbolName: "arrow.clockwise",
                                        accessibilityDescription: nil)?
                 .withSymbolConfiguration(.init(pointSize: 20, weight: .regular))
@@ -3563,7 +3673,7 @@ private final class UpdatesPane: NSView {
             heroSub.stringValue = "Click Check now to see if there's a newer release."
             checkBtn.title = "Check now"
         case .upToDate(let v):
-            heroTile.layer?.backgroundColor = Theme.okSoft.cgColor
+            setHeroBg(Theme.okSoft)
             heroSymbol.image = NSImage(systemSymbolName: "checkmark",
                                        accessibilityDescription: nil)?
                 .withSymbolConfiguration(.init(pointSize: 22, weight: .semibold))
@@ -3572,7 +3682,7 @@ private final class UpdatesPane: NSView {
             heroSub.stringValue = "Ghostie \(v)"
             checkBtn.title = "Check now"
         case .available(let from, let to, _):
-            heroTile.layer?.backgroundColor = Theme.infoSoft.cgColor
+            setHeroBg(Theme.infoSoft)
             heroSymbol.image = NSImage(systemSymbolName: "arrow.down.circle",
                                        accessibilityDescription: nil)?
                 .withSymbolConfiguration(.init(pointSize: 22, weight: .semibold))
@@ -3581,7 +3691,7 @@ private final class UpdatesPane: NSView {
             heroSub.stringValue = "\(from) → \(to)"
             checkBtn.title = "Update"
         case .unsupported:
-            heroTile.layer?.backgroundColor = Theme.warnSoft.cgColor
+            setHeroBg(Theme.warnSoft)
             heroSymbol.image = NSImage(systemSymbolName: "exclamationmark.triangle",
                                        accessibilityDescription: nil)?
                 .withSymbolConfiguration(.init(pointSize: 22, weight: .semibold))
@@ -3597,7 +3707,7 @@ private final class UpdatesPane: NSView {
             checkBtn.action = #selector(ActionTarget.fire)
             objc_setAssociatedObject(checkBtn, &ActionTarget.key, target, .OBJC_ASSOCIATION_RETAIN)
         case .failed(let e):
-            heroTile.layer?.backgroundColor = Theme.dangerSoft.cgColor
+            setHeroBg(Theme.dangerSoft)
             heroSymbol.image = NSImage(systemSymbolName: "xmark.circle",
                                        accessibilityDescription: nil)?
                 .withSymbolConfiguration(.init(pointSize: 22, weight: .semibold))
