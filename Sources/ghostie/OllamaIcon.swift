@@ -127,25 +127,42 @@ enum OllamaIcon {
     /// black on light backgrounds, white on dark. Resolved in this order:
     ///   1. `Bundle.main.resourceURL` — what `build-app.sh` populates inside
     ///      `Ghostie.app/Contents/Resources/ollama.png`. Production path.
-    ///   2. `Bundle.module` — the SwiftPM resource bundle, used by
-    ///      `swift run` and `swift test`.
+    ///   2. The SwiftPM resource bundle (`ghostie_ghostie.bundle`) sitting
+    ///      next to the executable — the `swift run` / `swift build` path.
     ///   3. The drawn silhouette — last-resort fallback so a stripped-down
     ///      checkout still has a recognizable icon.
+    ///
+    /// **Do not use the synthesized `Bundle.module` here.** Its generated
+    /// accessor calls `fatalError` when the resource bundle can't be found,
+    /// and `build-app.sh` does not copy `ghostie_ghostie.bundle` into the
+    /// distributed `.app`. On any machine other than the one that produced
+    /// the build, `Bundle.module` therefore crashes the whole process — see
+    /// the Settings → Summary → Ollama crash this method previously caused.
+    /// `Bundle(path:)` below returns `nil` instead of trapping.
     ///
     /// The image keeps its native aspect ratio; the caller is expected to
     /// pin one dimension (typically `heightAnchor`) and let `NSImageView`
     /// proportionally scale the other.
     static func templateImage() -> NSImage {
-        let candidates: [URL?] = [
-            Bundle.main.resourceURL?.appendingPathComponent("ollama.png"),
-            Bundle.module.url(forResource: "ollama", withExtension: "png")
-        ]
-        for case let url? in candidates where FileManager.default.fileExists(atPath: url.path) {
-            if let img = NSImage(contentsOf: url) {
-                img.isTemplate = true
-                return img
-            }
+        // 1. Production .app: ollama.png copied straight into Contents/Resources.
+        if let url = Bundle.main.resourceURL?.appendingPathComponent("ollama.png"),
+           FileManager.default.fileExists(atPath: url.path),
+           let img = NSImage(contentsOf: url) {
+            img.isTemplate = true
+            return img
         }
+        // 2. `swift run` / `swift build`: the SwiftPM resource bundle is
+        //    emitted next to the executable. Resolve it with `Bundle(path:)`
+        //    (optional-returning, never traps) rather than `Bundle.module`.
+        let sidecar = Bundle.main.bundleURL
+            .appendingPathComponent("ghostie_ghostie.bundle")
+        if let bundle = Bundle(path: sidecar.path),
+           let url = bundle.url(forResource: "ollama", withExtension: "png"),
+           let img = NSImage(contentsOf: url) {
+            img.isTemplate = true
+            return img
+        }
+        // 3. Last resort: the drawn silhouette.
         return drawnTemplateImage(pointSize: 24)
     }
 }
