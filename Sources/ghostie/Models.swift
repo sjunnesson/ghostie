@@ -68,7 +68,12 @@ enum Models {
     /// `fetch-models` subcommand.
     static func required(for config: Config) -> [Model] {
         var out: [Model] = []
-        if config.codeSwitch.enabled {
+        // v2: the user's intent to use code-switching is signalled by
+        // `cs.languages.count >= 2`. The pipeline only actually code-switches
+        // when ≥2 are installed (see `Pipeline.swift`), so this is the
+        // "what should be downloaded to bootstrap the configured intent"
+        // signal, not the "is code-switching active right now" signal.
+        if config.codeSwitch.languages.count >= 2 {
             if let kb = kbWhisperLarge(variant: config.codeSwitch.kbWhisperVariant) {
                 out.append(kb)
             }
@@ -80,6 +85,51 @@ enum Models {
         }
         return out
     }
+
+    /// What's currently on disk under `~/.ghostie/models/`, grouped by the
+    /// language each model is best at. Foundation of the v2 code-switching
+    /// pipeline: the **set of languages the pipeline is allowed to label
+    /// audio with is whatever this returns** — no `codeSwitch.languages`
+    /// override, no "configured for sv but no Swedish model installed"
+    /// failure mode. Adding entries to `installedCandidates` below is how
+    /// new languages join the install; the pipeline reads from
+    /// `InstalledModels`, never from this raw list.
+    ///
+    /// Pre-v2 call sites (`Models.required(for:)`, Settings, MenuBar) keep
+    /// working unchanged; this is purely additive in PR 0.
+    static func installed() -> InstalledModels {
+        let fm = FileManager.default
+        var candidates: [(String, Model)] = []
+        if let kb = kbWhisperLarge(variant: "standard") { candidates.append(("sv", kb)) }
+        if let kb = kbWhisperLarge(variant: "strict")   { candidates.append(("sv", kb)) }
+        candidates.append(("en", largeV3))
+        candidates.append(("en", baseEnglish))
+        // New per-language fine-tunes (no, da, de, …) get appended here as
+        // they're added to the registry above. First match per language wins.
+
+        var perLanguage: [String: String] = [:]
+        for (lang, m) in candidates where perLanguage[lang] == nil {
+            if fm.fileExists(atPath: m.destPath) {
+                perLanguage[lang] = m.destPath
+            }
+        }
+        return InstalledModels(perLanguage: perLanguage)
+    }
+}
+
+/// A read-only view of "which whisper models are available on this machine,
+/// grouped by language". The v2 code-switching pipeline lifts its language
+/// whitelist directly from `languages`; removing a model removes the language
+/// with no config edit needed.
+struct InstalledModels {
+    /// language code → absolute GGML path. Empty == no whisper model on disk.
+    let perLanguage: [String: String]
+
+    /// Languages this install can decode. Sorted for stable doctor / log output.
+    var languages: [String] { perLanguage.keys.sorted() }
+
+    /// GGML path for `lang`, or nil if no model for that language is on disk.
+    func modelPath(for lang: String) -> String? { perLanguage[lang] }
 }
 
 /// What we last knew about a successfully-downloaded model. Lives next to the

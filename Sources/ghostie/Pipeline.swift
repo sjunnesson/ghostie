@@ -195,9 +195,17 @@ struct Pipeline {
             }
         }
 
-        if config.codeSwitch.enabled {
-            Log.info("Code-switching transcription enabled (sv↔en, dual-model).")
-            let cst = CodeSwitchTranscriber(config: config)
+        // Codeswitch is taken whenever ≥2 per-language whisper models are
+        // installed on disk. With one model, the single-language path runs
+        // exactly as it did pre-v2. Users control behaviour by what they
+        // install, not by a Settings toggle — the disk IS the whitelist.
+        let installed = Models.installed()
+        let cs = config.codeSwitch
+        let active = cs.effectiveLanguages(installed: installed)
+        if active.count >= 2 {
+            Log.info("Code-switching transcription on (languages: "
+                + active.joined(separator: "+") + ").")
+            let cst = CodeSwitchTranscriber(config: config, installed: installed)
             let (meSegs, partSegs) = try cst.transcribeBoth(me: mic, participants: sys)
             collect(meSegs, "Me")
             collect(partSegs, "Participants")

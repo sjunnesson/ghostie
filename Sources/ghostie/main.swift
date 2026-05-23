@@ -286,18 +286,35 @@ func cmdDoctor(_ config: Config) {
             s.isConfigured ? claudePath : "not found — install Claude Code and run `claude` once to log in")
     }
     let cs = config.codeSwitch
-    if cs.enabled {
-        row(true, "code-switching", "ENABLED — \(cs.languages.joined(separator: "+")), dominant \(cs.dominantLanguage), KB variant \(cs.kbWhisperVariant)")
-        for (lang, path) in cs.requiredModelPaths {
-            let ok = FileManager.default.fileExists(atPath: path)
+    let installed = Models.installed()
+    let effective = cs.effectiveLanguages(installed: installed)
+    let willCodeSwitch = effective.count >= 2
+    row(true, "languages installed on disk",
+        installed.languages.isEmpty
+            ? "none — single-language path only"
+            : installed.languages.joined(separator: ", "))
+    if willCodeSwitch {
+        row(true, "code-switching", "on — \(effective.joined(separator: "+")), dominant \(cs.dominantLanguage), KB variant \(cs.kbWhisperVariant)")
+        let lid = LanguageSegmenter.defaultIdentifier(config: config, installed: installed)
+        row(true, "  language identifier (LID)", lid.description)
+        for lang in effective {
+            let path = cs.effectiveModelPath(for: lang, installed: installed) ?? ""
+            let ok = !path.isEmpty && FileManager.default.fileExists(atPath: path)
             row(ok, "  model[\(lang)]", ok ? path : "missing — run scripts/setup.sh --codeswitch")
+        }
+        // Surface any configured languages that resolve to no installed model.
+        if !cs.languages.isEmpty {
+            let dropped = cs.languages.filter { cs.effectiveModelPath(for: $0, installed: installed) == nil }
+            if !dropped.isEmpty {
+                row(false, "  configured but not installed", dropped.joined(separator: ", "))
+            }
         }
         let vadOK = !config.vadModel.isEmpty
             && FileManager.default.fileExists(atPath: config.vadModel)
         row(vadOK, "  Silero VAD (required by code-switching)",
             vadOK ? config.vadModel : "missing — scripts/setup.sh --codeswitch fetches it")
     } else {
-        row(true, "code-switching", "disabled (single-language path)")
+        row(true, "code-switching", "off (single-language path)")
     }
 
     let matchers = config.triggerBundleIds.map { $0.lowercased() }
@@ -572,6 +589,165 @@ func runCodeSwitchSelfTest() -> Bool {
           neutral[4] == "sv" && neutral[5] == "sv",
           "got \(neutral)")
 
+    // Snap-to-silence (PR 4): adjacent runs get their boundary moved to the
+    // nearest energy trough within snapSearchMs; otherwise they merge into
+    // the longer run's language. Built on `AudioStitcher.troughs(...)` over
+    // raw 16 kHz Int16-LE PCM — no models or fixtures required.
+    do {
+        // Synthesize 6 s of PCM: 2 s speech, 200 ms silence at 2.0–2.2,
+        // 1.8 s speech, no silence, then 2 s speech to t=6 s.
+        let sr = 16_000
+        let speechAmp: Int16 = 8_000   // about -12 dBFS — well above the -40 floor
+        func makePCM(speechRanges: [(start: Int, end: Int)],
+                     totalMs: Int) -> Data {
+            let totalSamples = totalMs * sr / 1000
+            var samples = [Int16](repeating: 0, count: totalSamples)
+            for r in speechRanges {
+                let lo = r.start * sr / 1000, hi = min(totalSamples, r.end * sr / 1000)
+                for i in lo..<hi {
+                    // sine wave at 200 Hz with mild noise to give an RMS
+                    // comfortably above the -40 dB floor.
+                    let t = Double(i) / Double(sr)
+                    let v = Foundation.sin(2 * .pi * 200 * t)
+                    samples[i] = Int16(Double(speechAmp) * v)
+                }
+            }
+            return samples.withUnsafeBufferPointer {
+                Data(buffer: $0)
+            }
+        }
+
+        // 0…2000 speech, 2000…2200 silence, 2200…4000 speech, 4000…6000 speech (no break).
+        let pcm = makePCM(speechRanges: [(0, 2000), (2200, 4000), (4000, 6000)], totalMs: 6000)
+        check("troughs: finds the 200 ms silence near 2.1 s",
+              AudioStitcher.troughs(in: pcm, nearMs: 2_100, searchMs: 800).contains { abs($0 - 2_100) < 100 },
+              "troughs near 2100ms: \(AudioStitcher.troughs(in: pcm, nearMs: 2_100, searchMs: 800))")
+        check("troughs: returns empty in continuous-speech region",
+              AudioStitcher.troughs(in: pcm, nearMs: 5_000, searchMs: 500).isEmpty)
+
+        // Build two runs whose boundary lands inside the silence — snap should
+        // move it to ~2100 ms.
+        let runA = LanguageRun(language: "sv", startMs: 0, endMs: 2_300,
+                               segments: [VADSegment(startMs: 0, endMs: 2_300)])
+        let runB = LanguageRun(language: "en", startMs: 2_300, endMs: 6_000,
+                               segments: [VADSegment(startMs: 2_300, endMs: 6_000)])
+        let cst = CodeSwitchTranscriber(config: Config(),
+                                        installed: InstalledModels(perLanguage: [:]))
+        let snapped = cst.snapBoundaries([runA, runB], in: pcm)
+        check("snap: boundary moves to trough center near 2.1 s",
+              snapped.count == 2 && abs(snapped[0].endMs - 2_100) <= 100,
+              "got endMs \(snapped.first?.endMs ?? -1)")
+        check("snap: adjacent runs stay contiguous after snap",
+              snapped.count == 2 && snapped[0].endMs == snapped[1].startMs)
+
+        // No trough between two speech-only runs (continuous speech) → merge
+        // into the longer language.
+        let runC = LanguageRun(language: "sv", startMs: 4_000, endMs: 5_000,
+                               segments: [VADSegment(startMs: 4_000, endMs: 5_000)])
+        let runD = LanguageRun(language: "en", startMs: 5_000, endMs: 6_000,
+                               segments: [VADSegment(startMs: 5_000, endMs: 6_000)])
+        let merged = cst.snapBoundaries([runC, runD], in: pcm)
+        check("snap: no trough → merge into longer run's language (sv wins)",
+              merged.count == 1 && merged.first?.language == "sv"
+              && merged.first?.startMs == 4_000 && merged.first?.endMs == 6_000,
+              "got \(merged.map { "(\($0.language) \($0.startMs)-\($0.endMs))" })")
+
+        // Post-decode verification (PR 5): a stub LID reports high confidence
+        // for "en" on every slice. A run routed as "sv" must re-route to "en"
+        // when the margin exceeds verifyMarginDb. A run routed as "en" stays.
+        struct StubVerifierLID: LanguageIdentifier {
+            let top: String
+            let topProb: Double
+            var description: String { "stub-verifier" }
+            func identify(pcm: Data, sampleRateHz: Int, restrict: [String]) throws -> [String: Double] {
+                let n = max(1, restrict.count)
+                let spread = (1 - topProb) / Double(max(1, n - 1))
+                var out: [String: Double] = [:]
+                for l in restrict {
+                    out[l] = Foundation.log(l == top ? topProb : spread)
+                }
+                return out
+            }
+        }
+        var verifyCfg = Config()
+        verifyCfg.codeSwitch.languages = ["sv", "en"]
+        verifyCfg.codeSwitch.verifyMarginDb = 0.2
+        let installedSvEn = InstalledModels(perLanguage: [
+            "sv": "/stub/kb.bin", "en": "/stub/lv3.bin"
+        ])
+        let cstV = CodeSwitchTranscriber(
+            config: verifyCfg,
+            installed: installedSvEn,
+            verifier: StubVerifierLID(top: "en", topProb: 0.9))
+        let wrongSv = LanguageRun(language: "sv", startMs: 0, endMs: 3_000,
+                                  segments: [VADSegment(startMs: 0, endMs: 3_000)])
+        let rightEn = LanguageRun(language: "en", startMs: 3_000, endMs: 6_000,
+                                  segments: [VADSegment(startMs: 3_000, endMs: 6_000)])
+        let verified = cstV.verifyRunLanguages([wrongSv, rightEn], in: pcm)
+        check("verify: high-margin disagreement re-routes the run",
+              verified.count == 2 && verified[0].language == "en")
+        check("verify: agreement keeps the original language",
+              verified[1].language == "en")
+
+        // Below the margin threshold (almost-uniform posterior) → no re-route.
+        // 0.52 gives margin ≈ 0.08, well below the 0.20 threshold; 0.55
+        // would land at 0.201 — right on the edge — and is misleading.
+        let cstNeutral = CodeSwitchTranscriber(
+            config: verifyCfg,
+            installed: installedSvEn,
+            verifier: StubVerifierLID(top: "en", topProb: 0.52))
+        let neutral = cstNeutral.verifyRunLanguages([wrongSv], in: pcm)
+        check("verify: low-margin LID → no re-route",
+              neutral.count == 1 && neutral[0].language == "sv")
+
+        // verifyMarginDb = 0 → verification disabled entirely.
+        var offCfg = verifyCfg
+        offCfg.codeSwitch.verifyMarginDb = 0
+        let cstOff = CodeSwitchTranscriber(
+            config: offCfg,
+            installed: installedSvEn,
+            verifier: StubVerifierLID(top: "en", topProb: 0.99))
+        let untouched = cstOff.verifyRunLanguages([wrongSv], in: pcm)
+        check("verify: verifyMarginDb=0 disables the pass",
+              untouched.count == 1 && untouched[0].language == "sv")
+    }
+
+    // 3-language Smoother (PR 3 contract: the binary cap is lifted; the same
+    // refinement algorithm now handles N≥3 whitelists). A track that's
+    // confidently `de` over 4 segments must collapse to one `de` run, and a
+    // mixed sv→en→de track must produce three runs in order.
+    do {
+        var c3 = CodeSwitchConfig(); c3.languages = ["sv", "en", "de"]
+        let sm3 = Smoother(config: c3, window: 4)
+        func det3(_ i: Int, _ lang: String, base: Int = 0) -> LanguageDetection {
+            let s = base + i * step
+            let seg = VADSegment(startMs: s, endMs: s + dur)
+            let conf = 0.95
+            let other = (1 - conf) / 2.0
+            let lp: [String: Double] = [
+                "sv": Foundation.log(lang == "sv" ? conf : other),
+                "en": Foundation.log(lang == "en" ? conf : other),
+                "de": Foundation.log(lang == "de" ? conf : other)
+            ]
+            return LanguageDetection(segment: seg, top: lang, confidence: conf,
+                                     margin: lp[lang]! - (lp.values.min() ?? 0),
+                                     logprobs: lp)
+        }
+        let deOnly = (0..<6).map { det3($0, "de") }
+        let r3 = sm3.refine(deOnly, priorFrom: empty)
+        check("3-lang: de_only → 1 de run", r3.count == 1 && r3.first?.language == "de",
+              "got \(r3.map(\.language))")
+
+        var mix: [LanguageDetection] = []
+        for i in 0..<6  { mix.append(det3(i, "sv")) }
+        for i in 6..<14 { mix.append(det3(i, "en")) }
+        for i in 14..<20 { mix.append(det3(i, "de")) }
+        let rm = sm3.refine(mix, priorFrom: empty)
+        check("3-lang: mixed sv→en→de → 3 runs in order",
+              rm.map(\.language) == ["sv", "en", "de"],
+              "got \(rm.map(\.language))")
+    }
+
     // mostRecentEndingBefore is past-only (causality / timing-skew gotcha).
     let tl = LanguageTimeline(intervals: [
         .init(startMs: 0, endMs: 5_000, language: "en", confidence: 0.9),
@@ -581,6 +757,155 @@ func runCodeSwitchSelfTest() -> Bool {
           tl.mostRecentEndingBefore(6_000, withinMs: 8_000) == "en"
           && tl.mostRecentEndingBefore(6_000, withinMs: 500) == nil
           && tl.mostRecentEndingBefore(8_000, withinMs: 8_000) == "en")
+
+    // CodeSwitchConfig prompt-map migration. The new `prompts: [String:String]`
+    // map replaces `promptSv` / `promptEn`; old user configs (and partials)
+    // must migrate cleanly via `init(from:)`, and the latent
+    // `lang == "sv" ? promptSv : promptEn` fallback (which silently returned
+    // English for every non-Swedish language) must be gone.
+    do {
+        let dec = JSONDecoder()
+        func decode(_ json: String) -> CodeSwitchConfig {
+            try! dec.decode(CodeSwitchConfig.self,
+                            from: Data(json.utf8))
+        }
+        let legacy = decode(#"{"enabled":true,"promptSv":"SV-CUSTOM","promptEn":"EN-CUSTOM"}"#)
+        check("legacy promptSv migrates to prompts['sv']",
+              legacy.prompts["sv"] == "SV-CUSTOM")
+        check("legacy promptEn migrates to prompts['en']",
+              legacy.prompts["en"] == "EN-CUSTOM")
+        check("prompt(for:) reads from the new map",
+              legacy.prompt(for: "sv") == "SV-CUSTOM")
+        check("prompt(for:) on unknown language returns \"\" (no silent en fallback)",
+              legacy.prompt(for: "de") == "")
+
+        let withMap = decode(#"{"prompts":{"sv":"NEW","de":"NEW-DE"},"promptSv":"IGNORED"}"#)
+        check("new prompts map wins over legacy fields",
+              withMap.prompts["sv"] == "NEW")
+        check("new prompts map honors N-language entries",
+              withMap.prompts["de"] == "NEW-DE")
+
+        let empty = decode("{}")
+        check("missing prompts → defaults preserved",
+              (empty.prompts["sv"]?.contains("svenska") ?? false)
+              && (empty.prompts["en"]?.contains("Business call") ?? false))
+
+        let enc = JSONEncoder()
+        enc.outputFormatting = [.sortedKeys]
+        let blob = String(data: try! enc.encode(legacy), encoding: .utf8) ?? ""
+        check("re-encoded config writes 'prompts', drops legacy keys",
+              blob.contains("\"prompts\"")
+              && !blob.contains("promptSv")
+              && !blob.contains("promptEn"))
+    }
+
+    // effectiveLanguages / effectiveModelPath: the v2 contract that the disk
+    // is the whitelist. cs.languages can override (intersected against
+    // what's installed); empty cs.languages means "use whatever is on disk".
+    do {
+        let installed3 = InstalledModels(perLanguage: [
+            "sv": "/stub/kb.bin", "en": "/stub/lv3.bin", "de": "/stub/de.bin"
+        ])
+        let installed1 = InstalledModels(perLanguage: ["en": "/stub/lv3.bin"])
+        let empty = InstalledModels(perLanguage: [:])
+
+        var c = CodeSwitchConfig()           // languages: ["sv","en"] by default
+        check("default config + 3 installed → intersection (sv,en)",
+              c.effectiveLanguages(installed: installed3) == ["sv", "en"])
+
+        c.languages = []
+        check("empty cs.languages + 3 installed → all 3 (disk is whitelist)",
+              c.effectiveLanguages(installed: installed3) == ["de", "en", "sv"])
+
+        c.languages = ["sv", "en", "de"]
+        check("configured 3 + only en installed → just en",
+              c.effectiveLanguages(installed: installed1) == ["en"])
+
+        c.languages = ["sv", "en"]
+        check("configured 2 + nothing installed → empty",
+              c.effectiveLanguages(installed: empty) == [])
+
+        // effectiveModelPath: override resolves on disk → wins.
+        // Override does NOT exist on disk → fall through to installed map.
+        // Neither → nil.
+        c.modelPerLanguage = ["en": "/dev/null"]    // exists; absolute path
+        check("override that exists on disk wins over installed map",
+              c.effectiveModelPath(for: "en", installed: installed1) == "/dev/null")
+
+        c.modelPerLanguage = ["en": "/tmp/this-file-does-not-exist-xyzzy"]
+        check("override that doesn't exist falls through to installed",
+              c.effectiveModelPath(for: "en", installed: installed1) == "/stub/lv3.bin")
+
+        c.modelPerLanguage = [:]
+        check("no override + nothing installed for lang → nil",
+              c.effectiveModelPath(for: "fr", installed: installed3) == nil)
+    }
+
+    // LanguageIdentifier seam: WhisperLID parse + spread, and the segmenter's
+    // posterior → detection conversion. These exercise the v2 protocol seam
+    // without spinning up whisper-cli or any audio fixtures.
+    do {
+        check("parse: 'auto-detected language: sv (p = 0.87)'",
+              WhisperLID.parse("whisper_full_with_state: auto-detected language: sv (p = 0.87)\n")
+                ?? ("?", 0) == ("sv", 0.87))
+        check("parse: 'detected language: en' (no probability)",
+              WhisperLID.parse("detected language: en\n")?.0 == "en")
+        check("parse: missing line → nil",
+              WhisperLID.parse("nothing here\n") == nil)
+
+        let spread = WhisperLID.spread(top: "sv", confidence: 0.85, restrict: ["sv", "en"])
+        check("spread: top in restrict → log(0.85) on top, log(0.15) on other",
+              abs((spread["sv"] ?? 0) - Foundation.log(0.85)) < 1e-9
+              && abs((spread["en"] ?? 0) - Foundation.log(0.15)) < 1e-9)
+
+        let off = WhisperLID.spread(top: "fr", confidence: 0.9, restrict: ["sv", "en"])
+        check("spread: off-whitelist top → uniform log(0.5) each",
+              abs((off["sv"] ?? 0) - Foundation.log(0.5)) < 1e-9
+              && abs((off["en"] ?? 0) - Foundation.log(0.5)) < 1e-9)
+
+        // detection(from:whitelist:segment:): the static helper that
+        // LanguageSegmenter uses to wrap an identifier's posterior into the
+        // LanguageDetection shape the smoother consumes.
+        let seg = VADSegment(startMs: 0, endMs: 2_000)
+        let post: [String: Double] = ["sv": Foundation.log(0.9), "en": Foundation.log(0.1)]
+        let detSv = LanguageSegmenter.detection(from: post, whitelist: ["sv", "en"], segment: seg)
+        check("detection: top reads from posterior argmax",
+              detSv.top == "sv"
+              && abs(detSv.confidence - 0.9) < 1e-9
+              && abs(detSv.margin - (Foundation.log(0.9) - Foundation.log(0.1))) < 1e-9)
+
+        let allInf: [String: Double] = ["sv": -.infinity, "en": -.infinity]
+        let detUnk = LanguageSegmenter.detection(from: allInf, whitelist: ["sv", "en"], segment: seg)
+        check("detection: all -Inf → unknown",
+              detUnk.top == LanguageDetection.unknown)
+
+        let detOff = LanguageSegmenter.detection(from: ["fr": Foundation.log(0.95)],
+                                                 whitelist: ["sv", "en"], segment: seg)
+        check("detection: top not in whitelist → unknown",
+              detOff.top == LanguageDetection.unknown)
+
+        // Stub identifier round-trip: the segmenter's contract is "throwing
+        // identifier → unknown for that segment", not the whole call.
+        struct ThrowingLID: LanguageIdentifier {
+            var description: String { "throwing-stub" }
+            func identify(pcm: Data, sampleRateHz: Int, restrict: [String]) throws -> [String: Double] {
+                throw NSError(domain: "test", code: 1)
+            }
+        }
+        struct StubLID: LanguageIdentifier {
+            let post: [String: Double]
+            var description: String { "stub" }
+            func identify(pcm: Data, sampleRateHz: Int, restrict: [String]) throws -> [String: Double] {
+                post
+            }
+        }
+        check("LID protocol covariance: stub implements identify",
+              ((try? StubLID(post: ["sv": Foundation.log(0.9)]).identify(
+                  pcm: Data(), sampleRateHz: 16_000, restrict: ["sv", "en"]))?["sv"] ?? 0)
+              == Foundation.log(0.9))
+        check("LID protocol: throwing impl propagates",
+              (try? ThrowingLID().identify(pcm: Data(), sampleRateHz: 16_000, restrict: [])) == nil)
+    }
 
     // Optional end-to-end audio fixtures (Tests/Fixtures) — skipped cleanly
     // when not present so `ghostie selftest` stays green without 2 GB models.

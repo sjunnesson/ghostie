@@ -2761,21 +2761,25 @@ private final class TranscriptionPane: NSView {
         stack.addArrangedSubview(header)
         header.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
 
-        // Mode — dropdown over single vs. dual-language transcription. Maps
-        // to the `codeSwitch.enabled` flag in Config; the Models card reacts
-        // to the selection (KB + large-v3 paired vs. base/large-v3 alone).
+        // Mode — dropdown over single vs. dual-language transcription. Writes
+        // to `codeSwitch.languages` (the v2 intent signal — empty/1 = single,
+        // 2+ = code-switching); the Models card reacts to the selection
+        // (KB + large-v3 paired vs. base/large-v3 alone). The pipeline only
+        // *actually* code-switches when ≥2 models are installed on disk.
         let mode = GroupCard(title: "Mode")
         let modePopup = NSPopUpButton(frame: .zero, pullsDown: false)
         modePopup.addItems(withTitles: [
             "Single language",
             "Language switching (Swedish ↔ English)"
         ])
-        modePopup.selectItem(at: cfg.codeSwitch.enabled ? 1 : 0)
+        modePopup.selectItem(at: cfg.codeSwitch.languages.count >= 2 ? 1 : 0)
         modePopup.translatesAutoresizingMaskIntoConstraints = false
         modePopup.widthAnchor.constraint(equalToConstant: 280).isActive = true
         let modeTarget = ToggleTarget { [weak self] in
             let on = modePopup.indexOfSelectedItem == 1
-            self?.change { c in c.codeSwitch.enabled = on }
+            self?.change { c in
+                c.codeSwitch.languages = on ? ["sv", "en"] : ["en"]
+            }
             self?.refreshAllRows()
         }
         modePopup.target = modeTarget
@@ -2870,7 +2874,7 @@ private final class TranscriptionPane: NSView {
     func refreshRow(_ key: String) {
         guard let st = rows[key], let model = modelForKey(key) else { return }
         let h = ModelDownloader.health(for: [model])[0]
-        let single = !cfg.codeSwitch.enabled
+        let single = cfg.codeSwitch.languages.count < 2
         // Single-mode pairs with one whisper model (base or large-v3); the KB
         // row pairs with large-v3 in codeswitch mode and only then.
         let selected: Bool = {
@@ -3098,7 +3102,7 @@ private final class ModelRowView: NSView {
 }
 
 /// Status mark in front of each model row. The model the engine actually uses
-/// is driven by `cfg.codeSwitch.enabled` + `cfg.whisperModel`, not by clicking
+/// is driven by `cfg.codeSwitch.languages` + `cfg.whisperModel`, not by clicking
 /// the row — so render a tickmark for the active model and leave the slot
 /// empty otherwise. (Was previously a radio circle which implied a per-row
 /// selection affordance that isn't actually wired.)

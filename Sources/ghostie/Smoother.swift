@@ -80,8 +80,14 @@ struct Smoother {
     let runPaddingMs: Int
 
     init(config: CodeSwitchConfig, window: Int) {
+        // Pre-v2 capped at 2 (`Array(config.languages.prefix(2))`) because
+        // the binary `other()` helper had no representation for a third
+        // language. With the log-space math + skewed() helper below, an
+        // arbitrary-length whitelist is well-defined and the smoother runs
+        // correctly for N ≥ 2. Empty / 1-element whitelists fall back to
+        // sv/en so existing pre-config behaviour is unchanged.
         self.languages = config.languages.count >= 2
-            ? Array(config.languages.prefix(2))
+            ? config.languages
             : ["sv", "en"]
         self.window = max(1, window)
         self.minSwitchSegments = max(1, config.minSwitchSegments)
@@ -93,8 +99,19 @@ struct Smoother {
         self.runPaddingMs = config.runPaddingMs
     }
 
-    private var other: (String) -> String {
-        { [languages] lang in languages.first { $0 != lang } ?? lang }
+    /// Log-prob distribution skewed toward `target` with mass `mass` on that
+    /// language and the residual `(1 − mass)` spread uniformly across the
+    /// other `N − 1` languages. The N-language replacement for the old
+    /// `[target: x, other(target): 1-x]` binary shape.
+    private func skewed(toward target: String, with mass: Double) -> [String: Double] {
+        let clamped = min(0.999, max(0.001, mass))
+        let n = languages.count
+        let spread = n > 1 ? (1 - clamped) / Double(n - 1) : 1.0
+        var out: [String: Double] = [:]
+        for l in languages {
+            out[l] = Foundation.log(l == target ? clamped : spread)
+        }
+        return out
     }
 
     // MARK: Pass 1 — per-track preliminary
@@ -114,6 +131,12 @@ struct Smoother {
     /// raw Bayesian decision. Used by `refine` and by `ghostie selftest` to
     /// assert the cross-track contract at segment granularity (a lone 2 s
     /// switch is intentionally smoothed away in the final runs).
+    ///
+    /// All distributions here are in **log-space**: `multiply` is an
+    /// element-wise sum and `normalize` is log-sum-exp. Linear-space
+    /// products under-flow to 0 once we generalize past N=2 with confident
+    /// priors; keeping log-space from day one means the algorithm stays
+    /// identical when v2 lifts the binary cap.
     func refinedSegmentLabels(_ dets: [LanguageDetection],
                               priorFrom otherTrack: LanguageTimeline) -> [String] {
         guard !dets.isEmpty else { return [] }
@@ -123,20 +146,22 @@ struct Smoother {
             if languages.contains(det.top), det.confidence > 0 {
                 likelihood = self.likelihood(det)
             } else if languages.contains(prelim[i]) {
-                likelihood = [prelim[i]: 0.6, other(prelim[i]): 0.4]
+                likelihood = skewed(toward: prelim[i], with: 0.6)
             } else {
                 likelihood = self.likelihood(det)
             }
             let prior: [String: Double]
             if let recent = otherTrack.mostRecentEndingBefore(
                 det.segment.startMs, withinMs: priorLookbackMs) {
-                prior = [recent: crossTrackPriorStrength,
-                         other(recent): 1 - crossTrackPriorStrength]
+                prior = skewed(toward: recent, with: crossTrackPriorStrength)
             } else {
-                prior = [dominantLanguage: 0.55, other(dominantLanguage): 0.45]
+                prior = skewed(toward: dominantLanguage, with: 0.55)
             }
-            let post = normalize(multiply(likelihood, prior))
-            return post.max { $0.value < $1.value }!.key
+            // Argmax of log-posterior == argmax of linear posterior, since
+            // log is monotonic. No need to subtract log-sum-exp here — only
+            // the ordering matters for `max`.
+            return multiply(likelihood, prior)
+                .max { $0.value < $1.value }!.key
         }
     }
 
@@ -149,40 +174,65 @@ struct Smoother {
         return runs(from: relabeled, labels: hysteresis(median(segLabels), durs))
     }
 
-    // MARK: Likelihood / prior math
+    // MARK: Likelihood / prior math — log-space throughout
+    //
+    // Every distribution returned/consumed by this section is a map from
+    // language → log-probability. `multiply` is element-wise sum (log of a
+    // product); `normalize` is log-sum-exp. Missing keys are treated as
+    // `-Infinity` (log 0). This is overkill for N=2 but is the version that
+    // survives unchanged when v2 lifts the binary cap on `languages`.
 
-    /// Softmax over the whitelist log-probs. Missing/sub-threshold detections
-    /// (top == unknown) yield a near-uniform likelihood so the prior dominates.
+    /// Log-likelihood of the whitelist languages given one detection. Missing
+    /// or sub-threshold detections (top == unknown) yield a near-uniform
+    /// distribution so the prior dominates downstream.
     private func likelihood(_ det: LanguageDetection) -> [String: Double] {
         var lp: [String: Double] = [:]
         for l in languages { if let v = det.logprobs[l] { lp[l] = v } }
-        if lp.count < 2 || det.top == LanguageDetection.unknown {
-            // Derive a soft distribution from confidence around `top`; if even
-            // that is unknown, fall back to uniform.
+        let usable = lp.count == languages.count && det.top != LanguageDetection.unknown
+        if !usable {
             if languages.contains(det.top), det.confidence > 0 {
                 let c = min(0.99, max(0.5, det.confidence))
-                return [det.top: c, other(det.top): 1 - c]
+                let spread = (1 - c) / Double(max(1, languages.count - 1))
+                var out: [String: Double] = [:]
+                for l in languages {
+                    out[l] = Foundation.log(l == det.top ? c : spread)
+                }
+                return out
             }
-            return Dictionary(uniqueKeysWithValues: languages.map { ($0, 1.0 / Double(languages.count)) })
+            // Uniform → equal log-prob everywhere. Value is log(1/N).
+            let u = Foundation.log(1.0 / Double(languages.count))
+            return Dictionary(uniqueKeysWithValues: languages.map { ($0, u) })
         }
-        let maxLp = lp.values.max() ?? 0
-        var exp: [String: Double] = [:]
-        for (k, v) in lp { exp[k] = Foundation.exp(v - maxLp) }
-        return normalize(exp)
+        // Detection log-probs are already in log-space; pass through. The
+        // downstream `normalize` (log-sum-exp) handles numerical stability,
+        // so no max-subtraction here.
+        return lp
     }
 
+    /// Element-wise log-multiply: pointwise sum, with missing keys treated as
+    /// `-Infinity` (log 0). Result is an un-normalized log-distribution; the
+    /// argmax is meaningful without normalization, since log is monotonic.
     private func multiply(_ a: [String: Double], _ b: [String: Double]) -> [String: Double] {
         var out: [String: Double] = [:]
-        for l in languages { out[l] = (a[l] ?? 0) * (b[l] ?? 0) }
+        for l in languages {
+            let av = a[l] ?? -.infinity
+            let bv = b[l] ?? -.infinity
+            out[l] = av + bv
+        }
         return out
     }
 
+    /// Log-sum-exp normalization: returns log-probabilities that sum to 1 in
+    /// linear space. Falls back to log-uniform when every entry is -Infinity
+    /// (the all-zero linear case).
     private func normalize(_ d: [String: Double]) -> [String: Double] {
-        let sum = d.values.reduce(0, +)
-        guard sum > 0 else {
-            return Dictionary(uniqueKeysWithValues: languages.map { ($0, 1.0 / Double(languages.count)) })
+        guard let maxV = d.values.max(), maxV > -.infinity else {
+            let u = Foundation.log(1.0 / Double(languages.count))
+            return Dictionary(uniqueKeysWithValues: languages.map { ($0, u) })
         }
-        return d.mapValues { $0 / sum }
+        let sumExp = d.values.reduce(0.0) { $0 + Foundation.exp($1 - maxV) }
+        let lse = maxV + Foundation.log(sumExp)
+        return d.mapValues { $0 - lse }
     }
 
     // MARK: Label-sequence smoothing

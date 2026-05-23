@@ -333,12 +333,11 @@ struct Config: Codable {
 /// decodes unchanged — Swift's synthesized Decodable falls back to the default
 /// when a key is absent, the same pattern the rest of Config relies on.
 struct CodeSwitchConfig: Codable {
-    /// When false the single-language transcribe path is used and nothing
-    /// about the pipeline changes.
-    var enabled: Bool = false
-
     /// Labels the smoother is allowed to emit. Nordic look-alikes (`no`, `da`)
     /// detected on short Swedish audio are mapped to `sv` (see Smoother).
+    /// Empty (recommended for v2) means "use whatever is installed on disk"
+    /// — see `effectiveLanguages(installed:)`. A non-empty list is an
+    /// override layer (configured ∩ installed).
     var languages: [String] = ["sv", "en"]
 
     /// Tiebreaker when neither the local detection nor the cross-track prior
@@ -375,18 +374,63 @@ struct CodeSwitchConfig: Codable {
     var crossTrackPriorStrength: Double = 0.75
     var priorLookbackMs: Int = 8000
 
-    var promptSv: String = "Affärssamtal på svenska. Termer: Ingka, Xplore, IKEA, IFB."
-    var promptEn: String = "Business call in English. Terms: Ingka, Xplore, IKEA, IFB, MCP, ACP."
+    // MARK: Snap-to-silence (PR 4)
+    //
+    // After smoothing, each language-switch boundary is moved to the nearest
+    // real silence trough so the decoder doesn't cut a syllable in half. If
+    // no trough is found in the search window, the two adjacent runs merge
+    // into the dominant-length language rather than producing a mid-word cut.
+
+    /// Window (± ms around the smoother boundary) within which we look for a
+    /// silence trough. Larger windows catch wider word-boundary gaps; too
+    /// large lets the cut wander far from the actual switch.
+    var snapSearchMs: Int = 1500
+    /// Minimum trough duration. Below this is normal phoneme energy dips, not
+    /// a word boundary.
+    var snapMinMs: Int = 80
+    /// dBFS threshold. Per-frame RMS below this counts as silence.
+    var snapEnergyDb: Double = -40
+
+    // MARK: Post-decode re-LID verification (PR 5)
+
+    /// Re-routing threshold. After snap-to-silence, each run's audio is
+    /// re-checked by the LID at its post-snap boundaries (longer, cleaner
+    /// audio than the original per-VAD-segment evidence). If the LID's
+    /// top-1 language sits at least this much higher in log-prob than the
+    /// originally-routed language, the run re-routes to the LID's pick
+    /// and decodes against that language's model instead. 0 disables the
+    /// check; 0.20 ≈ "LID at least exp(0.20) ≈ 1.22× more confident".
+    var verifyMarginDb: Double = 0.20
+
+    /// Decoder prompt per language. The N-language replacement for the old
+    /// `promptSv` / `promptEn` pair: each model gets a prompt in its own
+    /// language with the domain terms it should bias toward. Old configs
+    /// carrying `promptSv` / `promptEn` migrate cleanly on load (see
+    /// `init(from:)`); they are no longer written back on save.
+    var prompts: [String: String] = [
+        "sv": "Affärssamtal på svenska. Termer: Ingka, Xplore, IKEA, IFB.",
+        "en": "Business call in English. Terms: Ingka, Xplore, IKEA, IFB, MCP, ACP."
+    ]
 
     // Same missing-key resilience as Config: a partial `codeSwitch` object
     // (e.g. just `{"enabled": true}`) decodes, with the rest taking defaults.
     init() {}
 
     enum CodingKeys: String, CodingKey {
-        case enabled, languages, dominantLanguage, modelPerLanguage, kbWhisperVariant
+        case languages, dominantLanguage, modelPerLanguage, kbWhisperVariant
         case smoothingWindowMe, smoothingWindowParticipants, minSwitchSegments
         case minSwitchMs, maxFillGapMs, runPaddingMs, silencePadMs, minDetectMs
-        case crossTrackPriorStrength, priorLookbackMs, promptSv, promptEn
+        case crossTrackPriorStrength, priorLookbackMs, prompts
+        case snapSearchMs, snapMinMs, snapEnergyDb
+        case verifyMarginDb
+        // Removed in v2: `enabled` (now derived from installed-model count;
+        // see Pipeline.swift). Old configs with the key load cleanly — Swift's
+        // JSON decoder ignores unknown keys.
+    }
+
+    /// Pre-v2 prompt keys folded into `prompts` on decode, never encoded back.
+    private enum LegacyPromptKeys: String, CodingKey {
+        case promptSv, promptEn
     }
 
     init(from decoder: Decoder) throws {
@@ -397,7 +441,6 @@ struct CodeSwitchConfig: Codable {
             catch {}
             return fallback
         }
-        enabled = g(.enabled, d.enabled)
         languages = g(.languages, d.languages)
         dominantLanguage = g(.dominantLanguage, d.dominantLanguage)
         modelPerLanguage = g(.modelPerLanguage, d.modelPerLanguage)
@@ -412,8 +455,27 @@ struct CodeSwitchConfig: Codable {
         minDetectMs = g(.minDetectMs, d.minDetectMs)
         crossTrackPriorStrength = g(.crossTrackPriorStrength, d.crossTrackPriorStrength)
         priorLookbackMs = g(.priorLookbackMs, d.priorLookbackMs)
-        promptSv = g(.promptSv, d.promptSv)
-        promptEn = g(.promptEn, d.promptEn)
+        snapSearchMs = g(.snapSearchMs, d.snapSearchMs)
+        snapMinMs = g(.snapMinMs, d.snapMinMs)
+        snapEnergyDb = g(.snapEnergyDb, d.snapEnergyDb)
+        verifyMarginDb = g(.verifyMarginDb, d.verifyMarginDb)
+
+        // Prompts: prefer the new map; otherwise migrate from the legacy
+        // promptSv / promptEn pair on top of defaults; otherwise defaults.
+        // A config with just `{"enabled": true}` still gets the default map.
+        if let p = (try? c.decodeIfPresent([String: String].self, forKey: .prompts)) ?? nil {
+            prompts = p
+        } else {
+            prompts = d.prompts
+            if let legacy = try? decoder.container(keyedBy: LegacyPromptKeys.self) {
+                if let sv = (try? legacy.decodeIfPresent(String.self, forKey: .promptSv)) ?? nil {
+                    prompts["sv"] = sv
+                }
+                if let en = (try? legacy.decodeIfPresent(String.self, forKey: .promptEn)) ?? nil {
+                    prompts["en"] = en
+                }
+            }
+        }
     }
 
     /// Resolve the logical model name for `lang` to a GGML file path. Defers
@@ -435,13 +497,44 @@ struct CodeSwitchConfig: Codable {
         }
     }
 
-    /// The model-fine-tuned prompt for `lang` (KB-Whisper expects Swedish).
+    /// The model-fine-tuned prompt for `lang`. Returns "" when the language
+    /// has no entry — pipeline treats that as "no `--prompt` arg" so an
+    /// unconfigured language doesn't get nudged toward the wrong domain.
+    /// (Pre-v2 this silently fell back to `promptEn` for every non-`sv` label,
+    /// which gave a 3-language config the English prompt for its German runs.)
     func prompt(for lang: String) -> String {
-        lang == "sv" ? promptSv : promptEn
+        prompts[lang] ?? ""
     }
 
     /// Distinct GGML model paths actually needed, for doctor / preflight.
     var requiredModelPaths: [(lang: String, path: String)] {
         languages.map { ($0, modelPath(for: $0)) }
+    }
+
+    /// Languages this run will actually label audio with, given what is on
+    /// disk. If `languages` is configured (non-empty), keep it but drop
+    /// entries with no installed model — a user can't transcribe a language
+    /// whose model they haven't downloaded. If `languages` is empty,
+    /// the configured whitelist is "whatever is installed", so the pipeline
+    /// turns languages on/off purely by `~/.ghostie/models/` content.
+    ///
+    /// Returned languages are in the same order as `installed.languages` when
+    /// configured is empty; otherwise in `languages` order, preserving the
+    /// user's stated priority (smoother dominance, doctor display).
+    func effectiveLanguages(installed: InstalledModels) -> [String] {
+        if languages.isEmpty { return installed.languages }
+        return languages.filter { installed.modelPath(for: $0) != nil }
+    }
+
+    /// GGML path for `lang`, layering the explicit `modelPerLanguage` override
+    /// (if it resolves on disk) over the installed-models map. Returns nil
+    /// when neither source can serve a model for that language — the caller
+    /// surfaces that as "missing model, run setup.sh --codeswitch".
+    func effectiveModelPath(for lang: String, installed: InstalledModels) -> String? {
+        let override = modelPath(for: lang)
+        if !override.isEmpty, FileManager.default.fileExists(atPath: override) {
+            return override
+        }
+        return installed.modelPath(for: lang)
     }
 }

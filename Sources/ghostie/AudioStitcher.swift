@@ -115,6 +115,74 @@ struct AudioStitcher {
         throw StitchError.unreadable(url)
     }
 
+    // MARK: Energy-trough detection (PR 4: snap-to-silence boundaries)
+    //
+    // Used by `CodeSwitchTranscriber` to place language-switch cut points at
+    // real silence troughs rather than at the raw smoother boundary, which
+    // can land mid-syllable. The decoder hallucinates duplicated half-words
+    // when split mid-syllable; snapping to silence preserves word boundaries.
+
+    /// Trough centers (ms from track start) near `nearMs`, within `searchMs`
+    /// on either side. A "trough" is a contiguous span of ≥ `minMs` of audio
+    /// whose 20 ms-frame RMS sits below `thresholdDb` dBFS. Returns sorted
+    /// centers; empty when no trough qualifies.
+    ///
+    /// Operates on canonical 16 kHz mono Int16-LE PCM (Ghostie's invariant).
+    /// 20 ms frame size matches typical VAD granularity; smaller frames over-
+    /// fragment, larger ones miss short word-boundary gaps.
+    static func troughs(in pcm: Data,
+                        nearMs: Int,
+                        searchMs: Int,
+                        minMs: Int = 80,
+                        thresholdDb: Double = -40) -> [Int] {
+        let sampleRate = 16_000
+        let frameMs = 20
+        let frameSamples = sampleRate * frameMs / 1000   // 320
+        let frameBytes = frameSamples * 2
+        let bytesPerMs = sampleRate * 2 / 1000           // 32
+        let lo = max(0, (nearMs - searchMs) * bytesPerMs)
+        let hi = min(pcm.count, (nearMs + searchMs) * bytesPerMs)
+        guard hi > lo + frameBytes else { return [] }
+
+        // Build a dBFS timeline (one entry per 20 ms frame).
+        var energies: [Double] = []
+        var p = lo
+        while p + frameBytes <= hi {
+            var sum: Double = 0
+            for i in 0..<frameSamples {
+                let off = p + i * 2
+                let s = pcm.withUnsafeBytes { ptr -> Int16 in
+                    Int16(littleEndian: ptr.load(fromByteOffset: off, as: Int16.self))
+                }
+                let v = Double(s) / 32768.0
+                sum += v * v
+            }
+            let rms = (sum / Double(frameSamples)).squareRoot()
+            energies.append(rms > 0 ? 20 * Foundation.log10(rms) : -200)
+            p += frameBytes
+        }
+
+        // Contiguous below-threshold runs ≥ minMs long → record center.
+        var out: [Int] = []
+        let framesInMin = (minMs + frameMs - 1) / frameMs
+        var i = 0
+        while i < energies.count {
+            if energies[i] < thresholdDb {
+                var j = i
+                while j + 1 < energies.count && energies[j + 1] < thresholdDb { j += 1 }
+                if (j - i + 1) >= framesInMin {
+                    let centerFrame = (i + j) / 2
+                    let centerMs = (lo / bytesPerMs) + centerFrame * frameMs + frameMs / 2
+                    out.append(centerMs)
+                }
+                i = j + 1
+            } else {
+                i += 1
+            }
+        }
+        return out
+    }
+
     static func writeWAV(_ pcm: Data, to url: URL, sampleRate: Int) throws {
         let channels = 1, bits = 16
         let byteRate = sampleRate * channels * bits / 8

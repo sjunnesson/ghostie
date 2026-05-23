@@ -12,11 +12,38 @@ struct CodeSwitchTranscriber {
     let config: Config
     var cs: CodeSwitchConfig { config.codeSwitch }
 
+    /// Snapshot of "what's on disk right now". Resolved once at the top of
+    /// `transcribeBoth` so the same view drives preflight, language whitelist,
+    /// model routing, and the doctor surface — no drift between layers.
+    let installed: InstalledModels
+
+    /// Optional LID for the post-decode verification pass (PR 5). When nil,
+    /// `verifyRunLanguages` builds the default identifier on demand. Tests
+    /// inject a deterministic stub here to assert the re-route contract
+    /// without spinning up whisper-cli.
+    let verifier: LanguageIdentifier?
+
+    init(config: Config,
+         installed: InstalledModels? = nil,
+         verifier: LanguageIdentifier? = nil) {
+        self.config = config
+        self.installed = installed ?? Models.installed()
+        self.verifier = verifier
+    }
+
+    /// Languages this call will actually label audio with — `cs.languages`
+    /// filtered against installed models, or installed if `cs.languages` is
+    /// empty. The single source of truth for downstream consumers.
+    var languages: [String] { cs.effectiveLanguages(installed: installed) }
+
     enum CSError: Error, LocalizedError {
+        case noLanguagesInstalled
         case modelMissing(lang: String, path: String)
         case whisperFailed(Int32, String)
         var errorDescription: String? {
             switch self {
+            case .noLanguagesInstalled:
+                return "code-switching has no installed language models. Install at least one whisper model under ~/.ghostie/models/ (run scripts/setup.sh --codeswitch)."
             case .modelMissing(let lang, let path):
                 return "code-switching model for '\(lang)' not found at \(path) — run scripts/setup.sh --codeswitch"
             case .whisperFailed(let code, let out):
@@ -29,7 +56,7 @@ struct CodeSwitchTranscriber {
         throws -> (me: [Transcriber.Segment], participants: [Transcriber.Segment]) {
 
         try preflightModels()
-        let seg = LanguageSegmenter(config: config)
+        let seg = LanguageSegmenter(config: config, installed: installed)
 
         let meSegs = try seg.segments(for: me)
         let partSegs = try seg.segments(for: participants)
@@ -50,11 +77,129 @@ struct CodeSwitchTranscriber {
 
         Log.info("Code-switching: Me \(runSummary(meRuns)), Participants \(runSummary(partRuns)).")
 
+        // Snap each language-switch boundary to the nearest silence trough
+        // (or merge the two runs when no trough lives in the search window).
+        // Eliminates mid-syllable cuts that hurt the decoder.
+        let mePcm = (try? AudioStitcher.readPCM(me)) ?? Data()
+        let partPcm = (try? AudioStitcher.readPCM(participants)) ?? Data()
+        let meSnapped = snapBoundaries(meRuns, in: mePcm)
+        let partSnapped = snapBoundaries(partRuns, in: partPcm)
+        if meSnapped.count != meRuns.count || partSnapped.count != partRuns.count {
+            Log.info("Snap-to-silence merged runs: Me \(meRuns.count)→\(meSnapped.count), Participants \(partRuns.count)→\(partSnapped.count).")
+        }
+
+        // Post-decode re-LID verification. After snap-to-silence the runs are
+        // longer and cleaner than the per-VAD-segment evidence the smoother
+        // saw, so re-checking each run with the LID catches the rare cases
+        // where smoothing routed a run to the wrong model.
+        let meVerified = verifyRunLanguages(meSnapped, in: mePcm, tag: "me")
+        let partVerified = verifyRunLanguages(partSnapped, in: partPcm, tag: "participants")
+
         let callID = me.deletingLastPathComponent().lastPathComponent
-        let meOut = try decode(track: me, runs: meRuns, callID: callID, tag: "me")
-        let partOut = try decode(track: participants, runs: partRuns,
+        let meOut = try decode(track: me, runs: meVerified, callID: callID, tag: "me")
+        let partOut = try decode(track: participants, runs: partVerified,
                                  callID: callID, tag: "participants")
         return (meOut, partOut)
+    }
+
+    /// Re-LID each run on its (snap-adjusted) audio and re-route runs whose
+    /// LID winner sits at least `cs.verifyMarginDb` higher in log-prob than
+    /// the originally-routed language. Returns the (possibly re-labeled)
+    /// runs in original order.
+    ///
+    /// Public so the selftest can drive it with a deterministic stub
+    /// identifier (no whisper-cli needed).
+    func verifyRunLanguages(_ runs: [LanguageRun],
+                            in pcm: Data,
+                            tag: String = "") -> [LanguageRun] {
+        guard cs.verifyMarginDb > 0, runs.count >= 1, !pcm.isEmpty else { return runs }
+        let active = languages
+        guard active.count >= 2 else { return runs }
+        let lid = verifier ?? LanguageSegmenter.defaultIdentifier(
+            config: config, installed: installed)
+        let bytesPerMs = 16_000 * 2 / 1000
+
+        var out: [LanguageRun] = []
+        for run in runs {
+            let lo = min(pcm.count, run.startMs * bytesPerMs)
+            let hi = min(pcm.count, run.endMs * bytesPerMs)
+            guard hi > lo + bytesPerMs * 500 else { out.append(run); continue }
+            let slice = pcm.subdata(in: lo..<hi)
+            let posterior: [String: Double]
+            do {
+                posterior = try lid.identify(pcm: slice,
+                                             sampleRateHz: 16_000,
+                                             restrict: active)
+            } catch {
+                out.append(run); continue
+            }
+            guard let topEntry = posterior.max(by: { $0.value < $1.value }),
+                  topEntry.value > -.infinity,
+                  active.contains(topEntry.key) else {
+                out.append(run); continue
+            }
+            let routedLp = posterior[run.language] ?? -.infinity
+            let margin = topEntry.value - routedLp
+            if topEntry.key != run.language, margin > cs.verifyMarginDb {
+                let where_ = tag.isEmpty ? "" : "\(tag) "
+                Log.info("Re-routing \(where_)run \(run.startMs)–\(run.endMs)ms: "
+                    + "\(run.language) → \(topEntry.key) "
+                    + "(LID margin \(String(format: "%.2f", margin)))")
+                out.append(LanguageRun(language: topEntry.key,
+                                       startMs: run.startMs,
+                                       endMs: run.endMs,
+                                       segments: run.segments))
+            } else {
+                out.append(run)
+            }
+        }
+        return out
+    }
+
+    /// Walk adjacent runs and either (a) move the boundary to the nearest
+    /// silence trough within `cs.snapSearchMs`, or (b) merge the two runs
+    /// into the longer-duration language. Both rules avoid the failure mode
+    /// where a language switch lands inside a syllable and the decoder
+    /// produces duplicated half-words on either side.
+    ///
+    /// Public for selftest (`runCodeSwitchSelfTest` exercises it on
+    /// synthetic PCM); the caller normally invokes it via `transcribeBoth`.
+    func snapBoundaries(_ runs: [LanguageRun], in pcm: Data) -> [LanguageRun] {
+        guard runs.count >= 2 else { return runs }
+        var out = runs
+        var i = 0
+        while i + 1 < out.count {
+            let a = out[i], b = out[i + 1]
+            let boundary = (a.endMs + b.startMs) / 2
+            let cand = AudioStitcher.troughs(in: pcm,
+                                             nearMs: boundary,
+                                             searchMs: cs.snapSearchMs,
+                                             minMs: cs.snapMinMs,
+                                             thresholdDb: cs.snapEnergyDb)
+            if let nearest = cand.min(by: { abs($0 - boundary) < abs($1 - boundary) }) {
+                out[i] = LanguageRun(language: a.language,
+                                     startMs: a.startMs,
+                                     endMs: nearest,
+                                     segments: a.segments)
+                out[i + 1] = LanguageRun(language: b.language,
+                                         startMs: nearest,
+                                         endMs: b.endMs,
+                                         segments: b.segments)
+                i += 1
+            } else {
+                // No trough → merge into the longer run's language. Don't
+                // advance i; the merged run may need to merge again with
+                // out[i+1] if there's still no trough between them.
+                let aLen = a.endMs - a.startMs, bLen = b.endMs - b.startMs
+                let lang = aLen >= bLen ? a.language : b.language
+                out[i] = LanguageRun(language: lang,
+                                     startMs: a.startMs,
+                                     endMs: b.endMs,
+                                     segments: a.segments + b.segments)
+                out.remove(at: i + 1)
+            }
+        }
+        return out
     }
 
     // MARK: Per-track decode
@@ -70,13 +215,14 @@ struct CodeSwitchTranscriber {
 
         let stitcher = AudioStitcher()
         // Group by language; off-whitelist runs fall back to the dominant model.
+        let active = languages
         let byLang = Dictionary(grouping: runs) { run -> String in
-            cs.languages.contains(run.language) ? run.language : cs.dominantLanguage
+            active.contains(run.language) ? run.language : cs.dominantLanguage
         }
 
         var out: [Transcriber.Segment] = []
         // Serial within a track keeps peak RAM at one model.
-        for lang in cs.languages where byLang[lang] != nil {
+        for lang in active where byLang[lang] != nil {
             guard let langRuns = byLang[lang], !langRuns.isEmpty else { continue }
             let dest = scratch.appendingPathComponent("\(tag)-\(lang).wav")
             let stitched = try stitcher.stitch(track: track, runs: langRuns,
@@ -97,7 +243,7 @@ struct CodeSwitchTranscriber {
     /// `--language`, `--max-context 0` (no cross-run carry), and the
     /// model-specific prompt.
     private func whisperDecode(_ wav: URL, language: String) throws -> [Transcriber.Segment] {
-        let model = cs.modelPath(for: language)
+        let model = cs.effectiveModelPath(for: language, installed: installed) ?? ""
         let prefix = wav.deletingPathExtension().path
         var args = [
             "-m", model,
@@ -137,8 +283,12 @@ struct CodeSwitchTranscriber {
     // MARK: Helpers
 
     private func preflightModels() throws {
-        for l in cs.languages {
-            let p = cs.modelPath(for: l)
+        let active = languages
+        if active.isEmpty { throw CSError.noLanguagesInstalled }
+        for l in active {
+            guard let p = cs.effectiveModelPath(for: l, installed: installed) else {
+                throw CSError.modelMissing(lang: l, path: cs.modelPath(for: l))
+            }
             if !FileManager.default.fileExists(atPath: p) {
                 throw CSError.modelMissing(lang: l, path: p)
             }

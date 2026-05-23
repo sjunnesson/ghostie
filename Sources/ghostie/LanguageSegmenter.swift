@@ -9,7 +9,52 @@ import Foundation
 /// an in-place `--offset-t`/`--duration-t` slice (no WAV splicing).
 struct LanguageSegmenter {
     let config: Config
+    /// Disk view used for whitelist + model resolution. Captured once at
+    /// construction so a model file vanishing mid-call doesn't cause the
+    /// segmenter and the decoder to disagree about what's installed.
+    let installed: InstalledModels
+    /// Pluggable LID. Defaults to `WhisperLID` driving the same `--detect-language`
+    /// head Ghostie used pre-v2; v2 swaps in `VoxLingua107LID` once the ONNX
+    /// framework lands. Tests inject a deterministic stub to exercise the
+    /// segmenter→smoother path without a live whisper binary.
+    let identifier: LanguageIdentifier
     var cs: CodeSwitchConfig { config.codeSwitch }
+    var languages: [String] { cs.effectiveLanguages(installed: installed) }
+
+    init(config: Config,
+         installed: InstalledModels? = nil,
+         identifier: LanguageIdentifier? = nil) {
+        self.config = config
+        let inst = installed ?? Models.installed()
+        self.installed = inst
+        self.identifier = identifier ?? Self.defaultIdentifier(config: config, installed: inst)
+    }
+
+    /// Pick the best LID for this install. Prefers the v2 ONNX identifier
+    /// when its framework and model are present (the `isReady` check), and
+    /// otherwise falls back to `WhisperLID` so behaviour is unchanged on a
+    /// machine that hasn't installed the dedicated LID yet.
+    ///
+    /// The nordic-to-sv remap (KB-Whisper / the lang head confuse
+    /// no/nb/nn/da on short Swedish) is baked into the WhisperLID at
+    /// construction so the application-level policy lives next to the
+    /// model decision, not in the segmenter's hot loop.
+    static func defaultIdentifier(config: Config,
+                                  installed: InstalledModels) -> LanguageIdentifier {
+        // VoxLingua107LID stub returns isReady == false today, so this path
+        // is dormant — but it's wired so the eventual ONNX commit flips it
+        // on by changing one boolean, not by editing every call site.
+        let vox = VoxLingua107LID(modelPath: "")
+        if vox.isReady { return vox }
+        let whitelist = config.codeSwitch.effectiveLanguages(installed: installed)
+        let nordicRemap: (String) -> String = { raw in
+            let lc = raw.lowercased()
+            return ["no", "nb", "nn", "da", "no-no"].contains(lc) && whitelist.contains("sv")
+                ? "sv" : lc
+        }
+        let driver = Self.resolveDetectionModel(config: config, installed: installed)
+        return WhisperLID(binary: config.whisperBinary, model: driver, remapTop: nordicRemap)
+    }
 
     enum SegmenterError: Error, LocalizedError {
         case whisperUnavailable
@@ -86,94 +131,70 @@ struct LanguageSegmenter {
     // MARK: Phase 2 — per-segment language detection
 
     /// Label every segment with a whitelist language or `unknown`. Segments
-    /// shorter than `minDetectMs` are `unknown` *without* invoking whisper —
+    /// shorter than `minDetectMs` are `unknown` *without* invoking the LID —
     /// this is why backchannels ("mm", "ja", "yeah") never fake a switch.
     ///
-    /// IMPORTANT: this whisper-cli's `--detect-language` ignores
-    /// `--offset-t`/`--duration` and always detects from the *file start*
-    /// (verified: identical p for every offset). So each segment is physically
-    /// sliced to a temp WAV and detected on that — the only reliable Option-A
-    /// path. Track PCM is read once, not per segment.
+    /// The LID model itself is held behind `self.identifier`; this method
+    /// owns the per-segment slicing, the minDetectMs floor, and the
+    /// pcm/segment plumbing only. Any LID error on one segment falls back to
+    /// `unknownDetection` for that segment — the smoother absorbs holes.
     func detect(_ segs: [VADSegment], in wav: URL) throws -> [LanguageDetection] {
-        let model = detectionModel()
-        guard !model.isEmpty else { throw SegmenterError.whisperUnavailable }
+        let whitelist = languages
+        guard !whitelist.isEmpty else { return segs.map(unknownDetection) }
         guard segs.contains(where: { $0.durationMs >= cs.minDetectMs }) else {
             return segs.map(unknownDetection)
         }
         let pcm = (try? AudioStitcher.readPCM(wav)) ?? Data()
         let bytesPerMs = 16_000 * 2 / 1000   // 16 kHz mono Int16
-        let scratch = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("ghostie-detect-\(UUID().uuidString)")
-        try? FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: scratch) }
 
         var dets: [LanguageDetection] = []
-        for (idx, s) in segs.enumerated() {
+        for s in segs {
             if s.durationMs < cs.minDetectMs || pcm.isEmpty {
                 dets.append(unknownDetection(s)); continue
             }
             let lo = min(pcm.count, s.startMs * bytesPerMs)
             let hi = min(pcm.count, lo + min(s.durationMs, 30_000) * bytesPerMs)
             guard hi > lo else { dets.append(unknownDetection(s)); continue }
-            let slice = scratch.appendingPathComponent("seg\(idx).wav")
-            do { try AudioStitcher.writeWAV(pcm.subdata(in: lo..<hi),
-                                            to: slice, sampleRate: 16_000) }
-            catch { dets.append(unknownDetection(s)); continue }
-            let (status, out) = runWhisper([
-                "-m", model, "-f", slice.path, "-l", "auto", "--detect-language"
-            ])
-            try? FileManager.default.removeItem(at: slice)
-            guard status == 0,
-                  let (lang, p) = Self.parseDetectedLanguage(out) else {
+            let slice = pcm.subdata(in: lo..<hi)
+            let posterior: [String: Double]
+            do {
+                posterior = try identifier.identify(pcm: slice,
+                                                    sampleRateHz: 16_000,
+                                                    restrict: whitelist)
+            } catch {
                 dets.append(unknownDetection(s)); continue
             }
-            dets.append(mapped(lang: lang, p: p, segment: s))
+            dets.append(Self.detection(from: posterior,
+                                       whitelist: whitelist,
+                                       segment: s))
         }
         return dets
     }
 
-    /// Map raw whisper language → whitelist. Nordic look-alikes collapse to
-    /// `sv` (KB-Whisper / the lang head confuse no/da/nb/nn on short Swedish);
-    /// anything off-whitelist is `unknown` so smoothing can absorb it.
-    private func mapped(lang: String, p: Double, segment: VADSegment) -> LanguageDetection {
-        let nordicToSv = ["sv", "no", "nb", "nn", "da", "no-no"]
-        var top = lang.lowercased()
-        if cs.languages.contains("sv"), nordicToSv.contains(top) { top = "sv" }
-        guard cs.languages.contains(top) else { return unknownDetection(segment) }
-        let conf = min(0.999, max(0.001, p))
-        let lp: [String: Double] = [
-            top: Foundation.log(conf),
-            (cs.languages.first { $0 != top } ?? "en"): Foundation.log(1 - conf)
-        ]
-        let margin = lp[top]! - (lp.values.min() ?? lp[top]!)
+    /// Convert an identifier's log-prob posterior into a `LanguageDetection`.
+    /// `unknown` whenever the top is off-whitelist or all entries are
+    /// `-Infinity` (the "identifier had no signal" floor).
+    static func detection(from posterior: [String: Double],
+                          whitelist: [String],
+                          segment: VADSegment) -> LanguageDetection {
+        guard let topEntry = posterior.max(by: { $0.value < $1.value }),
+              topEntry.value > -.infinity,
+              whitelist.contains(topEntry.key) else {
+            return LanguageDetection(segment: segment, top: LanguageDetection.unknown,
+                                     confidence: 0, margin: 0, logprobs: [:])
+        }
+        let top = topEntry.key
+        let topLp = topEntry.value
+        let secondLp = posterior.values.filter { $0 < topLp }.max() ?? -.infinity
+        let conf = min(0.999, max(0.001, Foundation.exp(topLp)))
+        let margin = topLp - (secondLp > -.infinity ? secondLp : topLp)
         return LanguageDetection(segment: segment, top: top,
-                                 confidence: conf, margin: margin, logprobs: lp)
+                                 confidence: conf, margin: margin, logprobs: posterior)
     }
 
     private func unknownDetection(_ s: VADSegment) -> LanguageDetection {
         LanguageDetection(segment: s, top: LanguageDetection.unknown,
                           confidence: 0, margin: 0, logprobs: [:])
-    }
-
-    /// Parse whisper's auto-detect line, e.g.
-    /// `whisper_full_with_state: auto-detected language: sv (p = 0.87)`
-    /// or `detected language: en`. Returns (language, probability).
-    static func parseDetectedLanguage(_ text: String) -> (String, Double)? {
-        for line in text.split(whereSeparator: \.isNewline) {
-            let l = line.lowercased()
-            guard let r = l.range(of: "detected language:") else { continue }
-            let rest = l[r.upperBound...].trimmingCharacters(in: .whitespaces)
-            guard let lang = rest.split(whereSeparator: { $0 == " " || $0 == "(" })
-                .first.map(String.init), !lang.isEmpty else { continue }
-            var p = 1.0
-            if let pr = l.range(of: "p = ") ?? l.range(of: "p=") {
-                let tail = l[pr.upperBound...]
-                let num = tail.prefix { $0.isNumber || $0 == "." }
-                p = Double(num) ?? 1.0
-            }
-            return (lang, p)
-        }
-        return nil
     }
 
     // MARK: whisper-cli plumbing
@@ -182,23 +203,45 @@ struct LanguageSegmenter {
     /// balanced multilingual model: KB-Whisper's language-ID head is
     /// Swedish-biased and detects English as `sv (p=1.0)`. Prefer the
     /// dominant-language model (en → vanilla large-v3), then any non-KB
-    /// whitelist model, then the single-language `whisperModel`, and only
-    /// fall back to a KB model if nothing else exists.
-    private func detectionModel() -> String {
+    /// effective-whitelist model, then the single-language `whisperModel`,
+    /// and only fall back to a KB model if nothing else exists.
+    ///
+    /// Reads from `effectiveModelPath(for:installed:)` so removing a model
+    /// from disk removes it from the candidate list with no config edit.
+    /// Static so the `defaultIdentifier` factory (called during init) can
+    /// reach it without a fully-constructed `self`.
+    static func resolveDetectionModel(config: Config,
+                                      installed: InstalledModels) -> String {
         let fm = FileManager.default
-        let dom = cs.modelPath(for: cs.dominantLanguage)
-        if (cs.modelPerLanguage[cs.dominantLanguage] ?? "") != "kb-whisper-large",
-           fm.fileExists(atPath: dom) { return dom }
-        for l in cs.languages where (cs.modelPerLanguage[l] ?? "") != "kb-whisper-large" {
-            let p = cs.modelPath(for: l)
-            if fm.fileExists(atPath: p) { return p }
+        let cs = config.codeSwitch
+        let languages = cs.effectiveLanguages(installed: installed)
+        func isKB(_ lang: String) -> Bool {
+            (cs.modelPerLanguage[lang] ?? "") == "kb-whisper-large"
+        }
+        if !isKB(cs.dominantLanguage),
+           let dom = cs.effectiveModelPath(for: cs.dominantLanguage, installed: installed),
+           fm.fileExists(atPath: dom) {
+            return dom
+        }
+        for l in languages where !isKB(l) {
+            if let p = cs.effectiveModelPath(for: l, installed: installed),
+               fm.fileExists(atPath: p) {
+                return p
+            }
         }
         if fm.fileExists(atPath: config.whisperModel) { return config.whisperModel }
-        for l in cs.languages {
-            let p = cs.modelPath(for: l)
-            if fm.fileExists(atPath: p) { return p }
+        for l in languages {
+            if let p = cs.effectiveModelPath(for: l, installed: installed),
+               fm.fileExists(atPath: p) {
+                return p
+            }
         }
         return ""
+    }
+
+    /// Instance-side wrapper for VAD segmentation (still needs whisper-cli).
+    private func detectionModel() -> String {
+        Self.resolveDetectionModel(config: config, installed: installed)
     }
 
     private func runWhisper(_ args: [String]) -> (Int32, String) {
