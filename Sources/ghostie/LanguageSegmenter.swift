@@ -91,10 +91,13 @@ struct LanguageSegmenter {
               FileManager.default.fileExists(atPath: config.vadModel) else {
             throw SegmenterError.vadModelMissing(config.vadModel)
         }
-        // Drive VAD with the balanced multilingual model (NOT KB-Whisper —
-        // its language-ID head is Swedish-biased; segmentation only needs the
-        // VAD offsets but we keep one model for both phases).
-        let driverModel = detectionModel()
+        // Drive VAD with the *smallest* installed model: the segment offsets
+        // come from the Silero VAD model (`--vad-model`), not the decoder, and
+        // the decoded text is discarded, so decode quality — and even a biased
+        // language head (KB-Whisper, base.en) — is irrelevant here. Only this
+        // pass is downgraded; per-segment detection keeps the balanced LID
+        // driver (see `resolveDetectionModel`).
+        let driverModel = segmentationModel()
         guard !driverModel.isEmpty else { throw SegmenterError.whisperUnavailable }
 
         let prefix = wav.deletingPathExtension().path + ".vad"
@@ -105,6 +108,9 @@ struct LanguageSegmenter {
             "-m", driverModel,
             "-f", wav.path,
             "-l", "auto",
+            // The text is thrown away, so decode greedily (best-of 1, beam 1)
+            // rather than paying default beam-search cost over the whole track.
+            "-bo", "1", "-bs", "1",
             "--vad", "--vad-model", config.vadModel,
             "--vad-threshold", "0.5",
             "--vad-min-speech-duration-ms", "250",
@@ -213,7 +219,8 @@ struct LanguageSegmenter {
 
     // MARK: whisper-cli plumbing
 
-    /// Model used for VAD-driving *and* language detection. Must be a
+    /// Model used for per-segment language detection (and as the VAD pass's
+    /// last-resort fallback — see `resolveSegmentationModel`). Must be a
     /// balanced multilingual model: KB-Whisper's language-ID head is
     /// Swedish-biased and detects English as `sv (p=1.0)`. Prefer the
     /// dominant-language model (en → vanilla large-v3), then any non-KB
@@ -258,9 +265,32 @@ struct LanguageSegmenter {
         return ""
     }
 
+    /// Model used to *drive* the VAD/segmentation pass only. The offsets come
+    /// from the Silero VAD model, not the decoder, and the decoded text is
+    /// discarded — so the cheapest installed decode model is the right choice
+    /// (even an LID-unsuitable one like base.en). Ranked by actual on-disk
+    /// size, not catalog `approxBytes`: custom catalog entries can carry
+    /// `approxBytes == 0` and would otherwise fake "smallest". Falls back to
+    /// the LID driver so an install whose only model lives outside the catalog
+    /// (a custom `whisperModel` path) still segments instead of failing.
+    static func resolveSegmentationModel(config: Config,
+                                         installed: InstalledModels) -> String {
+        let fm = FileManager.default
+        var smallest: (path: String, bytes: Int64)?
+        for m in Models.allDecodeModels {
+            guard let attrs = try? fm.attributesOfItem(atPath: m.destPath),
+                  let bytes = attrs[.size] as? Int64 else { continue }
+            if smallest == nil || bytes < smallest!.bytes {
+                smallest = (m.destPath, bytes)
+            }
+        }
+        if let smallest { return smallest.path }
+        return resolveDetectionModel(config: config, installed: installed)
+    }
+
     /// Instance-side wrapper for VAD segmentation (still needs whisper-cli).
-    private func detectionModel() -> String {
-        Self.resolveDetectionModel(config: config, installed: installed)
+    private func segmentationModel() -> String {
+        Self.resolveSegmentationModel(config: config, installed: installed)
     }
 
     private func runWhisper(_ args: [String]) -> (Int32, String) {

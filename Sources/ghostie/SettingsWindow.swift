@@ -52,7 +52,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         guard inflightModelKey == nil else { return }
         for m in Models.required(for: cfg) {
             guard let key = rowKey(for: m) else { continue }
-            if case .missing = ModelDownloader.health(for: [m])[0].state {
+            if case .missing = ModelDownloader.health(for: [m], verifyHash: false)[0].state {
                 startDownload(m, key: key)
                 return
             }
@@ -270,6 +270,9 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         updater.cancel()
         unwireEngineObserver()
         sidebarTick?.invalidate(); sidebarTick = nil
+        // The Listening pane's per-second tick mirrors the sidebar tick: stop
+        // it here, not in its deinit — the pane can outlive the window.
+        panes.listening?.stopLiveTick()
         window = nil
         sidebar = nil
         split = nil
@@ -588,8 +591,15 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
 
     private func handleModelRowAction(_ key: String) {
         guard let model = modelForKey(key) else { return }
-        let h = ModelDownloader.health(for: [model])[0]
-        switch h.state {
+        // Hash-free check (SHA256 of a ~1.1 GB file is ~3 s on the main
+        // thread). A hash mismatch is only ever discovered by the explicit
+        // Verify/Re-verify actions below, so overlay the pane's remembered
+        // verdict — it's the state the row is actually displaying.
+        var state = ModelDownloader.health(for: [model], verifyHash: false)[0].state
+        if case .ok = state, let verdict = panes.transcription?.verifiedState(key) {
+            state = verdict
+        }
+        switch state {
         case .missing, .sizeWrong, .hashMismatch:
             if inflightModelKey == key {
                 downloader.cancel()
@@ -651,8 +661,10 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         guard inflightModelKey == nil else { return }
         panes.transcription?.setRowBusy(key, status: "Verifying (HEAD + SHA256)…")
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            _ = ModelDownloader.adopt(model)
-            DispatchQueue.main.async { self?.panes.transcription?.refreshRow(key) }
+            let state = ModelDownloader.adopt(model)
+            DispatchQueue.main.async {
+                self?.panes.transcription?.recordVerifiedState(state, forKey: key)
+            }
         }
     }
 
@@ -660,8 +672,10 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         guard inflightModelKey == nil else { return }
         panes.transcription?.setRowBusy(key, status: "Re-hashing…")
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            _ = ModelDownloader.health(for: [model])
-            DispatchQueue.main.async { self?.panes.transcription?.refreshRow(key) }
+            let state = ModelDownloader.health(for: [model])[0].state
+            DispatchQueue.main.async {
+                self?.panes.transcription?.recordVerifiedState(state, forKey: key)
+            }
         }
     }
 
@@ -2058,16 +2072,31 @@ private final class ListeningPane: NSView {
         advancedContainer.widthAnchor.constraint(equalTo: paneStack.widthAnchor).isActive = true
         refreshAdvanced()
 
-        // Per-second tick to keep the elapsed time accurate while recording.
-        // `.common` mode so the tile keeps updating when the window isn't
-        // key (e.g. the user clicks into another app with Settings still
-        // visible). `Timer.scheduledTimer` would install on `.default` only.
+        startLiveTick()
+    }
+
+    /// Per-second tick to keep the elapsed time accurate while recording.
+    /// `.common` mode so the tile keeps updating when the window isn't
+    /// key (e.g. the user clicks into another app with Settings still
+    /// visible). `Timer.scheduledTimer` would install on `.default` only.
+    /// Started by `build()` (every window open builds a fresh pane) and
+    /// stopped from `windowWillClose` — same lifecycle as the sidebar tick.
+    /// Relying on `deinit` alone left it running (with its per-second
+    /// permission checks) forever after the first Settings open, because the
+    /// pane object can outlive the window.
+    func startLiveTick() {
+        timer?.invalidate()
         let t = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
             guard let self else { return }
             self.refreshLiveStatus(self.engineState())
         }
         RunLoop.main.add(t, forMode: .common)
         timer = t
+    }
+
+    func stopLiveTick() {
+        timer?.invalidate()
+        timer = nil
     }
 
     func refreshPermissions() {
@@ -2835,6 +2864,13 @@ private final class TranscriptionPane: NSView {
     /// downloading even though they're not on disk yet. Pruned when the
     /// download settles (see `downloadDidSettle`).
     private var pendingKeys: Set<String> = []
+    /// Full-hash verdicts from the explicit Verify / Re-verify row actions,
+    /// keyed by row. Routine refreshes skip the SHA256 (existence + sidecar
+    /// size only — hashing ~1.1 GB on the main thread froze the pane), so a
+    /// hash mismatch can only be discovered by those actions; remember it
+    /// here so the badge and the action button keep reporting it until a
+    /// re-download settles.
+    private var verifiedStates: [String: ModelDownloader.HealthState] = [:]
     private weak var footerSeg: NSSegmentedControl?
     /// Retains the `+` menu's action target while the menu is open.
     private var menuTarget: MenuTarget?
@@ -2913,6 +2949,27 @@ private final class TranscriptionPane: NSView {
 
         // Quality.
         let quality = GroupCard(title: "Quality")
+        let qualityPopup = NSPopUpButton(frame: .zero, pullsDown: false)
+        qualityPopup.addItems(withTitles: ["Best quality", "Balanced (lighter)"])
+        qualityPopup.selectItem(at: cfg.transcriptionQuality == "balanced" ? 1 : 0)
+        let qualityTarget = ToggleTarget { [weak self] in
+            let next = (qualityPopup.indexOfSelectedItem == 1) ? "balanced" : "best"
+            guard let self, self.cfg.transcriptionQuality != next else { return }
+            self.change { c in c.transcriptionQuality = next }
+            // The single-language model is resolved from disk at load, not
+            // persisted, so re-read the effective pick — the tickmark on the
+            // model rows tracks it whenever code-switching isn't active.
+            self.cfg.whisperModel = Config.load().whisperModel
+            self.refreshAllRows()
+        }
+        qualityPopup.target = qualityTarget
+        qualityPopup.action = #selector(ToggleTarget.fire)
+        objc_setAssociatedObject(qualityPopup, &ToggleTarget.key, qualityTarget, .OBJC_ASSOCIATION_RETAIN)
+        qualityPopup.widthAnchor.constraint(equalToConstant: 180).isActive = true
+        quality.addRow(RowBuilder.row(
+            label: "Model for one-language calls",
+            sub: "Balanced uses a smaller model — lighter on CPU, slightly less accurate.",
+            control: qualityPopup))
         quality.addRow(buildToggleRow(
             label: "Tidy up the transcript",
             sub: "Trims the things Whisper sometimes invents in silent stretches, like \"Thanks for watching.\"",
@@ -3107,7 +3164,21 @@ private final class TranscriptionPane: NSView {
     /// stays, shown by its on-disk status.
     func downloadDidSettle(_ key: String) {
         pendingKeys.remove(key)
+        verifiedStates[key] = nil   // file replaced or removed — verdict is stale
         rebuildModelRows()
+    }
+
+    /// Last full-hash verdict for a row, if an explicit Verify / Re-verify
+    /// has run. The hash-free refresh path can't tell ok from hashMismatch.
+    func verifiedState(_ key: String) -> ModelDownloader.HealthState? {
+        verifiedStates[key]
+    }
+
+    /// Land the result of an off-main Verify / Re-verify: remember the
+    /// verdict (see `verifiedStates`) and redraw the row with it.
+    func recordVerifiedState(_ state: ModelDownloader.HealthState, forKey key: String) {
+        verifiedStates[key] = state
+        refreshRow(key)
     }
 
     /// One-line description per catalog entry: the language it decodes (and
@@ -3130,7 +3201,11 @@ private final class TranscriptionPane: NSView {
 
     func refreshRow(_ key: String) {
         guard let st = rows[key], let model = modelForKey(key), let e = entriesByKey[key] else { return }
-        let state = ModelDownloader.health(for: [model])[0].state
+        // Hash-free: this runs on pane build and every refresh, and a SHA256
+        // of a ~1.1 GB model is ~3 s on the main thread. A mismatch verdict
+        // from an explicit Verify / Re-verify overlays the cheap check.
+        var state = ModelDownloader.health(for: [model], verifyHash: false)[0].state
+        if case .ok = state, let verdict = verifiedStates[key] { state = verdict }
         let installed = Models.installed(preferredKBVariant: cfg.codeSwitch.kbWhisperVariant)
         let active = cfg.codeSwitch.effectiveLanguages(installed: installed)
         let selected: Bool

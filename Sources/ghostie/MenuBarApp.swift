@@ -3,7 +3,7 @@ import UserNotifications
 
 /// The menu bar (status bar) application. No Dock icon — it lives entirely in
 /// the macOS menu header for quick access.
-final class MenuBarApp: NSObject, NSApplicationDelegate {
+final class MenuBarApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let engine: Engine
     /// Always the engine's live config, so menu actions reflect Settings edits.
     private var config: Config { engine.config }
@@ -33,10 +33,11 @@ final class MenuBarApp: NSObject, NSApplicationDelegate {
             .requestAuthorization(options: [.alert, .sound]) { _, _ in }
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        statusItem.button?.image = GhostIcon.menuBarImage()
+        statusItem.button?.image = Self.menuBarIcon
 
         buildMenu()
         statusItem.menu = menu
+        menu.delegate = self
 
         engine.onStateChange = { [weak self] st in
             DispatchQueue.main.async { self?.render(st) }
@@ -65,22 +66,6 @@ final class MenuBarApp: NSObject, NSApplicationDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
             self?.openSettingsIfModelsMissing()
         }
-
-        // Refresh the recording timer + AX warning visibility every second.
-        // AX permission can be revoked at any moment via System Settings, so
-        // the warning must follow on its own cadence rather than only on
-        // engine state changes.
-        //
-        // Scheduled on `.common` mode (not the default `.default`-only mode
-        // that `Timer.scheduledTimer` uses) so the "Recording call… MM:SS"
-        // title keeps ticking while the menu is open — NSMenu tracking runs
-        // the runloop in `.eventTracking`, which `.common` includes.
-        let t = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
-            guard let self else { return }
-            self.render(self.engine.state)
-        }
-        RunLoop.main.add(t, forMode: .common)
-        tick = t
 
         // OTA: a delayed launch check + a daily timer (only on builds we can
         // cryptographically verify; the timer re-reads the toggle each fire).
@@ -139,6 +124,14 @@ final class MenuBarApp: NSObject, NSApplicationDelegate {
         refreshLastNote()
     }
 
+    /// AX permission can be revoked at any moment via System Settings, but
+    /// the warning row is only visible inside the menu — so re-checking when
+    /// the menu opens is exactly as fresh as the user can perceive, and it
+    /// keeps `AXIsProcessTrusted()` (a TCC round-trip) off any timer.
+    func menuWillOpen(_ menu: NSMenu) {
+        axWarningItem.isHidden = AXIsProcessTrusted()
+    }
+
     /// Transparent 1×1 placeholder. Assigning this as a menu item's image
     /// overrides macOS Sonoma+'s auto-attached glyphs (the gear that gets
     /// stuck onto the Settings… item via title + `,` heuristics). `image =
@@ -157,6 +150,24 @@ final class MenuBarApp: NSObject, NSApplicationDelegate {
         return i
     }
 
+    /// Rendered once and reused. The ghost shape never changes — only the
+    /// tint conveys state — so rebuilding the Bezier image and reassigning
+    /// `statusItem.button?.image` on every render (as we used to) just forced
+    /// a pointless WindowServer invalidation each time. Kept as a template so
+    /// `contentTintColor` actually applies — without that the menu-bar
+    /// button falls back to the raw black pixels we draw in
+    /// `GhostIcon.menuBarImage()`, which were invisible on a dark menu
+    /// bar when state was `.processing` (orange tint never took effect).
+    private static let menuBarIcon: NSImage = {
+        let img = GhostIcon.menuBarImage()
+        img.isTemplate = true
+        return img
+    }()
+    /// Last tint actually pushed to the button, so per-second renders while
+    /// recording don't re-assign an unchanged tint. `nil` matches the
+    /// button's initial state (no tint → adapts to the menu bar).
+    private var appliedTint: NSColor?
+
     private func render(_ state: EngineState) {
         var title = "● " + state.menuLabel
         if case .recording(let since) = state {
@@ -165,15 +176,9 @@ final class MenuBarApp: NSObject, NSApplicationDelegate {
         }
         statusMenuItem.title = title
         toggleItem.title = engine.isListening ? "Pause Listening" : "Resume Listening"
-        // AX permission state can change at any moment via System Settings; we
-        // re-check on every render so revocation surfaces within a second.
-        axWarningItem.isHidden = AXIsProcessTrusted()
 
-        // Always the ghost; its tint conveys state. Keep it as a template so
-        // `contentTintColor` actually applies — without that the menu-bar
-        // button falls back to the raw black pixels we draw in
-        // `GhostIcon.menuBarImage()`, which were invisible on a dark menu
-        // bar when state was `.processing` (orange tint never took effect).
+        // Always the ghost; its tint conveys state. The image itself is set
+        // once at launch (`menuBarIcon`) and never reassigned.
         let color: NSColor? = {
             switch state {
             case .recording:  return .systemRed
@@ -182,10 +187,37 @@ final class MenuBarApp: NSObject, NSApplicationDelegate {
             case .paused:     return .tertiaryLabelColor
             }
         }()
-        let img = GhostIcon.menuBarImage()
-        img.isTemplate = true
-        statusItem.button?.image = img
-        statusItem.button?.contentTintColor = color
+        if color != appliedTint {
+            statusItem.button?.contentTintColor = color
+            appliedTint = color
+        }
+
+        syncTick(for: state)
+    }
+
+    /// The 1 Hz tick exists solely to advance the "Recording call… MM:SS"
+    /// title, so it runs only while `.recording` — in every other state we
+    /// render on engine callbacks instead of polling, letting App Nap do its
+    /// thing. Called from `render` (always on the main thread), so a rapid
+    /// record/stop flap can't double-start or leak: the `tick == nil` guard
+    /// and the invalidate below are serialized.
+    private func syncTick(for state: EngineState) {
+        if case .recording = state {
+            guard tick == nil else { return }
+            // Scheduled on `.common` mode (not the default `.default`-only
+            // mode that `Timer.scheduledTimer` uses) so the title keeps
+            // ticking while the menu is open — NSMenu tracking runs the
+            // runloop in `.eventTracking`, which `.common` includes.
+            let t = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
+                guard let self else { return }
+                self.render(self.engine.state)
+            }
+            RunLoop.main.add(t, forMode: .common)
+            tick = t
+        } else {
+            tick?.invalidate()
+            tick = nil
+        }
     }
 
     private func refreshLastNote() {
@@ -248,7 +280,9 @@ final class MenuBarApp: NSObject, NSApplicationDelegate {
     private func openSettingsIfModelsMissing() {
         let required = Models.required(for: engine.config)
         let anyMissing = required.contains { m in
-            if case .missing = ModelDownloader.health(for: [m])[0].state { return true }
+            // verifyHash: false — this is a launch-time "is it present?"
+            // probe; full SHA-256 of ~GBs of models doesn't belong here.
+            if case .missing = ModelDownloader.health(for: [m], verifyHash: false)[0].state { return true }
             return false
         }
         guard anyMissing else { return }
@@ -258,6 +292,7 @@ final class MenuBarApp: NSObject, NSApplicationDelegate {
 
     @objc private func quit() {
         statusMenuItem.title = "Finishing up…"
+        tick?.invalidate(); tick = nil
         updateTimer?.cancel(); updateTimer = nil
         engine.shutdown { DispatchQueue.main.async { NSApp.terminate(nil) } }
     }

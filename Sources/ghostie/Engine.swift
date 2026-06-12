@@ -102,9 +102,16 @@ final class Engine: @unchecked Sendable {
         Log.info("Listening paused.")
     }
 
-    /// Try to process anything sitting in the backlog. Cheap when empty.
+    /// Try to process anything sitting in the backlog. The empty case — every
+    /// 10-min timer tick, normally — is answered by one directory listing
+    /// (`Backlog.isEmpty`) before `Config.load()` (which stats binaries and
+    /// re-reads the model catalog) or any entry parsing happens.
     func drainBacklog() {
         work.async {
+            guard !Backlog.isEmpty else {
+                self.onBacklogChange?(0)
+                return
+            }
             let done = Pipeline.drain(config: Config.load())
             let pending = Backlog.pendingCount
             if done > 0 { self.callsProcessed += done }

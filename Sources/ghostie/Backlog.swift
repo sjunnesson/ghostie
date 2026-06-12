@@ -117,4 +117,18 @@ enum Backlog {
     }
 
     static var pendingCount: Int { entries().count }
+
+    /// Cheap emptiness probe for the periodic retry timer: a single directory
+    /// listing, no meta.json reads or JSON parsing. Every entry lives in its
+    /// own subdirectory, so "no subdirectories" is exactly "nothing pending".
+    /// (A stray non-entry subdirectory at worst costs one full `entries()`
+    /// pass, which then ignores it as before.)
+    static var isEmpty: Bool {
+        guard let items = try? FileManager.default.contentsOfDirectory(
+            at: URL(fileURLWithPath: root),
+            includingPropertiesForKeys: [.isDirectoryKey]) else { return true }
+        return !items.contains {
+            (try? $0.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true
+        }
+    }
 }

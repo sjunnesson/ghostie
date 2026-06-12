@@ -110,24 +110,37 @@ enum Models {
     }
 
     /// Best model for the **single-language** path. Preference is catalog-driven
-    /// and reproduces the built-in order (large-v3 → KB → base.en): a balanced
-    /// multilingual model (`goodForLID`, e.g. large-v3) first, then the largest
-    /// specialist, with the small English-only floor last. A custom multilingual
-    /// model the user flagged `goodForLID` becomes a candidate too. This keeps
-    /// single-language transcription disk-driven like the code-switch path —
-    /// best installed model, no config edit. `present` is the existence test —
-    /// split out so the ordering is unit-testable without touching disk.
-    static func bestSingleLanguageModel(present: (String) -> Bool) -> String? {
-        bestSingleLanguageModel(from: ModelCatalog.load(), present: present)
+    /// and shaped by `quality` (`config.transcriptionQuality`):
+    /// - `"best"` (default) reproduces the built-in order (large-v3 → KB →
+    ///   base.en): a balanced multilingual model (`goodForLID`, e.g. large-v3)
+    ///   first, then the largest specialist, with the small English-only floor
+    ///   last. A custom multilingual model the user flagged `goodForLID`
+    ///   becomes a candidate too.
+    /// - `"balanced"` is the mirror image: a smaller specialist (base.en tier)
+    ///   first, the multilingual heavyweights last — so a plain-English call
+    ///   skips the 1.1 GB large-v3 load even when the code-switch pair is
+    ///   installed.
+    /// This keeps single-language transcription disk-driven like the code-switch
+    /// path — best installed model, no config edit. `present` is the existence
+    /// test — split out so the ordering is unit-testable without touching disk.
+    static func bestSingleLanguageModel(quality: String = "best",
+                                        present: (String) -> Bool) -> String? {
+        bestSingleLanguageModel(from: ModelCatalog.load(), quality: quality, present: present)
     }
 
     /// Catalog-injectable core of `bestSingleLanguageModel`, for unit tests.
-    /// Single-`Int64` rank (cheap to type-check): a `goodForLID` band first,
-    /// then larger size — the (goodForLID, -size) order.
+    /// Single-`Int64` rank (cheap to type-check): for `"best"` a `goodForLID`
+    /// band first, then larger size — the (goodForLID, -size) order; for
+    /// `"balanced"` both terms flip, so smaller non-`goodForLID` models win
+    /// and large-v3 is only the fallback when nothing lighter is installed.
+    /// An unknown `quality` value behaves as `"best"`.
     static func bestSingleLanguageModel(from entries: [CatalogEntry],
+                                        quality: String = "best",
                                         present: (String) -> Bool) -> String? {
         func rank(_ e: CatalogEntry) -> Int64 {
-            (e.goodForLID ? 0 : 1_000_000_000_000) - e.approxBytes
+            quality == "balanced"
+                ? (e.goodForLID ? 1_000_000_000_000 : 0) + e.approxBytes
+                : (e.goodForLID ? 0 : 1_000_000_000_000) - e.approxBytes
         }
         let sorted = entries.filter { !$0.language.isEmpty }.sorted { rank($0) < rank($1) }
         for e in sorted {
@@ -138,8 +151,8 @@ enum Models {
     }
 
     /// Disk-backed `bestSingleLanguageModel`. nil when nothing is installed.
-    static func bestSingleLanguageModelPath() -> String? {
-        bestSingleLanguageModel {
+    static func bestSingleLanguageModelPath(quality: String = "best") -> String? {
+        bestSingleLanguageModel(quality: quality) {
             FileManager.default.fileExists(atPath: $0)
         }
     }

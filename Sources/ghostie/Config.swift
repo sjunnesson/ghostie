@@ -76,6 +76,16 @@ struct Config: Codable {
     /// markers, training-data-leak phrases). Strongly recommended.
     var cleanTranscript: Bool = true
 
+    /// Quality/speed trade-off for the single-language model auto-pick.
+    /// `"best"` (the default) keeps the disk-driven order: the highest-quality
+    /// installed model wins (large-v3 once it's downloaded). `"balanced"`
+    /// prefers a smaller/faster installed model (base.en tier) even when
+    /// large-v3 is on disk — for users who fetched the code-switch pair but
+    /// don't want plain-English calls paying the 1.1 GB large-v3 decode.
+    /// Ignored when `GHOSTIE_WHISPER_MODEL` or an explicit config model pins
+    /// the path (see `load()`).
+    var transcriptionQuality: String = "best"
+
     // MARK: Code-switching (sv ↔ en — see code-switching.md)
 
     /// Per-segment, per-language transcription for mixed-language calls.
@@ -147,7 +157,7 @@ struct Config: Codable {
         case triggerBundleIds
         case requireTriggerApp, pollIntervalSeconds, endGraceSeconds, minCallSeconds
         case whisperBinary, whisperModel, language, initialPrompt, vadModel
-        case cleanTranscript, codeSwitch
+        case cleanTranscript, transcriptionQuality, codeSwitch
         case summaryProvider, summaryModel, claudeBinary, ollamaUrl, ollamaModel
         case workDir
         case autoCheckUpdates, lastUpdateCheck, updateFeedOverride
@@ -176,6 +186,7 @@ struct Config: Codable {
         initialPrompt = g(.initialPrompt, d.initialPrompt)
         vadModel = g(.vadModel, d.vadModel)
         cleanTranscript = g(.cleanTranscript, d.cleanTranscript)
+        transcriptionQuality = g(.transcriptionQuality, d.transcriptionQuality)
         codeSwitch = g(.codeSwitch, d.codeSwitch)
         summaryProvider = g(.summaryProvider, d.summaryProvider)
         summaryModel = g(.summaryModel, d.summaryModel)
@@ -244,9 +255,10 @@ struct Config: Codable {
         //   1. GHOSTIE_WHISPER_MODEL — an explicit pin, honored verbatim.
         //   2. A config.json model that points at a real file other than the
         //      default — the user (or a prior setup) deliberately chose it.
-        //   3. The best installed model (large-v3 → KB → base.en), so the
-        //      single-language path is disk-driven like the code-switch path
-        //      and gets large-v3 quality once downloaded, with no edit.
+        //   3. The best installed model for `transcriptionQuality` ("best":
+        //      large-v3 → KB → base.en; "balanced": base.en tier first), so
+        //      the single-language path is disk-driven like the code-switch
+        //      path and gets large-v3 quality once downloaded, with no edit.
         //   4. The bundled base.en (fresh self-contained install, nothing else).
         if let m = env["GHOSTIE_WHISPER_MODEL"], !m.isEmpty {
             cfg.whisperModel = m
@@ -254,7 +266,7 @@ struct Config: Codable {
             let pinned = cfg.whisperModel != Config().whisperModel
                 && FileManager.default.fileExists(atPath: cfg.whisperModel)
             if !pinned,
-               let best = Models.bestSingleLanguageModelPath() {
+               let best = Models.bestSingleLanguageModelPath(quality: cfg.transcriptionQuality) {
                 cfg.whisperModel = best
             }
             if !FileManager.default.fileExists(atPath: cfg.whisperModel),
@@ -269,7 +281,36 @@ struct Config: Codable {
         return cfg
     }
 
+    /// Cached `resolveClaudeBinary()` result for the process lifetime
+    /// (nil = not resolved yet, "" = resolved to "not found"). The resolution
+    /// can spawn a login shell, and `Config.load()` runs on every 10-minute
+    /// backlog drain tick — without this cache an absent claude meant a
+    /// `zsh -lc` spawn every 10 minutes forever. Guarded by a lock because
+    /// `Config.load()` is called from the engine's queues, the backlog timer,
+    /// and the main thread (Settings) concurrently.
+    private static var cachedClaudeBinary: String?
+    private static let claudeBinaryLock = NSLock()
+
     static func findClaudeBinary() -> String {
+        claudeBinaryLock.lock()
+        defer { claudeBinaryLock.unlock() }
+        if let cached = cachedClaudeBinary {
+            // A miss ("") stays a miss for the process lifetime; a hit is
+            // trusted only while the file still exists, so an uninstalled /
+            // moved claude triggers exactly one fresh resolution.
+            if cached.isEmpty || FileManager.default.isExecutableFile(atPath: cached) {
+                return cached
+            }
+        }
+        let resolved = resolveClaudeBinary()
+        cachedClaudeBinary = resolved
+        return resolved
+    }
+
+    /// Uncached resolution: well-known install locations first, then a PATH
+    /// lookup via `zsh -lc` — deliberately a *login* shell so the user's
+    /// Homebrew/profile PATH is in effect.
+    private static func resolveClaudeBinary() -> String {
         let home = NSHomeDirectory()
         let candidates = [
             "\(home)/.local/bin/claude",

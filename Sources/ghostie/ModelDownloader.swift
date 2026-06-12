@@ -352,9 +352,13 @@ extension ModelDownloader {
     }
 
     /// Hash + size each model on disk against its sidecar. SHA256 of a 1 GB
-    /// file is ~3 sec on Apple Silicon; this is a deliberate on-demand check,
-    /// not a launch-time one.
-    static func health(for models: [Model]) -> [Health] {
+    /// file is ~3 sec on Apple Silicon, so the hash is opt-out: pass
+    /// `verifyHash: false` for launch-time / Settings-refresh "is it present?"
+    /// checks — existence plus the sidecar size comparison only, which the
+    /// sidecar already records (and verified against `x-linked-size` at
+    /// download time). The default keeps the full hash for `ghostie doctor
+    /// models` and explicit re-verify actions.
+    static func health(for models: [Model], verifyHash: Bool = true) -> [Health] {
         let fm = FileManager.default
         return models.map { m in
             guard fm.fileExists(atPath: m.destPath),
@@ -367,9 +371,11 @@ extension ModelDownloader {
             if size != side.size {
                 return Health(model: m, state: .sizeWrong(onDisk: size, expected: side.size))
             }
-            let got = hash(file: m.destPath)
-            if got.caseInsensitiveCompare(side.etag) != .orderedSame {
-                return Health(model: m, state: .hashMismatch(onDisk: got, expected: side.etag))
+            if verifyHash {
+                let got = hash(file: m.destPath)
+                if got.caseInsensitiveCompare(side.etag) != .orderedSame {
+                    return Health(model: m, state: .hashMismatch(onDisk: got, expected: side.etag))
+                }
             }
             return Health(model: m, state: .ok(etag: side.etag, size: size))
         }
