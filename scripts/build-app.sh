@@ -126,18 +126,26 @@ if [ "$SELFCONTAINED" = "1" ]; then
     git clone --depth 1 --branch "$WHISPER_TAG" \
       https://github.com/ggerganov/whisper.cpp "$SRC"
   fi
-  if [ ! -x "$SRC/build/bin/whisper-cli" ]; then
-    echo "==> Building static whisper-cli (Metal embedded)…"
+  if [ ! -x "$SRC/build/bin/whisper-cli" ] || [ ! -x "$SRC/build/bin/whisper-server" ]; then
+    echo "==> Building static whisper-cli + whisper-server (Metal embedded)…"
     cmake -S "$SRC" -B "$SRC/build" -DCMAKE_BUILD_TYPE=Release \
       -DBUILD_SHARED_LIBS=OFF -DGGML_METAL_EMBED_LIBRARY=ON \
       -DWHISPER_BUILD_EXAMPLES=ON -DWHISPER_BUILD_TESTS=OFF >/dev/null
-    cmake --build "$SRC/build" -j --config Release --target whisper-cli >/dev/null
+    cmake --build "$SRC/build" -j --config Release \
+      --target whisper-cli --target whisper-server >/dev/null
   fi
   cp "$SRC/build/bin/whisper-cli" "$APP/Contents/Resources/whisper-cli"
   # whisper.cpp is MIT — carry its license next to the redistributed binary.
   [ -f "$SRC/LICENSE" ] && cp "$SRC/LICENSE" "$APP/Contents/Resources/whisper.cpp.LICENSE"
   echo "    bundled whisper-cli ($(otool -L "$APP/Contents/Resources/whisper-cli" | grep -c dylib) dynamic libs)"
   NESTED_BINS+=("$APP/Contents/Resources/whisper-cli")
+
+  # whisper-server: the resident language-ID head for code-switching (one
+  # model load per call instead of one per segment). Resolved at runtime via
+  # Config.bundledResource("whisper-server") — keeps the .dmg self-contained.
+  cp "$SRC/build/bin/whisper-server" "$APP/Contents/Resources/whisper-server"
+  echo "    bundled whisper-server ($(otool -L "$APP/Contents/Resources/whisper-server" | grep -c dylib) dynamic libs)"
+  NESTED_BINS+=("$APP/Contents/Resources/whisper-server")
 
   # Whisper speech model (ggml-base.en.bin, ~140 MB) is intentionally NOT
   # bundled — it's downloaded on first launch from Hugging Face by

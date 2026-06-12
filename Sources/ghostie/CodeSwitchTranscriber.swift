@@ -64,7 +64,15 @@ struct CodeSwitchTranscriber {
         throws -> (me: [Transcriber.Segment], participants: [Transcriber.Segment]) {
 
         try preflightModels()
-        let seg = LanguageSegmenter(config: config, installed: installed)
+        // ONE identifier for the whole call: when it's a ServerWhisperLID the
+        // resident whisper-server stays loaded across BOTH tracks' detect
+        // passes (and the verify pass below), and this defer tears it down
+        // exactly once whether we return or throw — a throw backlogs the call
+        // and a retry starts a fresh server. (A hard crash skips the defer;
+        // that's the one path that can orphan a whisper-server.)
+        let lid = LanguageSegmenter.defaultIdentifier(config: config, installed: installed)
+        defer { lid.shutdown() }
+        let seg = LanguageSegmenter(config: config, installed: installed, identifier: lid)
 
         let meSegs = try seg.segments(for: me)
         let partSegs = try seg.segments(for: participants)
@@ -108,8 +116,9 @@ struct CodeSwitchTranscriber {
         // longer and cleaner than the per-VAD-segment evidence the smoother
         // saw, so re-checking each run with the LID catches the rare cases
         // where smoothing routed a run to the wrong model.
-        let meVerified = verifyRunLanguages(meSnapped, in: mePcm, tag: "me")
-        let partVerified = verifyRunLanguages(partSnapped, in: partPcm, tag: "participants")
+        let meVerified = verifyRunLanguages(meSnapped, in: mePcm, tag: "me", using: lid)
+        let partVerified = verifyRunLanguages(partSnapped, in: partPcm,
+                                              tag: "participants", using: lid)
 
         let callID = me.deletingLastPathComponent().lastPathComponent
         let meOut = try decode(runs: meVerified, pcm: mePcm,
@@ -125,15 +134,24 @@ struct CodeSwitchTranscriber {
     /// runs in original order.
     ///
     /// Public so the selftest can drive it with a deterministic stub
-    /// identifier (no whisper-cli needed).
+    /// identifier (no whisper-cli needed). `using` lets `transcribeBoth`
+    /// share its per-call identifier (and its resident server) instead of
+    /// building a second one here.
     func verifyRunLanguages(_ runs: [LanguageRun],
                             in pcm: Data,
-                            tag: String = "") -> [LanguageRun] {
+                            tag: String = "",
+                            using shared: LanguageIdentifier? = nil) -> [LanguageRun] {
         guard cs.verifyMarginDb > 0, runs.count >= 1, !pcm.isEmpty else { return runs }
         let active = languages
         guard active.count >= 2 else { return runs }
-        let lid = verifier ?? LanguageSegmenter.defaultIdentifier(
-            config: config, installed: installed)
+        // Precedence: injected test verifier → the caller's per-call
+        // identifier → a locally-built default. Only the locally-built one is
+        // ours to shut down (a resident server must not leak from this scope).
+        let built: LanguageIdentifier? = (verifier == nil && shared == nil)
+            ? LanguageSegmenter.defaultIdentifier(config: config, installed: installed)
+            : nil
+        defer { built?.shutdown() }
+        let lid = verifier ?? shared ?? built!
         let bytesPerMs = 16_000 * 2 / 1000
 
         var out: [LanguageRun] = []

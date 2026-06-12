@@ -1033,6 +1033,47 @@ func runCodeSwitchSelfTest() -> Bool {
               (try? ThrowingLID().identify(pcm: Data(), sampleRateHz: 16_000, restrict: [])) == nil)
     }
 
+    // ServerWhisperLID's pure helpers (the resident whisper-server LID).
+    // verbose_json gotcha (verified on whisper.cpp 1.8.4): `detected_language`
+    // is the FULL ENGLISH NAME ("english"), never a code — the ISO code must
+    // come from the argmax of `language_probabilities` (a thresholded map
+    // summing to < 1) and the confidence from
+    // `detected_language_probability`. No process, network, or models here.
+    do {
+        let en = #"{"task":"transcribe","detected_language":"english","detected_language_probability":0.9937,"language_probabilities":{"en":0.9937,"ja":0.0014,"sv":0.0008},"text":""}"#
+        let pEn = ServerWhisperLID.parseDetection(Data(en.utf8))
+        check("server parse: ISO code from probabilities argmax, not the English name",
+              pEn?.code == "en" && abs((pEn?.prob ?? 0) - 0.9937) < 1e-9,
+              "got \(String(describing: pEn))")
+
+        let sv = #"{"detected_language":"swedish","detected_language_probability":0.71,"language_probabilities":{"sv":0.71,"no":0.18,"da":0.06},"text":""}"#
+        let pSv = ServerWhisperLID.parseDetection(Data(sv.utf8))
+        check("server parse: thresholded map (sums < 1) still argmaxes correctly",
+              pSv?.code == "sv" && abs((pSv?.prob ?? 0) - 0.71) < 1e-9,
+              "got \(String(describing: pSv))")
+
+        let noProb = #"{"detected_language":"swedish","language_probabilities":{"sv":0.8,"en":0.1}}"#
+        check("server parse: missing detected_language_probability falls back to argmax value",
+              abs((ServerWhisperLID.parseDetection(Data(noProb.utf8))?.prob ?? 0) - 0.8) < 1e-9)
+
+        let noMap = #"{"detected_language":"english","detected_language_probability":0.99}"#
+        check("server parse: missing language_probabilities → nil (name is never parsed)",
+              ServerWhisperLID.parseDetection(Data(noMap.utf8)) == nil)
+
+        // Errors come back as HTTP 400 with a PLAIN TEXT body, not JSON.
+        check("server parse: plain-text error body ('Invalid request') → nil",
+              ServerWhisperLID.parseDetection(Data("Invalid request".utf8)) == nil)
+
+        // Multipart body: the three verified fields, proper boundary framing.
+        let body = String(data: ServerWhisperLID.multipartBody(
+            wav: Data("RIFFstub".utf8), boundary: "B"), encoding: .utf8) ?? ""
+        check("server multipart: carries file + detect_language + verbose_json",
+              body.contains("name=\"file\"") && body.contains("RIFFstub")
+              && body.contains("name=\"detect_language\"\r\n\r\ntrue")
+              && body.contains("name=\"response_format\"\r\n\r\nverbose_json")
+              && body.hasSuffix("--B--\r\n"))
+    }
+
     // Optional end-to-end audio fixtures (Tests/Fixtures) — skipped cleanly
     // when not present so `ghostie selftest` stays green without 2 GB models.
     let fixtures = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
@@ -1159,6 +1200,36 @@ func printHelp() {
     """)
 }
 
+// MARK: - lid-probe (hidden)
+
+/// Hidden field-debugging subcommand: builds the default language identifier
+/// (resident whisper-server when available, else spawn-per-segment
+/// whisper-cli), runs it on one 16 kHz mono WAV, prints the posterior, and
+/// shuts the server down. Not part of any pipeline and not listed in help.
+func cmdLidProbe(_ config: Config, wavPath: String) {
+    let installed = Models.installed(preferredKBVariant: config.codeSwitch.kbWhisperVariant)
+    var restrict = config.codeSwitch.effectiveLanguages(installed: installed)
+    if restrict.count < 2 { restrict = ["en", "sv"] }
+    let lid = LanguageSegmenter.defaultIdentifier(config: config, installed: installed)
+    defer { lid.shutdown() }
+    print("identifier: \(lid.description)")
+    print("whitelist:  \(restrict.joined(separator: ", "))")
+    do {
+        let pcm = try AudioStitcher.readPCM(URL(fileURLWithPath: wavPath))
+        let t0 = Date()
+        let posterior = try lid.identify(pcm: pcm, sampleRateHz: 16_000, restrict: restrict)
+        let elapsed = Date().timeIntervalSince(t0)
+        for (lang, lp) in posterior.sorted(by: { $0.value > $1.value }) {
+            print(String(format: "  %@  p=%.4f  (logp %+.4f)", lang, Foundation.exp(lp), lp))
+        }
+        print(String(format: "identified in %.2f s", elapsed))
+    } catch {
+        print("lid-probe failed: \(error.localizedDescription)")
+        lid.shutdown()   // exit() skips the defer — tear down explicitly
+        exit(1)
+    }
+}
+
 // MARK: - Entry
 
 let config = Config.load()
@@ -1202,6 +1273,10 @@ case "icon":
     // Hidden: render the app icon PNG (used by scripts/build-app.sh).
     let out = args.count > 1 ? args[1] : "icon.png"
     exit(GhostIcon.writeAppIconPNG(to: out) ? 0 : 1)
+case "lid-probe":
+    // Hidden: run the active language identifier on a WAV (field debugging).
+    guard args.count > 1 else { Log.error("Usage: ghostie lid-probe <wav>"); exit(1) }
+    cmdLidProbe(config, wavPath: args[1])
 case "update":
     cmdUpdate(config, install: args.contains("--install"))
 case "selftest":

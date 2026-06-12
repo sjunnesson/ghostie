@@ -56,6 +56,13 @@ struct Config: Codable {
     /// Path to the whisper.cpp CLI binary. Auto-detected if empty.
     var whisperBinary: String = ""
 
+    /// Path to the whisper.cpp `whisper-server` binary. Auto-detected if
+    /// empty, same resolution chain as `whisperBinary` (bundled .app copy →
+    /// Homebrew/local paths). Used by the code-switching LID to keep one
+    /// resident model loaded per call instead of reloading it per segment;
+    /// absent is fine — the LID falls back to spawn-per-segment whisper-cli.
+    var whisperServerBinary: String = ""
+
     /// Path to the ggml whisper model file.
     var whisperModel: String = "\(NSHomeDirectory())/.ghostie/models/ggml-base.en.bin"
 
@@ -156,7 +163,8 @@ struct Config: Codable {
         case notesFolder, keepAudio, saveTranscript, triggerBundlePrefixes
         case triggerBundleIds
         case requireTriggerApp, pollIntervalSeconds, endGraceSeconds, minCallSeconds
-        case whisperBinary, whisperModel, language, initialPrompt, vadModel
+        case whisperBinary, whisperServerBinary, whisperModel, language
+        case initialPrompt, vadModel
         case cleanTranscript, transcriptionQuality, codeSwitch
         case summaryProvider, summaryModel, claudeBinary, ollamaUrl, ollamaModel
         case workDir
@@ -181,6 +189,7 @@ struct Config: Codable {
         endGraceSeconds = g(.endGraceSeconds, d.endGraceSeconds)
         minCallSeconds = g(.minCallSeconds, d.minCallSeconds)
         whisperBinary = g(.whisperBinary, d.whisperBinary)
+        whisperServerBinary = g(.whisperServerBinary, d.whisperServerBinary)
         whisperModel = g(.whisperModel, d.whisperModel)
         language = g(.language, d.language)
         initialPrompt = g(.initialPrompt, d.initialPrompt)
@@ -246,6 +255,15 @@ struct Config: Codable {
         } else if cfg.whisperBinary.isEmpty
                || !FileManager.default.isExecutableFile(atPath: cfg.whisperBinary) {
             cfg.whisperBinary = Config.findWhisperBinary()
+        }
+        // whisper-server: identical precedence to whisper-cli above. "" is a
+        // valid outcome — the LID then uses the spawn-per-segment fallback.
+        if let bundled = Config.bundledResource("whisper-server"),
+           FileManager.default.isExecutableFile(atPath: bundled) {
+            cfg.whisperServerBinary = bundled
+        } else if cfg.whisperServerBinary.isEmpty
+               || !FileManager.default.isExecutableFile(atPath: cfg.whisperServerBinary) {
+            cfg.whisperServerBinary = Config.findWhisperServerBinary()
         }
         if cfg.claudeBinary.isEmpty
            || !FileManager.default.isExecutableFile(atPath: cfg.claudeBinary) {
@@ -357,6 +375,24 @@ struct Config: Codable {
             "/usr/local/bin/whisper-cpp",
             "/opt/homebrew/bin/whisper",
             "/usr/local/bin/whisper"
+        ]
+        for c in candidates where FileManager.default.isExecutableFile(atPath: c) {
+            return c
+        }
+        return ""
+    }
+
+    /// `whisper-server` resolution, mirroring `findWhisperBinary`: bundled
+    /// .app copy (self-contained .dmg) → known Homebrew/local paths → "".
+    /// Never persisted, so it self-heals across machines like the others.
+    static func findWhisperServerBinary() -> String {
+        if let bundled = bundledResource("whisper-server"),
+           FileManager.default.isExecutableFile(atPath: bundled) {
+            return bundled
+        }
+        let candidates = [
+            "/opt/homebrew/bin/whisper-server",
+            "/usr/local/bin/whisper-server"
         ]
         for c in candidates where FileManager.default.isExecutableFile(atPath: c) {
             return c

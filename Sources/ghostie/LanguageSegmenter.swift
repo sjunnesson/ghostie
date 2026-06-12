@@ -59,6 +59,19 @@ struct LanguageSegmenter {
                 ? "sv" : lc
         }
         let driver = Self.resolveDetectionModel(config: config, installed: installed)
+        // Prefer the resident whisper-server head: one model load per call
+        // (~0.95 s) instead of one per segment (~4.8 s each via whisper-cli),
+        // bit-identical probabilities. Construction is cheap — the server is
+        // lazily spawned on the first identify, so building this for a
+        // description (doctor) costs nothing. Falls back to WhisperLID when
+        // the server binary isn't on this machine, so existing installs
+        // never regress.
+        if !config.whisperServerBinary.isEmpty,
+           FileManager.default.isExecutableFile(atPath: config.whisperServerBinary),
+           !driver.isEmpty, FileManager.default.fileExists(atPath: driver) {
+            return ServerWhisperLID(serverBinary: config.whisperServerBinary,
+                                    model: driver, remapTop: nordicRemap)
+        }
         return WhisperLID(binary: config.whisperBinary, model: driver, remapTop: nordicRemap)
     }
 
