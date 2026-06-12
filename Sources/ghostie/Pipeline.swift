@@ -199,8 +199,8 @@ struct Pipeline {
         // installed on disk. With one model, the single-language path runs
         // exactly as it did pre-v2. Users control behaviour by what they
         // install, not by a Settings toggle — the disk IS the whitelist.
-        let installed = Models.installed()
         let cs = config.codeSwitch
+        let installed = Models.installed(preferredKBVariant: cs.kbWhisperVariant)
         let active = cs.effectiveLanguages(installed: installed)
         if active.count >= 2 {
             Log.info("Code-switching transcription on (languages: "

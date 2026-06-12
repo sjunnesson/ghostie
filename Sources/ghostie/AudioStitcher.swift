@@ -54,8 +54,17 @@ struct AudioStitcher {
     /// `silencePadMs` of zeroes between consecutive runs.
     func stitch(track: URL, runs: [LanguageRun], to dest: URL,
                 silencePadMs: Int) throws -> Stitched {
+        try stitch(pcm: try Self.readPCM(track), runs: runs,
+                   to: dest, silencePadMs: silencePadMs)
+    }
+
+    /// Same as `stitch(track:…)` but over already-read PCM, so a caller that
+    /// holds the track's PCM (the codeswitch path reads it once per track) can
+    /// stitch every per-language batch without re-reading and re-parsing the
+    /// WAV from disk each time.
+    func stitch(pcm: Data, runs: [LanguageRun], to dest: URL,
+                silencePadMs: Int) throws -> Stitched {
         guard !runs.isEmpty else { throw StitchError.noRuns }
-        let pcm = try Self.readPCM(track)
         let total = pcm.count / bytesPerSample
 
         func sampleIndex(_ ms: Int) -> Int {
@@ -122,17 +131,19 @@ struct AudioStitcher {
     // can land mid-syllable. The decoder hallucinates duplicated half-words
     // when split mid-syllable; snapping to silence preserves word boundaries.
 
-    /// Trough centers (ms from track start) near `nearMs`, within `searchMs`
-    /// on either side. A "trough" is a contiguous span of ≥ `minMs` of audio
+    /// Trough centers (ms from track start) within the half-open window
+    /// [`loMs`, `hiMs`). A "trough" is a contiguous span of ≥ `minMs` of audio
     /// whose 20 ms-frame RMS sits below `thresholdDb` dBFS. Returns sorted
     /// centers; empty when no trough qualifies.
     ///
     /// Operates on canonical 16 kHz mono Int16-LE PCM (Ghostie's invariant).
     /// 20 ms frame size matches typical VAD granularity; smaller frames over-
-    /// fragment, larger ones miss short word-boundary gaps.
+    /// fragment, larger ones miss short word-boundary gaps. The caller passes
+    /// an explicit window (e.g. bounded to the two runs being split) so a
+    /// returned center can never land outside the span it's meant to divide.
     static func troughs(in pcm: Data,
-                        nearMs: Int,
-                        searchMs: Int,
+                        loMs: Int,
+                        hiMs: Int,
                         minMs: Int = 80,
                         thresholdDb: Double = -40) -> [Int] {
         let sampleRate = 16_000
@@ -140,31 +151,35 @@ struct AudioStitcher {
         let frameSamples = sampleRate * frameMs / 1000   // 320
         let frameBytes = frameSamples * 2
         let bytesPerMs = sampleRate * 2 / 1000           // 32
-        let lo = max(0, (nearMs - searchMs) * bytesPerMs)
-        let hi = min(pcm.count, (nearMs + searchMs) * bytesPerMs)
+        let lo = max(0, loMs * bytesPerMs)
+        let hi = min(pcm.count, hiMs * bytesPerMs)
         guard hi > lo + frameBytes else { return [] }
 
-        // Build a dBFS timeline (one entry per 20 ms frame).
+        // Build a dBFS timeline (one entry per 20 ms frame). Bind the buffer
+        // once for the whole scan instead of re-acquiring an unsafe pointer
+        // per sample (tens of thousands of closure entries per boundary).
         var energies: [Double] = []
-        var p = lo
-        while p + frameBytes <= hi {
-            var sum: Double = 0
-            for i in 0..<frameSamples {
-                let off = p + i * 2
-                let s = pcm.withUnsafeBytes { ptr -> Int16 in
-                    Int16(littleEndian: ptr.load(fromByteOffset: off, as: Int16.self))
+        pcm.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+            var p = lo
+            while p + frameBytes <= hi {
+                var sum: Double = 0
+                for i in 0..<frameSamples {
+                    let s = Int16(littleEndian:
+                        raw.loadUnaligned(fromByteOffset: p + i * 2, as: Int16.self))
+                    let v = Double(s) / 32768.0
+                    sum += v * v
                 }
-                let v = Double(s) / 32768.0
-                sum += v * v
+                let rms = (sum / Double(frameSamples)).squareRoot()
+                energies.append(rms > 0 ? 20 * Foundation.log10(rms) : -200)
+                p += frameBytes
             }
-            let rms = (sum / Double(frameSamples)).squareRoot()
-            energies.append(rms > 0 ? 20 * Foundation.log10(rms) : -200)
-            p += frameBytes
         }
 
         // Contiguous below-threshold runs ≥ minMs long → record center.
+        // Floor at one frame so a misconfigured `minMs == 0` can't make every
+        // single quiet frame qualify as a trough.
         var out: [Int] = []
-        let framesInMin = (minMs + frameMs - 1) / frameMs
+        let framesInMin = max(1, (minMs + frameMs - 1) / frameMs)
         var i = 0
         while i < energies.count {
             if energies[i] < thresholdDb {

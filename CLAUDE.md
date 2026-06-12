@@ -73,18 +73,29 @@ the same code drives the menu-bar app and the headless daemon.
   `<prefix>.json`.
 - **`TranscriptCleaner.swift`** — the per-track hallucination guard. Deliberately
   conservative (a single legitimate "Okay." survives). Covered by `selftest`.
-- **Code-switching (sv↔en, opt-in via `config.codeSwitch.enabled`)** — replaces
-  the single whisper pass when enabled; per-track cleaning + the timestamp
-  merge in `Pipeline` are unchanged. `LanguageSegmenter.swift` (VAD segments +
-  per-segment language detection via whisper-cli), `Smoother.swift` (the pure,
-  testable two-pass core: per-track median/hysteresis then cross-track Bayesian
-  refine; also defines the shared `VADSegment`/`LanguageDetection`/
-  `LanguageRun`/`LanguageTimeline` types), `AudioStitcher.swift` (native
-  16 kHz-mono WAV slicing into per-language stitched WAVs with silence pads +
-  an offset table — no ffmpeg), `CodeSwitchTranscriber.swift` (orchestrates and
-  returns per-track `Transcriber.Segment`s; any whisper failure throws so the
-  whole call backlogs and re-runs cleanly — no partial state).
-  `ModelDownloader.swift` fetches the dual models from Hugging Face into
+- **Code-switching (N-language, e.g. sv↔en)** — active whenever ≥2 per-language
+  whisper models are installed on disk; **the disk is the whitelist**, not a
+  Settings toggle (there is no `codeSwitch.enabled` flag). `codeSwitch.languages`
+  empty (the default) means "use whatever `Models.installed()` reports";
+  a non-empty list is an explicit override **and** the "I want code-switching"
+  intent signal Settings writes (so `Models.required` knows whether to fetch the
+  pair). `CodeSwitchConfig.effectiveLanguages(installed:)` / `effectiveDominant`
+  / `effectiveModelPath` resolve config ∩ disk into the single whitelist every
+  stage (segmenter, smoother, verifier, decoder) reads — they must not diverge.
+  When active it replaces the single whisper pass; per-track cleaning + the
+  timestamp merge in `Pipeline` are unchanged. `LanguageSegmenter.swift` (VAD
+  segments + per-segment language detection), `LanguageIdentifier.swift` (the
+  pluggable LID seam: `WhisperLID` today, `VoxLingua107LID` stub for the ONNX
+  path; plus the `LogProb.skewed` log-prob shape both it and the smoother share),
+  `Smoother.swift` (the pure, testable two-pass core: per-track median/hysteresis
+  then cross-track Bayesian refine in log-space; also defines the shared
+  `VADSegment`/`LanguageDetection`/`LanguageRun`/`LanguageTimeline` types),
+  `AudioStitcher.swift` (native 16 kHz-mono WAV slicing into per-language
+  stitched WAVs with silence pads + an offset table — no ffmpeg; also the
+  snap-to-silence `troughs` energy scan), `CodeSwitchTranscriber.swift`
+  (orchestrates and returns per-track `Transcriber.Segment`s; any whisper failure
+  throws so the whole call backlogs and re-runs cleanly — no partial state).
+  `ModelDownloader.swift` fetches the per-language models from Hugging Face into
   `~/.ghostie/models/` (shared by the Settings “Download models” button and
   `ghostie fetch-models`; variant→URL/filename mapping kept in lockstep with
   `setup.sh` and `CodeSwitchConfig.modelPath`).
@@ -108,7 +119,11 @@ the same code drives the menu-bar app and the headless daemon.
   (`GHOSTIE_NOTES_FOLDER`, `GHOSTIE_WHISPER_MODEL`, `GHOSTIE_SUMMARY_MODEL`).
   Binary/model paths are **never persisted** so resolution (including
   `.app`-bundled resources for the self-contained `.dmg`) re-runs on every
-  machine and self-heals stale paths. `Config.load()` is re-read per call, so
+  machine and self-heals stale paths. The single-language `whisperModel` is
+  disk-resolved at load (like `whisperBinary`): `GHOSTIE_WHISPER_MODEL` or an
+  explicit non-default config file wins, else `Models.bestSingleLanguageModel`
+  picks the best installed model (large-v3 → KB → base.en) — don't revert this
+  to a hardcoded base.en default. `Config.load()` is re-read per call, so
   Settings changes apply with no restart.
 - Supporting: `WavWriter`, `AudioChunkConverter`, `MenuBarApp`,
   `SettingsWindow`, `GhostIcon`, `Logger`.

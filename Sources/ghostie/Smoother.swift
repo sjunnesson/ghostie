@@ -79,24 +79,35 @@ struct Smoother {
     let priorLookbackMs: Int
     let runPaddingMs: Int
 
-    init(config: CodeSwitchConfig, window: Int) {
-        // Pre-v2 capped at 2 (`Array(config.languages.prefix(2))`) because
-        // the binary `other()` helper had no representation for a third
-        // language. With the log-space math + skewed() helper below, an
-        // arbitrary-length whitelist is well-defined and the smoother runs
-        // correctly for N ≥ 2. Empty / 1-element whitelists fall back to
-        // sv/en so existing pre-config behaviour is unchanged.
-        self.languages = config.languages.count >= 2
-            ? config.languages
-            : ["sv", "en"]
+    /// `languages` is the **resolved** whitelist the rest of the pipeline
+    /// labels and decodes against (`cs.effectiveLanguages(installed:)`), not
+    /// raw `config.languages` — passing the latter let the smoother emit runs
+    /// in a language no other stage could detect or decode. Empty / 1-element
+    /// whitelists fall back to sv/en so the pure unit tests stay meaningful.
+    /// `dominantLanguage` is clamped into `languages` so the no-prior fallback
+    /// never skews toward a language with zero mass here.
+    init(config: CodeSwitchConfig, languages: [String], window: Int) {
+        var seen = Set<String>()
+        let deduped = languages.filter { seen.insert($0).inserted }
+        self.languages = deduped.count >= 2 ? deduped : ["sv", "en"]
         self.window = max(1, window)
         self.minSwitchSegments = max(1, config.minSwitchSegments)
         self.minSwitchMs = max(1, config.minSwitchMs)
         self.maxFillGapMs = config.maxFillGapMs
-        self.dominantLanguage = config.dominantLanguage
+        self.dominantLanguage = self.languages.contains(config.dominantLanguage)
+            ? config.dominantLanguage
+            : (self.languages.first ?? config.dominantLanguage)
         self.crossTrackPriorStrength = min(1.0, max(0.5, config.crossTrackPriorStrength))
         self.priorLookbackMs = config.priorLookbackMs
         self.runPaddingMs = config.runPaddingMs
+    }
+
+    /// Unit-test convenience: build a smoother straight from a config's own
+    /// `languages` list (the pure selftest exercises the algorithm with an
+    /// explicit whitelist). Production always goes through the primary init
+    /// with the resolved effective whitelist.
+    init(config: CodeSwitchConfig, window: Int) {
+        self.init(config: config, languages: config.languages, window: window)
     }
 
     /// Log-prob distribution skewed toward `target` with mass `mass` on that
@@ -104,14 +115,7 @@ struct Smoother {
     /// other `N − 1` languages. The N-language replacement for the old
     /// `[target: x, other(target): 1-x]` binary shape.
     private func skewed(toward target: String, with mass: Double) -> [String: Double] {
-        let clamped = min(0.999, max(0.001, mass))
-        let n = languages.count
-        let spread = n > 1 ? (1 - clamped) / Double(n - 1) : 1.0
-        var out: [String: Double] = [:]
-        for l in languages {
-            out[l] = Foundation.log(l == target ? clamped : spread)
-        }
-        return out
+        LogProb.skewed(toward: target, mass: mass, over: languages)
     }
 
     // MARK: Pass 1 — per-track preliminary
@@ -191,13 +195,10 @@ struct Smoother {
         let usable = lp.count == languages.count && det.top != LanguageDetection.unknown
         if !usable {
             if languages.contains(det.top), det.confidence > 0 {
-                let c = min(0.99, max(0.5, det.confidence))
-                let spread = (1 - c) / Double(max(1, languages.count - 1))
-                var out: [String: Double] = [:]
-                for l in languages {
-                    out[l] = Foundation.log(l == det.top ? c : spread)
-                }
-                return out
+                // Derive a likelihood from `top` + confidence; the (0.5, 0.99)
+                // clamp keeps a single confident detection from dominating.
+                return LogProb.skewed(toward: det.top, mass: det.confidence,
+                                      over: languages, clamp: 0.5...0.99)
             }
             // Uniform → equal log-prob everywhere. Value is log(1/N).
             let u = Foundation.log(1.0 / Double(languages.count))

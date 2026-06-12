@@ -27,14 +27,22 @@ struct CodeSwitchTranscriber {
          installed: InstalledModels? = nil,
          verifier: LanguageIdentifier? = nil) {
         self.config = config
-        self.installed = installed ?? Models.installed()
+        self.installed = installed ?? Models.installed(
+            preferredKBVariant: config.codeSwitch.kbWhisperVariant)
         self.verifier = verifier
     }
 
     /// Languages this call will actually label audio with — `cs.languages`
     /// filtered against installed models, or installed if `cs.languages` is
-    /// empty. The single source of truth for downstream consumers.
+    /// empty. The single source of truth for downstream consumers: the
+    /// segmenter, the smoother, the verifier, and the decoder all read this,
+    /// so none of them can label or route a run to a language another stage
+    /// can't handle.
     var languages: [String] { cs.effectiveLanguages(installed: installed) }
+
+    /// `dominantLanguage` clamped into `languages`, so the decode off-whitelist
+    /// bucket and the smoother prior always point at an installed language.
+    var dominant: String { cs.effectiveDominant(installed: installed) }
 
     enum CSError: Error, LocalizedError {
         case noLanguagesInstalled
@@ -62,11 +70,21 @@ struct CodeSwitchTranscriber {
         let partSegs = try seg.segments(for: participants)
         if meSegs.isEmpty && partSegs.isEmpty { return ([], []) }
 
-        let meDet = try seg.detect(meSegs, in: me)
-        let partDet = try seg.detect(partSegs, in: participants)
+        // Read each track's PCM once here and thread it through detect → snap →
+        // verify → decode, rather than re-reading (and re-parsing) the WAV at
+        // every stage. ~60 MB for a 30-min track, previously decoded ~4× per
+        // track; now once.
+        let mePcm = (try? AudioStitcher.readPCM(me)) ?? Data()
+        let partPcm = (try? AudioStitcher.readPCM(participants)) ?? Data()
 
-        let smMe = Smoother(config: cs, window: cs.smoothingWindowMe)
-        let smPart = Smoother(config: cs, window: cs.smoothingWindowParticipants)
+        let meDet = try seg.detect(meSegs, pcm: mePcm)
+        let partDet = try seg.detect(partSegs, pcm: partPcm)
+
+        // Build the smoother with the SAME effective whitelist the segmenter
+        // labels against (not raw cs.languages) so it can't emit a run in a
+        // language the decoder has no model for.
+        let smMe = Smoother(config: cs, languages: languages, window: cs.smoothingWindowMe)
+        let smPart = Smoother(config: cs, languages: languages, window: cs.smoothingWindowParticipants)
 
         // Pass 1 on both tracks, then Pass 2 each using the *other* track's
         // preliminary (never refined) timeline — no within-call feedback loop.
@@ -80,8 +98,6 @@ struct CodeSwitchTranscriber {
         // Snap each language-switch boundary to the nearest silence trough
         // (or merge the two runs when no trough lives in the search window).
         // Eliminates mid-syllable cuts that hurt the decoder.
-        let mePcm = (try? AudioStitcher.readPCM(me)) ?? Data()
-        let partPcm = (try? AudioStitcher.readPCM(participants)) ?? Data()
         let meSnapped = snapBoundaries(meRuns, in: mePcm)
         let partSnapped = snapBoundaries(partRuns, in: partPcm)
         if meSnapped.count != meRuns.count || partSnapped.count != partRuns.count {
@@ -96,8 +112,9 @@ struct CodeSwitchTranscriber {
         let partVerified = verifyRunLanguages(partSnapped, in: partPcm, tag: "participants")
 
         let callID = me.deletingLastPathComponent().lastPathComponent
-        let meOut = try decode(track: me, runs: meVerified, callID: callID, tag: "me")
-        let partOut = try decode(track: participants, runs: partVerified,
+        let meOut = try decode(runs: meVerified, pcm: mePcm,
+                               callID: callID, tag: "me")
+        let partOut = try decode(runs: partVerified, pcm: partPcm,
                                  callID: callID, tag: "participants")
         return (meOut, partOut)
     }
@@ -122,7 +139,11 @@ struct CodeSwitchTranscriber {
         var out: [LanguageRun] = []
         for run in runs {
             let lo = min(pcm.count, run.startMs * bytesPerMs)
-            let hi = min(pcm.count, run.endMs * bytesPerMs)
+            // Cap the re-LID window: the language head doesn't benefit from
+            // minutes of audio, so a long run only copies/decodes its first
+            // 15 s rather than the whole span.
+            let durMs = max(0, run.endMs - run.startMs)
+            let hi = min(pcm.count, lo + min(durMs, 15_000) * bytesPerMs)
             guard hi > lo + bytesPerMs * 500 else { out.append(run); continue }
             let slice = pcm.subdata(in: lo..<hi)
             let posterior: [String: Double]
@@ -138,7 +159,11 @@ struct CodeSwitchTranscriber {
                   active.contains(topEntry.key) else {
                 out.append(run); continue
             }
-            let routedLp = posterior[run.language] ?? -.infinity
+            // If the LID posterior has no mass for the currently-routed
+            // language we have nothing to compare against — keep the run
+            // rather than letting a `-inf` routedLp turn into a +inf margin
+            // that force-re-routes past the verifyMarginDb gate.
+            guard let routedLp = posterior[run.language] else { out.append(run); continue }
             let margin = topEntry.value - routedLp
             if topEntry.key != run.language, margin > cs.verifyMarginDb {
                 let where_ = tag.isEmpty ? "" : "\(tag) "
@@ -171,11 +196,19 @@ struct CodeSwitchTranscriber {
         while i + 1 < out.count {
             let a = out[i], b = out[i + 1]
             let boundary = (a.endMs + b.startMs) / 2
-            let cand = AudioStitcher.troughs(in: pcm,
-                                             nearMs: boundary,
-                                             searchMs: cs.snapSearchMs,
-                                             minMs: cs.snapMinMs,
-                                             thresholdDb: cs.snapEnergyDb)
+            // Bound the search to strictly inside the two runs. A trough within
+            // ±snapSearchMs but outside [a.startMs, b.endMs] would otherwise
+            // become an inverted boundary (endMs < startMs) that stitch()
+            // silently drops, losing that run's audio.
+            let loMs = max(a.startMs + 1, boundary - cs.snapSearchMs)
+            let hiMs = min(b.endMs - 1, boundary + cs.snapSearchMs)
+            let cand = loMs < hiMs
+                ? AudioStitcher.troughs(in: pcm,
+                                        loMs: loMs,
+                                        hiMs: hiMs,
+                                        minMs: cs.snapMinMs,
+                                        thresholdDb: cs.snapEnergyDb)
+                : []
             if let nearest = cand.min(by: { abs($0 - boundary) < abs($1 - boundary) }) {
                 out[i] = LanguageRun(language: a.language,
                                      startMs: a.startMs,
@@ -204,7 +237,7 @@ struct CodeSwitchTranscriber {
 
     // MARK: Per-track decode
 
-    private func decode(track: URL, runs: [LanguageRun],
+    private func decode(runs: [LanguageRun], pcm: Data,
                         callID: String, tag: String) throws -> [Transcriber.Segment] {
         guard !runs.isEmpty else { return [] }
         let scratch = URL(fileURLWithPath: "\(NSHomeDirectory())/.ghostie/scratch")
@@ -214,10 +247,13 @@ struct CodeSwitchTranscriber {
         defer { try? FileManager.default.removeItem(at: scratch) }
 
         let stitcher = AudioStitcher()
-        // Group by language; off-whitelist runs fall back to the dominant model.
+        // Group by language; off-whitelist runs fall back to the dominant
+        // model. `dominant` is clamped into `active`, so the fallback bucket is
+        // always one the `for lang in active` loop below actually visits — an
+        // off-whitelist run can't be silently dropped.
         let active = languages
         let byLang = Dictionary(grouping: runs) { run -> String in
-            active.contains(run.language) ? run.language : cs.dominantLanguage
+            active.contains(run.language) ? run.language : dominant
         }
 
         var out: [Transcriber.Segment] = []
@@ -225,7 +261,7 @@ struct CodeSwitchTranscriber {
         for lang in active where byLang[lang] != nil {
             guard let langRuns = byLang[lang], !langRuns.isEmpty else { continue }
             let dest = scratch.appendingPathComponent("\(tag)-\(lang).wav")
-            let stitched = try stitcher.stitch(track: track, runs: langRuns,
+            let stitched = try stitcher.stitch(pcm: pcm, runs: langRuns,
                                                to: dest, silencePadMs: cs.silencePadMs)
             let segs = try whisperDecode(stitched.url, language: lang)
             for s in segs {

@@ -286,7 +286,7 @@ func cmdDoctor(_ config: Config) {
             s.isConfigured ? claudePath : "not found — install Claude Code and run `claude` once to log in")
     }
     let cs = config.codeSwitch
-    let installed = Models.installed()
+    let installed = Models.installed(preferredKBVariant: cs.kbWhisperVariant)
     let effective = cs.effectiveLanguages(installed: installed)
     let willCodeSwitch = effective.count >= 2
     row(true, "languages installed on disk",
@@ -620,10 +620,10 @@ func runCodeSwitchSelfTest() -> Bool {
         // 0…2000 speech, 2000…2200 silence, 2200…4000 speech, 4000…6000 speech (no break).
         let pcm = makePCM(speechRanges: [(0, 2000), (2200, 4000), (4000, 6000)], totalMs: 6000)
         check("troughs: finds the 200 ms silence near 2.1 s",
-              AudioStitcher.troughs(in: pcm, nearMs: 2_100, searchMs: 800).contains { abs($0 - 2_100) < 100 },
-              "troughs near 2100ms: \(AudioStitcher.troughs(in: pcm, nearMs: 2_100, searchMs: 800))")
+              AudioStitcher.troughs(in: pcm, loMs: 1_300, hiMs: 2_900).contains { abs($0 - 2_100) < 100 },
+              "troughs in 1300–2900ms: \(AudioStitcher.troughs(in: pcm, loMs: 1_300, hiMs: 2_900))")
         check("troughs: returns empty in continuous-speech region",
-              AudioStitcher.troughs(in: pcm, nearMs: 5_000, searchMs: 500).isEmpty)
+              AudioStitcher.troughs(in: pcm, loMs: 4_500, hiMs: 5_500).isEmpty)
 
         // Build two runs whose boundary lands inside the silence — snap should
         // move it to ~2100 ms.
@@ -652,6 +652,24 @@ func runCodeSwitchSelfTest() -> Bool {
               && merged.first?.startMs == 4_000 && merged.first?.endMs == 6_000,
               "got \(merged.map { "(\($0.language) \($0.startMs)-\($0.endMs))" })")
 
+        // Snap must NOT use a silence trough that lives OUTSIDE the two runs.
+        // PCM here is silent 0–2000 ms, then continuous speech 2000–6000 ms.
+        // Two runs sit entirely inside the speech (a=2200–3000, b=3000–5000),
+        // so the only silence (pre-2000) is out of span: the bounded search
+        // finds no in-span trough and merges, rather than snapping a's end
+        // back into the leading silence (which would invert the run and drop
+        // its audio in stitch).
+        let speechOnly = makePCM(speechRanges: [(2_000, 6_000)], totalMs: 6_000)
+        let inA = LanguageRun(language: "sv", startMs: 2_200, endMs: 3_000,
+                              segments: [VADSegment(startMs: 2_200, endMs: 3_000)])
+        let inB = LanguageRun(language: "en", startMs: 3_000, endMs: 5_000,
+                              segments: [VADSegment(startMs: 3_000, endMs: 5_000)])
+        let bounded = cst.snapBoundaries([inA, inB], in: speechOnly)
+        check("snap: trough outside the run span is never used (no inverted run)",
+              bounded.allSatisfy { $0.endMs > $0.startMs }
+              && (bounded.first?.startMs ?? -1) == 2_200,
+              "got \(bounded.map { "(\($0.language) \($0.startMs)-\($0.endMs))" })")
+
         // Post-decode verification (PR 5): a stub LID reports high confidence
         // for "en" on every slice. A run routed as "sv" must re-route to "en"
         // when the margin exceeds verifyMarginDb. A run routed as "en" stays.
@@ -660,13 +678,7 @@ func runCodeSwitchSelfTest() -> Bool {
             let topProb: Double
             var description: String { "stub-verifier" }
             func identify(pcm: Data, sampleRateHz: Int, restrict: [String]) throws -> [String: Double] {
-                let n = max(1, restrict.count)
-                let spread = (1 - topProb) / Double(max(1, n - 1))
-                var out: [String: Double] = [:]
-                for l in restrict {
-                    out[l] = Foundation.log(l == top ? topProb : spread)
-                }
-                return out
+                LogProb.skewed(toward: top, mass: topProb, over: restrict)
             }
         }
         var verifyCfg = Config()
@@ -710,6 +722,16 @@ func runCodeSwitchSelfTest() -> Bool {
         let untouched = cstOff.verifyRunLanguages([wrongSv], in: pcm)
         check("verify: verifyMarginDb=0 disables the pass",
               untouched.count == 1 && untouched[0].language == "sv")
+
+        // A run whose language isn't in the active whitelist has no log-prob
+        // to compare against in the posterior; the missing-key guard must KEEP
+        // it rather than letting routedLp = -inf force an unconditional
+        // re-route (margin would be +inf, past any verifyMarginDb gate).
+        let deRun = LanguageRun(language: "de", startMs: 0, endMs: 3_000,
+                                segments: [VADSegment(startMs: 0, endMs: 3_000)])
+        let keptDe = cstV.verifyRunLanguages([deRun], in: pcm)   // verifier: en@0.9, active=[sv,en]
+        check("verify: run language absent from posterior is kept, not force-rerouted",
+              keptDe.count == 1 && keptDe[0].language == "de")
     }
 
     // 3-language Smoother (PR 3 contract: the binary cap is lifted; the same
@@ -784,6 +806,8 @@ func runCodeSwitchSelfTest() -> Bool {
               withMap.prompts["sv"] == "NEW")
         check("new prompts map honors N-language entries",
               withMap.prompts["de"] == "NEW-DE")
+        check("partial prompts map preserves the default for unlisted languages",
+              withMap.prompts["en"]?.contains("Business call") ?? false)
 
         let empty = decode("{}")
         check("missing prompts → defaults preserved",
@@ -809,8 +833,16 @@ func runCodeSwitchSelfTest() -> Bool {
         let installed1 = InstalledModels(perLanguage: ["en": "/stub/lv3.bin"])
         let empty = InstalledModels(perLanguage: [:])
 
-        var c = CodeSwitchConfig()           // languages: ["sv","en"] by default
-        check("default config + 3 installed → intersection (sv,en)",
+        var c = CodeSwitchConfig()           // languages: [] by default (disk-driven)
+        check("default (empty) config → disk is the whitelist (all 3 installed)",
+              c.effectiveLanguages(installed: installed3) == ["de", "en", "sv"])
+
+        c.languages = ["sv", "en"]
+        check("configured 2 + 3 installed → intersection (sv,en)",
+              c.effectiveLanguages(installed: installed3) == ["sv", "en"])
+
+        c.languages = ["sv", "sv", "en"]
+        check("duplicate languages are de-duplicated (no Dictionary trap)",
               c.effectiveLanguages(installed: installed3) == ["sv", "en"])
 
         c.languages = []
@@ -839,6 +871,100 @@ func runCodeSwitchSelfTest() -> Bool {
         c.modelPerLanguage = [:]
         check("no override + nothing installed for lang → nil",
               c.effectiveModelPath(for: "fr", installed: installed3) == nil)
+
+        // effectiveDominant clamps a dominant with no installed model into the
+        // whitelist, so off-whitelist runs never bucket into a language the
+        // decode loop skips and the smoother prior never skews at zero mass.
+        c.languages = []
+        c.dominantLanguage = "de"          // not installed in installed1 (en only)
+        check("effectiveDominant clamps an uninstalled dominant into the whitelist",
+              c.effectiveDominant(installed: installed1) == "en")
+        c.dominantLanguage = "en"
+        check("effectiveDominant keeps an installed dominant",
+              c.effectiveDominant(installed: installed3) == "en")
+    }
+
+    // Detection-driver capability: KB-Whisper (sv-biased) and base.en
+    // (English-only) can't drive language detection / VAD even when installed;
+    // large-v3 can; an unknown/custom path gets the benefit of the doubt.
+    do {
+        check("LID driver: base.en is not a balanced detection model",
+              Models.isBadLIDDriver(path: Models.baseEnglish.destPath))
+        check("LID driver: large-v3 is a balanced detection model",
+              !Models.isBadLIDDriver(path: Models.largeV3.destPath))
+        check("LID driver: KB-Whisper is sv-biased, not a detection model",
+              Models.isBadLIDDriver(path: Models.kbWhisperLarge(variant: "standard")!.destPath))
+        check("LID driver: an unknown/custom path is eligible",
+              !Models.isBadLIDDriver(path: "/some/custom/multilingual.bin"))
+    }
+
+    // Single-language model preference: large-v3 → KB → base.en, so the
+    // single-language path picks the best installed model (disk-driven) and
+    // base.en is only the floor.
+    do {
+        let lv3 = Models.largeV3.destPath
+        let kb = Models.kbWhisperLarge(variant: "standard")!.destPath
+        let base = Models.baseEnglish.destPath
+        check("single-lang model: large-v3 wins when present",
+              Models.bestSingleLanguageModel { [lv3, kb, base].contains($0) } == lv3)
+        check("single-lang model: KB beats base.en when large-v3 absent",
+              Models.bestSingleLanguageModel { [kb, base].contains($0) } == kb)
+        check("single-lang model: base.en is the floor",
+              Models.bestSingleLanguageModel { $0 == base } == base)
+        check("single-lang model: nothing installed → nil",
+              Models.bestSingleLanguageModel { _ in false } == nil)
+    }
+
+    // Model catalog: the user-extensible "bring your own model" layer. The
+    // pipeline is already language-agnostic, so these check that a custom
+    // catalog entry flows through discovery / capability lookups the same way
+    // a built-in does — keyed by language, honoring goodForLID. Pure (no disk).
+    do {
+        let seeds = ModelCatalog.builtinSeeds()
+        let ar = CatalogEntry(filename: "ggml-ar.bin", url: "https://example.test/ar.bin",
+                              label: "Arabic specialist", language: "ar",
+                              goodForLID: false, approxBytes: 3_000_000_000)
+        let customMulti = CatalogEntry(filename: "ggml-custom-multi.bin",
+                                       url: "https://example.test/m.bin",
+                                       label: "Custom multilingual", language: "xx",
+                                       goodForLID: true, approxBytes: 1_000_000_000)
+
+        // merge: a new filename is appended; a duplicate filename is collapsed.
+        let merged = ModelCatalog.merge(seeds: seeds, user: [ar])
+        check("catalog merge: a custom entry is appended",
+              merged.count == seeds.count + 1 && merged.contains { $0.filename == "ggml-ar.bin" })
+        let dupName = CatalogEntry(filename: "ggml-ar.bin", url: "https://example.test/other.bin",
+                                   label: "dup", language: "ar")
+        check("catalog merge: duplicate custom filenames collapse to one",
+              ModelCatalog.merge(seeds: seeds, user: [ar, dupName]).filter { $0.filename == "ggml-ar.bin" }.count == 1)
+
+        // merge: a built-in's goodForLID can be re-flagged, but its url/size
+        // stay authoritative (a sparse hand edit can't corrupt the URL).
+        let flip = ModelCatalog.merge(seeds: seeds,
+            user: [CatalogEntry(filename: Models.baseEnglish.filename, url: "", label: "", goodForLID: true)])
+        let baseMerged = flip.first { $0.filename == Models.baseEnglish.filename }
+        check("catalog merge: a built-in goodForLID re-flags, url stays authoritative",
+              baseMerged?.goodForLID == true
+              && baseMerged?.url == Models.baseEnglish.url.absoluteString
+              && flip.count == seeds.count)
+
+        // installed(): a custom entry registers its own language.
+        let inst = Models.installed(from: [ar], preferredKBVariant: "standard") { $0 == ar.model()!.destPath }
+        check("catalog installed(): a custom entry registers its language",
+              inst.modelPath(for: "ar") == ar.model()!.destPath)
+
+        // A custom goodForLID model is a valid detection driver; a custom
+        // specialist (goodForLID: false) is ruled out — same rule as base.en/KB.
+        let decoders = Models.decodeModels(from: [customMulti, ar])
+        check("catalog: a custom goodForLID model is a valid LID driver",
+              !Models.isBadLIDDriver(path: customMulti.model()!.destPath, in: decoders))
+        check("catalog: a custom specialist is ruled out as an LID driver",
+              Models.isBadLIDDriver(path: ar.model()!.destPath, in: decoders))
+
+        // Single-language pick prioritizes goodForLID over raw size (the
+        // multilingual model wins even though the specialist is larger).
+        check("catalog: single-language pick prefers a goodForLID model over a larger specialist",
+              Models.bestSingleLanguageModel(from: [ar, customMulti]) { _ in true } == customMulti.model()!.destPath)
     }
 
     // LanguageIdentifier seam: WhisperLID parse + spread, and the segmenter's
@@ -1037,6 +1163,7 @@ func printHelp() {
 
 let config = Config.load()
 config.writeExampleIfMissing()
+ModelCatalog.seedIfMissing()
 
 let args = Array(CommandLine.arguments.dropFirst())
 let command = args.first

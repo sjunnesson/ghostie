@@ -1,5 +1,33 @@
 import Foundation
 
+/// The one shape both the LID and the smoother keep re-deriving: put `mass`
+/// on `top`, spread the residual `(1 − mass)` uniformly over the rest, return
+/// it as log-probabilities. Having a single definition (rather than four
+/// near-copies with subtly different clamp bounds) means the smoother and the
+/// identifier can't drift into disagreeing about the same distribution — the
+/// kind of mismatch that re-routes audio to the wrong model.
+enum LogProb {
+    /// `over` is the language set the distribution covers. When `top` ∈ `over`
+    /// (the normal case) it gets `mass` (clamped to `clamp`) and the others
+    /// share the residual; when `top` ∉ `over` the result is uniform.
+    static func skewed(toward top: String, mass: Double, over langs: [String],
+                       clamp: ClosedRange<Double> = 0.001...0.999) -> [String: Double] {
+        let c = min(clamp.upperBound, max(clamp.lowerBound, mass))
+        let n = max(1, langs.count)
+        var out: [String: Double] = [:]
+        if langs.contains(top), n > 1 {
+            let spread = (1 - c) / Double(n - 1)
+            for l in langs { out[l] = Foundation.log(l == top ? c : spread) }
+        } else if langs.contains(top) {
+            out[top] = Foundation.log(c)
+        } else {
+            let u = Foundation.log(1.0 / Double(n))
+            for l in langs { out[l] = u }
+        }
+        return out
+    }
+}
+
 /// The seam between "segment audio into language regions" and "ask a model
 /// which language a piece of audio is in".
 ///
@@ -40,6 +68,16 @@ protocol LanguageIdentifier {
     var description: String { get }
 }
 
+/// Lets the segmenter tell a *structural* identifier failure (model/binary/
+/// framework missing — every segment will fail the same way) apart from a
+/// per-segment "couldn't tell" (unparseable output, off-whitelist guess). The
+/// segmenter rethrows the former so the call backlogs and retries cleanly,
+/// and absorbs the latter into the `unknown` floor. Errors that don't conform
+/// are treated as soft (per-segment) by default.
+protocol ClassifiableLIDError: Error {
+    var isStructural: Bool { get }
+}
+
 // MARK: - WhisperLID — today's path, refactored behind the protocol
 
 /// Per-segment language ID via the whisper-cli `--detect-language` head.
@@ -70,7 +108,7 @@ struct WhisperLID: LanguageIdentifier {
         "whisper-cli language head (\((model as NSString).lastPathComponent))"
     }
 
-    enum LIDError: Error, LocalizedError {
+    enum LIDError: Error, LocalizedError, ClassifiableLIDError {
         case unavailable(String)
         case whisperFailed(Int32, String)
         case unparseable(String)
@@ -81,6 +119,17 @@ struct WhisperLID: LanguageIdentifier {
             case .whisperFailed(let c, let out): return "whisper -dl exited \(c): \(out.suffix(200))"
             case .unparseable(let s): return "could not parse detected language from: \(s.suffix(200))"
             case .offWhitelist(let lang): return "detected language '\(lang)' is not in the whitelist"
+            }
+        }
+        /// `unavailable` means the LID can't run at all (missing binary/model)
+        /// → structural: every segment will fail identically, so fail the call
+        /// and let it backlog. `whisperFailed` (a non-zero exit) stays soft —
+        /// pre-v2 degraded those to `unknown` rather than risk a retry loop on
+        /// a transient hiccup — as do the this-clip-only verdicts.
+        var isStructural: Bool {
+            switch self {
+            case .unavailable:                              return true
+            case .whisperFailed, .unparseable, .offWhitelist: return false
             }
         }
     }
@@ -149,24 +198,11 @@ struct WhisperLID: LanguageIdentifier {
     /// Spread a top-1 + confidence across `restrict` as a log-prob map: mass
     /// `confidence` on `top` (clamped to (0.001, 0.999)), the residual
     /// uniformly across the rest. Off-whitelist `top` returns uniform.
+    /// Thin wrapper over `LogProb.skewed` — the single definition of the shape.
     static func spread(top: String,
                        confidence: Double,
                        restrict: [String]) -> [String: Double] {
-        let n = max(1, restrict.count)
-        let c = min(0.999, max(0.001, confidence))
-        var out: [String: Double] = [:]
-        if restrict.contains(top), restrict.count > 1 {
-            let spread = (1 - c) / Double(restrict.count - 1)
-            for l in restrict {
-                out[l] = Foundation.log(l == top ? c : spread)
-            }
-        } else if restrict.contains(top) {
-            out[top] = Foundation.log(c)
-        } else {
-            let u = Foundation.log(1.0 / Double(n))
-            for l in restrict { out[l] = u }
-        }
-        return out
+        LogProb.skewed(toward: top, mass: confidence, over: restrict)
     }
 }
 

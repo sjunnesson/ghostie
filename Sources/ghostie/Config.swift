@@ -220,7 +220,6 @@ struct Config: Codable {
         // Environment overrides win (handy for launchd / one-off runs).
         let env = ProcessInfo.processInfo.environment
         if let f = env["GHOSTIE_NOTES_FOLDER"], !f.isEmpty { cfg.notesFolder = f }
-        if let m = env["GHOSTIE_WHISPER_MODEL"], !m.isEmpty { cfg.whisperModel = m }
         if let s = env["GHOSTIE_SUMMARY_MODEL"], !s.isEmpty { cfg.summaryModel = s }
         if let p = env["GHOSTIE_SUMMARY_PROVIDER"], !p.isEmpty { cfg.summaryProvider = p }
         if let u = env["GHOSTIE_OLLAMA_URL"], !u.isEmpty { cfg.ollamaUrl = u }
@@ -241,11 +240,27 @@ struct Config: Codable {
            || !FileManager.default.isExecutableFile(atPath: cfg.claudeBinary) {
             cfg.claudeBinary = Config.findClaudeBinary()
         }
-        // Fall back to models bundled in the .app when the configured paths
-        // don't exist (fresh self-contained install with no Homebrew/setup).
-        if !FileManager.default.fileExists(atPath: cfg.whisperModel),
-           let m = Config.bundledResource("ggml-base.en.bin") {
+        // Single-language model resolution, in precedence order:
+        //   1. GHOSTIE_WHISPER_MODEL — an explicit pin, honored verbatim.
+        //   2. A config.json model that points at a real file other than the
+        //      default — the user (or a prior setup) deliberately chose it.
+        //   3. The best installed model (large-v3 → KB → base.en), so the
+        //      single-language path is disk-driven like the code-switch path
+        //      and gets large-v3 quality once downloaded, with no edit.
+        //   4. The bundled base.en (fresh self-contained install, nothing else).
+        if let m = env["GHOSTIE_WHISPER_MODEL"], !m.isEmpty {
             cfg.whisperModel = m
+        } else {
+            let pinned = cfg.whisperModel != Config().whisperModel
+                && FileManager.default.fileExists(atPath: cfg.whisperModel)
+            if !pinned,
+               let best = Models.bestSingleLanguageModelPath() {
+                cfg.whisperModel = best
+            }
+            if !FileManager.default.fileExists(atPath: cfg.whisperModel),
+               let m = Config.bundledResource("ggml-base.en.bin") {
+                cfg.whisperModel = m
+            }
         }
         if !FileManager.default.fileExists(atPath: cfg.vadModel),
            let v = Config.bundledResource("ggml-silero-v5.1.2.bin") {
@@ -335,10 +350,13 @@ struct Config: Codable {
 struct CodeSwitchConfig: Codable {
     /// Labels the smoother is allowed to emit. Nordic look-alikes (`no`, `da`)
     /// detected on short Swedish audio are mapped to `sv` (see Smoother).
-    /// Empty (recommended for v2) means "use whatever is installed on disk"
-    /// — see `effectiveLanguages(installed:)`. A non-empty list is an
-    /// override layer (configured ∩ installed).
-    var languages: [String] = ["sv", "en"]
+    /// Empty (the default) means "use whatever is installed on disk" — see
+    /// `effectiveLanguages(installed:)`, so the disk drives the whitelist and
+    /// a fresh install doesn't claim to need the code-switch model pair. A
+    /// non-empty list is both an explicit override layer (configured ∩
+    /// installed) and the "I want code-switching" intent signal Settings
+    /// writes (see `Models.required`).
+    var languages: [String] = []
 
     /// Tiebreaker when neither the local detection nor the cross-track prior
     /// is decisive.
@@ -400,7 +418,13 @@ struct CodeSwitchConfig: Codable {
     /// originally-routed language, the run re-routes to the LID's pick
     /// and decodes against that language's model instead. 0 disables the
     /// check; 0.20 ≈ "LID at least exp(0.20) ≈ 1.22× more confident".
-    var verifyMarginDb: Double = 0.20
+    ///
+    /// Defaults to 0 (off): today's only identifier is `WhisperLID`, the same
+    /// model that made the original routing decision, so re-asking it shares
+    /// the very failure mode (Nordic/short-audio confusion) the pass is meant
+    /// to catch and can re-route a correct run to the wrong model. Turn it on
+    /// once a genuinely independent LID (VoxLingua107) backs the verifier.
+    var verifyMarginDb: Double = 0
 
     /// Decoder prompt per language. The N-language replacement for the old
     /// `promptSv` / `promptEn` pair: each model gets a prompt in its own
@@ -460,21 +484,22 @@ struct CodeSwitchConfig: Codable {
         snapEnergyDb = g(.snapEnergyDb, d.snapEnergyDb)
         verifyMarginDb = g(.verifyMarginDb, d.verifyMarginDb)
 
-        // Prompts: prefer the new map; otherwise migrate from the legacy
-        // promptSv / promptEn pair on top of defaults; otherwise defaults.
-        // A config with just `{"enabled": true}` still gets the default map.
-        if let p = (try? c.decodeIfPresent([String: String].self, forKey: .prompts)) ?? nil {
-            prompts = p
-        } else {
-            prompts = d.prompts
-            if let legacy = try? decoder.container(keyedBy: LegacyPromptKeys.self) {
-                if let sv = (try? legacy.decodeIfPresent(String.self, forKey: .promptSv)) ?? nil {
-                    prompts["sv"] = sv
-                }
-                if let en = (try? legacy.decodeIfPresent(String.self, forKey: .promptEn)) ?? nil {
-                    prompts["en"] = en
-                }
+        // Prompts: start from the built-in defaults, overlay the legacy
+        // promptSv / promptEn pair, then overlay the new `prompts` map last so
+        // it wins. Overlaying (rather than replacing) means customizing one
+        // language — `{"prompts":{"sv":"…"}}` — keeps the default domain
+        // prompt for every other language instead of blanking it.
+        prompts = d.prompts
+        if let legacy = try? decoder.container(keyedBy: LegacyPromptKeys.self) {
+            if let sv = (try? legacy.decodeIfPresent(String.self, forKey: .promptSv)) ?? nil {
+                prompts["sv"] = sv
             }
+            if let en = (try? legacy.decodeIfPresent(String.self, forKey: .promptEn)) ?? nil {
+                prompts["en"] = en
+            }
+        }
+        if let p = (try? c.decodeIfPresent([String: String].self, forKey: .prompts)) ?? nil {
+            prompts.merge(p) { _, new in new }
         }
     }
 
@@ -506,11 +531,6 @@ struct CodeSwitchConfig: Codable {
         prompts[lang] ?? ""
     }
 
-    /// Distinct GGML model paths actually needed, for doctor / preflight.
-    var requiredModelPaths: [(lang: String, path: String)] {
-        languages.map { ($0, modelPath(for: $0)) }
-    }
-
     /// Languages this run will actually label audio with, given what is on
     /// disk. If `languages` is configured (non-empty), keep it but drop
     /// entries with no installed model — a user can't transcribe a language
@@ -518,12 +538,27 @@ struct CodeSwitchConfig: Codable {
     /// the configured whitelist is "whatever is installed", so the pipeline
     /// turns languages on/off purely by `~/.ghostie/models/` content.
     ///
-    /// Returned languages are in the same order as `installed.languages` when
-    /// configured is empty; otherwise in `languages` order, preserving the
-    /// user's stated priority (smoother dominance, doctor display).
+    /// Returned languages are de-duplicated (a hand-edited `["sv","sv"]` must
+    /// not reach the smoother, where it would trap `Dictionary(uniqueKeys…)`)
+    /// and, when configured, in `languages` order, preserving the user's
+    /// stated priority; when empty, in `installed.languages` (sorted) order.
     func effectiveLanguages(installed: InstalledModels) -> [String] {
-        if languages.isEmpty { return installed.languages }
-        return languages.filter { installed.modelPath(for: $0) != nil }
+        let base = languages.isEmpty
+            ? installed.languages
+            : languages.filter { installed.modelPath(for: $0) != nil }
+        var seen = Set<String>()
+        return base.filter { seen.insert($0).inserted }
+    }
+
+    /// `dominantLanguage` clamped to the effective whitelist. When the
+    /// configured dominant has no installed model it would otherwise route
+    /// off-whitelist runs into a bucket the decoder never visits (dropped
+    /// audio) and skew the smoother's prior toward a language with zero mass;
+    /// fall back to the first effective language so the tiebreak/prior always
+    /// points at something the pipeline can actually decode.
+    func effectiveDominant(installed: InstalledModels) -> String {
+        let langs = effectiveLanguages(installed: installed)
+        return langs.contains(dominantLanguage) ? dominantLanguage : (langs.first ?? dominantLanguage)
     }
 
     /// GGML path for `lang`, layering the explicit `modelPerLanguage` override

@@ -25,7 +25,8 @@ struct LanguageSegmenter {
          installed: InstalledModels? = nil,
          identifier: LanguageIdentifier? = nil) {
         self.config = config
-        let inst = installed ?? Models.installed()
+        let inst = installed ?? Models.installed(
+            preferredKBVariant: config.codeSwitch.kbWhisperVariant)
         self.installed = inst
         self.identifier = identifier ?? Self.defaultIdentifier(config: config, installed: inst)
     }
@@ -49,7 +50,12 @@ struct LanguageSegmenter {
         let whitelist = config.codeSwitch.effectiveLanguages(installed: installed)
         let nordicRemap: (String) -> String = { raw in
             let lc = raw.lowercased()
-            return ["no", "nb", "nn", "da", "no-no"].contains(lc) && whitelist.contains("sv")
+            // Fold a Nordic look-alike into Swedish only when the user can't
+            // actually decode that language. If they installed a Norwegian
+            // model, `no` is in the whitelist and must reach its own model
+            // rather than being silently rewritten to sv.
+            let collapsible = ["no", "nb", "nn", "da", "no-no"]
+            return collapsible.contains(lc) && whitelist.contains("sv") && !whitelist.contains(lc)
                 ? "sv" : lc
         }
         let driver = Self.resolveDetectionModel(config: config, installed: installed)
@@ -138,13 +144,15 @@ struct LanguageSegmenter {
     /// owns the per-segment slicing, the minDetectMs floor, and the
     /// pcm/segment plumbing only. Any LID error on one segment falls back to
     /// `unknownDetection` for that segment — the smoother absorbs holes.
-    func detect(_ segs: [VADSegment], in wav: URL) throws -> [LanguageDetection] {
+    ///
+    /// `pcm` is the track's canonical PCM, read once by the caller and shared
+    /// with the snap/decode stages (no per-stage re-read of the WAV).
+    func detect(_ segs: [VADSegment], pcm: Data) throws -> [LanguageDetection] {
         let whitelist = languages
         guard !whitelist.isEmpty else { return segs.map(unknownDetection) }
         guard segs.contains(where: { $0.durationMs >= cs.minDetectMs }) else {
             return segs.map(unknownDetection)
         }
-        let pcm = (try? AudioStitcher.readPCM(wav)) ?? Data()
         let bytesPerMs = 16_000 * 2 / 1000   // 16 kHz mono Int16
 
         var dets: [LanguageDetection] = []
@@ -161,6 +169,12 @@ struct LanguageSegmenter {
                 posterior = try identifier.identify(pcm: slice,
                                                     sampleRateHz: 16_000,
                                                     restrict: whitelist)
+            } catch let e as ClassifiableLIDError where e.isStructural {
+                // The identifier itself can't run (missing binary/model) — fail
+                // the call so Pipeline backlogs it for a clean retry, rather
+                // than silently labeling every segment unknown and mis-routing
+                // the whole track to the dominant language.
+                throw SegmenterError.whisperUnavailable
             } catch {
                 dets.append(unknownDetection(s)); continue
             }
@@ -215,21 +229,26 @@ struct LanguageSegmenter {
         let fm = FileManager.default
         let cs = config.codeSwitch
         let languages = cs.effectiveLanguages(installed: installed)
-        func isKB(_ lang: String) -> Bool {
-            (cs.modelPerLanguage[lang] ?? "") == "kb-whisper-large"
+        // A usable detection driver must be a balanced multilingual model:
+        // KB-Whisper's language head is sv-biased and base.en can't detect
+        // non-English at all, so `Models.isBadLIDDriver` rules both out even
+        // when they're the only model installed for their language.
+        func lidDriver(for lang: String) -> String? {
+            guard let p = cs.effectiveModelPath(for: lang, installed: installed),
+                  fm.fileExists(atPath: p), !Models.isBadLIDDriver(path: p) else { return nil }
+            return p
         }
-        if !isKB(cs.dominantLanguage),
-           let dom = cs.effectiveModelPath(for: cs.dominantLanguage, installed: installed),
-           fm.fileExists(atPath: dom) {
-            return dom
+        if let dom = lidDriver(for: cs.dominantLanguage) { return dom }
+        for l in languages {
+            if let p = lidDriver(for: l) { return p }
         }
-        for l in languages where !isKB(l) {
-            if let p = cs.effectiveModelPath(for: l, installed: installed),
-               fm.fileExists(atPath: p) {
-                return p
-            }
+        if fm.fileExists(atPath: config.whisperModel),
+           !Models.isBadLIDDriver(path: config.whisperModel) {
+            return config.whisperModel
         }
-        if fm.fileExists(atPath: config.whisperModel) { return config.whisperModel }
+        // Last resort: any installed model, even a biased one. Detection will
+        // be poor, but segmentation only needs VAD offsets, so a single-model
+        // install can still run rather than failing the whole call.
         for l in languages {
             if let p = cs.effectiveModelPath(for: l, installed: installed),
                fm.fileExists(atPath: p) {

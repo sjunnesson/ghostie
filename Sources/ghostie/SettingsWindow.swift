@@ -59,17 +59,9 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         }
     }
 
-    private func rowKey(for model: Model) -> String? {
-        switch model.filename {
-        case Models.baseEnglish.filename: return "base"
-        case Models.sileroVAD.filename:   return "vad"
-        case Models.largeV3.filename:     return "large-v3"
-        default:
-            if let kb = Models.kbWhisperLarge(variant: cfg.codeSwitch.kbWhisperVariant),
-               model.filename == kb.filename { return "kb" }
-            return nil
-        }
-    }
+    /// Row keys are catalog filenames now (globally unique, already the
+    /// download/sidecar key), so a `Model` maps straight to its row.
+    private func rowKey(for model: Model) -> String? { model.filename }
 
     // MARK: Stored references
 
@@ -391,6 +383,8 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
                 cfg: cfg,
                 rowAction: { [weak self] key in self?.handleModelRowAction(key) },
                 openConfig: { [weak self] in self?.openJSON() },
+                addModel: { [weak self] in self?.presentAddModelSheet() },
+                removeModel: { [weak self] key in self?.removeModel(key) },
                 changes: { [weak self] block in self?.mutateCfg(block) }
             )
             panes.transcription = p
@@ -587,19 +581,9 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
 
     // MARK: Model row actions
 
-    /// Resolve the row key to the Model it currently represents. The "kb"
-    /// row depends on the variant in the in-memory config, so it has to
-    /// recompute each time.
+    /// Resolve the row key (a catalog filename) to the Model it represents.
     fileprivate func modelForKey(_ key: String) -> Model? {
-        switch key {
-        case "base":     return Models.baseEnglish
-        case "large-v3": return Models.largeV3
-        case "vad":      return Models.sileroVAD
-        case "kb":
-            let v = cfg.codeSwitch.kbWhisperVariant
-            return Models.kbWhisperLarge(variant: v.isEmpty ? "standard" : v)
-        default: return nil
-        }
+        ModelCatalog.load().first { $0.filename == key }?.model()
     }
 
     private func handleModelRowAction(_ key: String) {
@@ -610,7 +594,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
             if inflightModelKey == key {
                 downloader.cancel()
                 inflightModelKey = nil
-                panes.transcription?.refreshAllRows()
+                panes.transcription?.downloadDidSettle(key)
             } else {
                 startDownload(model, key: key)
             }
@@ -638,8 +622,29 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
                 a.informativeText = err.localizedDescription
                 a.runModal()
             }
-            self.panes.transcription?.refreshAllRows()
+            self.panes.transcription?.downloadDidSettle(key)
         })
+    }
+
+    /// Remove a model from the list: confirm, cancel any in-flight download,
+    /// delete the file + sidecar, drop a custom catalog entry (built-ins stay
+    /// as re-addable presets), and rebuild. The language self-heals out of the
+    /// effective whitelist once its model is gone.
+    private func removeModel(_ key: String) {
+        guard let model = modelForKey(key) else { return }
+        let entry = ModelCatalog.load().first { $0.filename == key }
+        let a = NSAlert()
+        a.messageText = "Remove this model?"
+        a.informativeText = "Deletes \(key) from ~/.ghostie/models."
+            + ((entry?.builtin ?? false) ? " You can re-add it later from the + menu." : "")
+        a.addButton(withTitle: "Remove")
+        a.addButton(withTitle: "Cancel")
+        guard a.runModal() == .alertFirstButtonReturn else { return }
+        if inflightModelKey == key { downloader.cancel(); inflightModelKey = nil }
+        try? FileManager.default.removeItem(atPath: model.destPath)
+        try? FileManager.default.removeItem(atPath: model.sidecarPath)
+        if entry?.builtin == false { ModelCatalog.remove(filename: key) }
+        panes.transcription?.downloadDidSettle(key)
     }
 
     private func startAdopt(_ model: Model, key: String) {
@@ -657,6 +662,102 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             _ = ModelDownloader.health(for: [model])
             DispatchQueue.main.async { self?.panes.transcription?.refreshRow(key) }
+        }
+    }
+
+    /// "Add a model" form: paste a Hugging Face repo, pick the language. Ghostie
+    /// finds the GGML file in the repo (HF API), writes the pairing to
+    /// `~/.ghostie/models.json` via `ModelCatalog`, and downloads it — the rest
+    /// of the pipeline (detection → per-language decode) picks it up with no
+    /// further config because the disk is the language whitelist.
+    private func presentAddModelSheet() {
+        func field(_ placeholder: String, width: CGFloat) -> NSTextField {
+            let f = NSTextField(string: "")
+            f.placeholderString = placeholder
+            f.translatesAutoresizingMaskIntoConstraints = false
+            f.widthAnchor.constraint(equalToConstant: width).isActive = true
+            return f
+        }
+        func lbl(_ s: String) -> NSTextField {
+            let t = NSTextField(labelWithString: s)
+            t.alignment = .right
+            return t
+        }
+        let repoField = field("KBLab/kb-whisper-large", width: 340)
+        let langField = field("ar", width: 120)
+        let grid = NSGridView(views: [
+            [lbl("Hugging Face repo"), repoField],
+            [lbl("Language"),          langField]
+        ])
+        grid.rowSpacing = 8
+        grid.columnSpacing = 10
+        grid.translatesAutoresizingMaskIntoConstraints = false
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 480, height: 78))
+        container.addSubview(grid)
+        NSLayoutConstraint.activate([
+            grid.topAnchor.constraint(equalTo: container.topAnchor),
+            grid.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            grid.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            grid.trailingAnchor.constraint(equalTo: container.trailingAnchor)
+        ])
+
+        let a = NSAlert()
+        a.messageText = "Add a model"
+        a.informativeText = "Paste a Hugging Face repo (org/name) — Ghostie finds the model file and downloads it. The language is the code Ghostie should use this model for (e.g. ar, de, fr); it detects each speaker's language and routes it to the matching model."
+        a.addButton(withTitle: "Add & Download")
+        a.addButton(withTitle: "Cancel")
+        a.accessoryView = container
+        a.window.initialFirstResponder = repoField
+        guard a.runModal() == .alertFirstButtonReturn else { return }
+
+        let raw = repoField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lang = langField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        func fail(_ msg: String) {
+            let e = NSAlert()
+            e.alertStyle = .warning
+            e.messageText = "Couldn't add the model"
+            e.informativeText = msg
+            e.runModal()
+        }
+        guard !raw.isEmpty else {
+            fail("Enter a Hugging Face repo, like KBLab/kb-whisper-large.")
+            return
+        }
+
+        // Resolving the file may hit the HF API — do it off the main thread, then
+        // add + download (or report a clear error) back on main.
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let resolved = HuggingFace.resolve(raw)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                guard let r = resolved, !r.filename.isEmpty else {
+                    fail("Couldn't find a model file in “\(raw)”. Check the repo name, or paste the direct file URL from Hugging Face.")
+                    return
+                }
+                // Friendly label: the repo's last path component, else the filename.
+                let label = (!raw.lowercased().hasPrefix("http") && raw.contains("/"))
+                    ? (raw.split(separator: "/").last.map(String.init) ?? r.filename)
+                    : (r.filename as NSString).deletingPathExtension
+                let entry = CatalogEntry(filename: r.filename, url: r.url, label: label,
+                                         language: lang, goodForLID: false,
+                                         approxBytes: 0, builtin: false)
+                ModelCatalog.add(entry)
+                // If the user has an explicit language whitelist (e.g. migrated
+                // from the old sv↔en toggle, which persisted ["sv","en"]), grow it
+                // so the new language activates — otherwise effectiveLanguages
+                // would silently drop it. Disk-driven users (empty list) need no
+                // change; the disk is the whitelist.
+                if !lang.isEmpty {
+                    self.mutateCfg { c in
+                        if !c.codeSwitch.languages.isEmpty, !c.codeSwitch.languages.contains(lang) {
+                            c.codeSwitch.languages.append(lang)
+                        }
+                    }
+                }
+                self.panes.transcription?.applyConfig(self.cfg)
+                // Kick off the download (health is .missing → startDownload).
+                self.handleModelRowAction(r.filename)
+            }
         }
     }
 
@@ -1043,6 +1144,15 @@ private final class GroupCard: NSView {
         super.viewDidChangeEffectiveAppearance()
         stack.layer?.backgroundColor = themedCG(Theme.cardBg)
         stack.layer?.borderColor = themedCG(Theme.cardBorder)
+    }
+
+    /// Remove every row (and divider) so the card can be rebuilt in place —
+    /// used by the catalog-driven Models card when the user adds a model.
+    func clearRows() {
+        for v in stack.arrangedSubviews {
+            stack.removeArrangedSubview(v)
+            v.removeFromSuperview()
+        }
     }
 
     func addRow(_ row: NSView, last: Bool = false) {
@@ -2709,18 +2819,38 @@ private final class TranscriptionPane: NSView {
     private var cfg: Config
     private let rowAction: (String) -> Void
     private let openConfig: () -> Void
+    private let addModel: () -> Void
+    private let removeModel: (String) -> Void
     private let parentChanges: ((inout Config) -> Void) -> Void
     private let advContainer = NSStackView()
     private var rows: [String: ModelRowState] = [:]
+    /// The catalog entry behind each row, keyed by filename — so refresh logic
+    /// reads language/goodForLID without re-loading the catalog per row.
+    private var entriesByKey: [String: CatalogEntry] = [:]
+    private let modelsCard = GroupCard(title: "Models")
+    private let languagesValue = NSTextField(labelWithString: "")
+    /// The row selected for the `−` button.
+    private var selectedKey: String?
+    /// Built-in presets whose download is in flight — shown in the list while
+    /// downloading even though they're not on disk yet. Pruned when the
+    /// download settles (see `downloadDidSettle`).
+    private var pendingKeys: Set<String> = []
+    private weak var footerSeg: NSSegmentedControl?
+    /// Retains the `+` menu's action target while the menu is open.
+    private var menuTarget: MenuTarget?
     private var disclosureToken: NSObjectProtocol?
 
     init(cfg: Config,
          rowAction: @escaping (String) -> Void,
          openConfig: @escaping () -> Void,
+         addModel: @escaping () -> Void,
+         removeModel: @escaping (String) -> Void,
          changes: @escaping ((inout Config) -> Void) -> Void) {
         self.cfg = cfg
         self.rowAction = rowAction
         self.openConfig = openConfig
+        self.addModel = addModel
+        self.removeModel = removeModel
         self.parentChanges = changes
         super.init(frame: .zero)
         build()
@@ -2761,53 +2891,25 @@ private final class TranscriptionPane: NSView {
         stack.addArrangedSubview(header)
         header.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
 
-        // Mode — dropdown over single vs. dual-language transcription. Writes
-        // to `codeSwitch.languages` (the v2 intent signal — empty/1 = single,
-        // 2+ = code-switching); the Models card reacts to the selection
-        // (KB + large-v3 paired vs. base/large-v3 alone). The pipeline only
-        // *actually* code-switches when ≥2 models are installed on disk.
-        let mode = GroupCard(title: "Mode")
-        let modePopup = NSPopUpButton(frame: .zero, pullsDown: false)
-        modePopup.addItems(withTitles: [
-            "Single language",
-            "Language switching (Swedish ↔ English)"
-        ])
-        modePopup.selectItem(at: cfg.codeSwitch.languages.count >= 2 ? 1 : 0)
-        modePopup.translatesAutoresizingMaskIntoConstraints = false
-        modePopup.widthAnchor.constraint(equalToConstant: 280).isActive = true
-        let modeTarget = ToggleTarget { [weak self] in
-            let on = modePopup.indexOfSelectedItem == 1
-            self?.change { c in
-                c.codeSwitch.languages = on ? ["sv", "en"] : ["en"]
-            }
-            self?.refreshAllRows()
-        }
-        modePopup.target = modeTarget
-        modePopup.action = #selector(ToggleTarget.fire)
-        objc_setAssociatedObject(modePopup, &ToggleTarget.key, modeTarget, .OBJC_ASSOCIATION_RETAIN)
-        mode.addRow(RowBuilder.row(
-            label: "Transcription mode",
-            sub: "Pick language switching for calls that mix Swedish and English.",
-            control: modePopup), last: true)
-        stack.addArrangedSubview(mode)
-        mode.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        // Languages — read-only summary of what Ghostie can recognize, derived
+        // from the models installed on disk (the disk is the whitelist; there's
+        // no fixed sv↔en toggle anymore). Add a model below to support a new
+        // language; Ghostie detects each speaker's language and routes it.
+        let langCard = GroupCard(title: "Languages")
+        languagesValue.font = .systemFont(ofSize: 12, weight: .medium)
+        languagesValue.textColor = Theme.text
+        langCard.addRow(RowBuilder.row(
+            label: "Languages Ghostie recognizes",
+            sub: "Driven by the models you've installed. Add a model below to support a new language — Ghostie detects which language each speaker uses and routes it to the matching model.",
+            control: languagesValue), last: true)
+        stack.addArrangedSubview(langCard)
+        langCard.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
 
-        // Models.
-        let modelsCard = GroupCard(title: "Models")
-        let modelDefs: [(key: String, title: String, subtitle: String, size: String)] = [
-            ("base",     "Whisper base",        "English only. ~150 MB. The quick one.",   "150 MB"),
-            ("large-v3", "Whisper large-v3",    "Speaks every language. ~1.1 GB. The accurate one.", "1.1 GB"),
-            ("kb",       "KB-Whisper-large (sv)","Swedish specialist. ~1.1 GB. Runs alongside Whisper large for mixed-language calls.", "1.1 GB"),
-            ("vad",      "Silero VAD",          "~900 KB. Lets Ghostie skip silent stretches so it doesn't invent words.", "900 KB")
-        ]
-        for (i, m) in modelDefs.enumerated() {
-            let row = ModelRowView(key: m.key, title: m.title, subtitle: m.subtitle)
-            row.onAction = { [weak self] in self?.rowAction(m.key) }
-            modelsCard.addRow(row, last: i == modelDefs.count - 1)
-            rows[m.key] = ModelRowState(row: row, key: m.key)
-        }
+        // Models — one row per catalog entry (built-ins + custom) plus an
+        // "Add a model" button. Rebuilt whenever the catalog changes.
         stack.addArrangedSubview(modelsCard)
         modelsCard.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        rebuildModelRows()
 
         // Quality.
         let quality = GroupCard(title: "Quality")
@@ -2871,36 +2973,185 @@ private final class TranscriptionPane: NSView {
         card.widthAnchor.constraint(equalTo: advContainer.widthAnchor).isActive = true
     }
 
-    func refreshRow(_ key: String) {
-        guard let st = rows[key], let model = modelForKey(key) else { return }
-        let h = ModelDownloader.health(for: [model])[0]
-        let single = cfg.codeSwitch.languages.count < 2
-        // Single-mode pairs with one whisper model (base or large-v3); the KB
-        // row pairs with large-v3 in codeswitch mode and only then.
-        let selected: Bool = {
-            switch key {
-            case "base":
-                return single && cfg.whisperModel == Models.baseEnglish.destPath
-            case "large-v3":
-                return (single && cfg.whisperModel == Models.largeV3.destPath)
-                    || (!single)
-            case "kb":
-                return !single
-            case "vad":
-                // VAD has no explicit toggle in Config — whisper-cli uses it
-                // automatically whenever the file is on disk. Show a tick to
-                // confirm it's active rather than leaving the row indicator
-                // permanently blank.
-                return h.state.isOK
-            default:
-                return false
+    /// Refresh the pane's cached config (e.g. after the Add-a-model flow grew
+    /// the language whitelist) and rebuild the model rows + languages summary.
+    func applyConfig(_ newCfg: Config) {
+        cfg = newCfg
+        rebuildModelRows()
+    }
+
+    /// Rebuild the Models card: a row per *installed* model (on disk, a built-in
+    /// preset whose download is in flight, or any custom entry), an empty-state
+    /// line when there are none, and a `+ −` footer — the macOS list-with-toolbar
+    /// pattern. `+` opens a menu of predefined models (plus "Add from Hugging
+    /// Face…"); `−` removes the selected row. Keeping the pane instance stable
+    /// means an inflight download's row keeps updating across the rebuild.
+    func rebuildModelRows() {
+        modelsCard.clearRows()
+        rows.removeAll()
+        entriesByKey.removeAll()
+
+        let fm = FileManager.default
+        let listed = ModelCatalog.load().filter { e in
+            guard let m = e.model() else { return false }
+            return !e.builtin || fm.fileExists(atPath: m.destPath) || pendingKeys.contains(e.filename)
+        }
+        if listed.isEmpty {
+            modelsCard.addRow(RowBuilder.row(
+                label: "No models added yet",
+                sub: "Click the + below to add one."))
+        } else {
+            for e in listed {
+                entriesByKey[e.filename] = e
+                let key = e.filename
+                let row = ModelRowView(key: key, title: e.label, subtitle: subtitle(for: e))
+                row.onAction = { [weak self] in self?.rowAction(key) }
+                row.onSelect = { [weak self] in self?.select(key) }
+                modelsCard.addRow(row)
+                rows[key] = ModelRowState(row: row, key: key)
             }
-        }()
-        st.row.apply(state: h.state, selected: selected, isPaired: key == "kb" && !single)
+        }
+        modelsCard.addRow(buildModelsFooter(), last: true)
+
+        if let sel = selectedKey, rows[sel] == nil { selectedKey = nil }
+        refreshAllRows()
+        if let sel = selectedKey { rows[sel]?.row.setHighlighted(true) }
+    }
+
+    /// The `+ −` toolbar beneath the model list.
+    private func buildModelsFooter() -> NSView {
+        let seg = NSSegmentedControl()
+        seg.segmentStyle = .smallSquare
+        seg.trackingMode = .momentary
+        seg.segmentCount = 2
+        seg.setImage(NSImage(systemSymbolName: "plus", accessibilityDescription: "Add"), forSegment: 0)
+        seg.setImage(NSImage(systemSymbolName: "minus", accessibilityDescription: "Remove"), forSegment: 1)
+        seg.setWidth(34, forSegment: 0)
+        seg.setWidth(34, forSegment: 1)
+        seg.setEnabled(selectedKey != nil, forSegment: 1)
+        seg.translatesAutoresizingMaskIntoConstraints = false
+        let target = ActionTarget { [weak self, weak seg] in
+            guard let self, let seg else { return }
+            if seg.selectedSegment == 0 { self.showAddMenu(from: seg) }
+            else if let sel = self.selectedKey { self.removeModel(sel) }
+        }
+        seg.target = target
+        seg.action = #selector(ActionTarget.fire)
+        objc_setAssociatedObject(seg, &ActionTarget.key, target, .OBJC_ASSOCIATION_RETAIN)
+        footerSeg = seg
+
+        let container = NSView()
+        container.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(seg)
+        NSLayoutConstraint.activate([
+            seg.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 10),
+            seg.topAnchor.constraint(equalTo: container.topAnchor, constant: 6),
+            seg.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -6),
+            seg.heightAnchor.constraint(equalToConstant: 22)
+        ])
+        return container
+    }
+
+    private func select(_ key: String) {
+        selectedKey = key
+        for (k, st) in rows { st.row.setHighlighted(k == key) }
+        footerSeg?.setEnabled(true, forSegment: 1)
+    }
+
+    /// `+` menu: predefined models not yet installed, then "Add from Hugging Face…".
+    private func showAddMenu(from view: NSView) {
+        let fm = FileManager.default
+        let presets = ModelCatalog.load().filter { e in
+            guard e.builtin, let m = e.model() else { return false }
+            return !fm.fileExists(atPath: m.destPath) && !pendingKeys.contains(e.filename)
+        }
+        let menu = NSMenu()
+        let target = MenuTarget { [weak self] item in
+            guard let self else { return }
+            if let fn = item.representedObject as? String { self.startPreset(fn) }
+            else { self.addModel() }
+        }
+        menuTarget = target
+        for e in presets {
+            let it = NSMenuItem(title: e.label, action: #selector(MenuTarget.fire(_:)), keyEquivalent: "")
+            it.representedObject = e.filename
+            it.target = target
+            menu.addItem(it)
+        }
+        if !presets.isEmpty { menu.addItem(.separator()) }
+        let custom = NSMenuItem(title: "Add from Hugging Face…",
+                                action: #selector(MenuTarget.fire(_:)), keyEquivalent: "")
+        custom.target = target
+        menu.addItem(custom)
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: view.bounds.height + 4), in: view)
+    }
+
+    /// Add a built-in preset: show its row immediately (pending), grow the
+    /// language whitelist if the user keeps an explicit one, then download.
+    private func startPreset(_ filename: String) {
+        pendingKeys.insert(filename)
+        if let lang = ModelCatalog.load().first(where: { $0.filename == filename })?.language,
+           !lang.isEmpty {
+            change { c in
+                if !c.codeSwitch.languages.isEmpty, !c.codeSwitch.languages.contains(lang) {
+                    c.codeSwitch.languages.append(lang)
+                }
+            }
+        }
+        rebuildModelRows()
+        rowAction(filename)   // → handleModelRowAction → startDownload (.missing)
+    }
+
+    /// A download settled (finished / failed / cancelled): drop it from the
+    /// pending set and rebuild so a failed preset disappears and a finished one
+    /// stays, shown by its on-disk status.
+    func downloadDidSettle(_ key: String) {
+        pendingKeys.remove(key)
+        rebuildModelRows()
+    }
+
+    /// One-line description per catalog entry: the language it decodes (and
+    /// whether it also drives detection), or a VAD note for the VAD entry.
+    private func subtitle(for e: CatalogEntry) -> String {
+        if e.language.isEmpty {
+            return "Voice activity — lets Ghostie skip silent stretches so it doesn't invent words."
+        }
+        let base = "Decodes ‘\(e.language)’."
+        return e.goodForLID ? base + " Also drives language detection." : base
+    }
+
+    private func refreshLanguagesSummary() {
+        let installed = Models.installed(preferredKBVariant: cfg.codeSwitch.kbWhisperVariant)
+        let langs = cfg.codeSwitch.effectiveLanguages(installed: installed)
+        languagesValue.stringValue = langs.isEmpty
+            ? "None yet — download a model below"
+            : langs.joined(separator: ", ")
+    }
+
+    func refreshRow(_ key: String) {
+        guard let st = rows[key], let model = modelForKey(key), let e = entriesByKey[key] else { return }
+        let state = ModelDownloader.health(for: [model])[0].state
+        let installed = Models.installed(preferredKBVariant: cfg.codeSwitch.kbWhisperVariant)
+        let active = cfg.codeSwitch.effectiveLanguages(installed: installed)
+        let selected: Bool
+        if e.language.isEmpty {
+            // VAD: no explicit toggle — whisper-cli uses it automatically
+            // whenever the file is on disk. Tick it when present.
+            selected = state.isOK
+        } else if active.count < 2 {
+            // Single-language path: the one model the engine will actually use.
+            selected = (model.destPath == cfg.whisperModel)
+        } else {
+            // Multi-language: a model is "active" when its language is in the
+            // effective whitelist — it's the decoder for that language.
+            selected = active.contains(e.language)
+        }
+        st.row.apply(state: state, selected: selected, isPaired: false)
     }
 
     func refreshAllRows() {
         for key in rows.keys { refreshRow(key) }
+        refreshLanguagesSummary()
     }
 
     func setRowDownloading(_ key: String, percent: Double, status: String) {
@@ -2911,15 +3162,7 @@ private final class TranscriptionPane: NSView {
     }
 
     private func modelForKey(_ key: String) -> Model? {
-        switch key {
-        case "base":     return Models.baseEnglish
-        case "large-v3": return Models.largeV3
-        case "vad":      return Models.sileroVAD
-        case "kb":       return Models.kbWhisperLarge(variant: cfg.codeSwitch.kbWhisperVariant.isEmpty
-                                                              ? "standard"
-                                                              : cfg.codeSwitch.kbWhisperVariant)
-        default: return nil
-        }
+        entriesByKey[key]?.model()
     }
 
     private func buildToggleRow(label: String, sub: String, on: Bool,
@@ -2937,6 +3180,14 @@ private final class TranscriptionPane: NSView {
 
 // MARK: - Model row
 
+/// Block-based target for `NSMenuItem`s in the "+" menu — the item is passed
+/// back so the handler can read its `representedObject`.
+private final class MenuTarget: NSObject {
+    private let handler: (NSMenuItem) -> Void
+    init(_ handler: @escaping (NSMenuItem) -> Void) { self.handler = handler }
+    @objc func fire(_ sender: NSMenuItem) { handler(sender) }
+}
+
 private final class ModelRowView: NSView {
     private let radio = RadioCircle()
     private let title = NSTextField(labelWithString: "")
@@ -2950,11 +3201,22 @@ private final class ModelRowView: NSView {
     private var subtitleToBottom: NSLayoutConstraint!
     private var statusToBottom: NSLayoutConstraint!
     var onAction: (() -> Void)?
+    /// Click anywhere on the row (not the action button) to select it for the
+    /// `−` button — the macOS list pattern.
+    var onSelect: (() -> Void)?
 
     init(key: String, title: String, subtitle: String) {
         self.action = StyledButton(title: "Download", target: nil, action: nil)
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
+        wantsLayer = true
+        layer?.cornerRadius = 5
+        // Click anywhere on the row (a gesture recognizer fires even over the
+        // non-interactive labels, which would otherwise swallow `mouseDown`).
+        // Don't delay primary mouse events, so the action button still works.
+        let click = NSClickGestureRecognizer(target: self, action: #selector(rowClicked))
+        click.delaysPrimaryMouseButtonEvents = false
+        addGestureRecognizer(click)
 
         self.title.stringValue = title
         self.title.font = .systemFont(ofSize: 13, weight: .semibold)
@@ -3048,6 +3310,13 @@ private final class ModelRowView: NSView {
         ])
     }
     required init?(coder: NSCoder) { fatalError() }
+
+    @objc private func rowClicked() { onSelect?() }
+
+    func setHighlighted(_ on: Bool) {
+        layer?.backgroundColor = on ? Theme.accent.withAlphaComponent(0.14).cgColor
+                                    : NSColor.clear.cgColor
+    }
 
     private func setProgressVisible(_ visible: Bool) {
         progressBar.isHidden = !visible
