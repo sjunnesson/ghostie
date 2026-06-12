@@ -13,17 +13,29 @@ import CoreMediaIO
 /// false positive — but they would also need to be holding the mic via Teams
 /// (the primary signal), which Zoom would not allow. The combination is
 /// vanishingly unlikely in practice.
+///
+/// `anyCameraRunning()` is a cheap read of a cached per-device running map:
+/// the push listener on `DeviceIsRunningSomewhere` patches its device's entry,
+/// list changes rebuild the map, and `refresh()` (the coordinator's 5 s
+/// backstop) re-reads every device authoritatively so a missed CMIO
+/// notification can never go stale for more than one period. Reconciliation
+/// is serialized on `listenerQueue`; the map is lock-guarded for cross-queue
+/// reads.
 final class CoreMediaIOCameraActivityProvider: CameraActivityProvider {
 
     private let listenerQueue = DispatchQueue(label: "ghostie.coremediaio.listener")
     private let stateLock = NSLock()
     private let fanout = ChangeFanout()
     private var perDeviceTeardowns: [CMIOObjectID: () -> Void] = [:]
+    /// Cached `DeviceIsRunningSomewhere` per known camera device.
+    private var runningByDevice: [CMIOObjectID: Bool] = [:]
     private var deviceListTeardown: (() -> Void)?
 
     init() {
         installDeviceListListener()
-        reconcileDeviceListeners()
+        // Serialize the initial build with any list callback already in
+        // flight on listenerQueue.
+        listenerQueue.sync { self.reconcileDeviceListeners() }
     }
 
     deinit {
@@ -35,10 +47,18 @@ final class CoreMediaIOCameraActivityProvider: CameraActivityProvider {
         for (_, tear) in perDeviceTeardowns { tear() }
     }
 
+    /// Cheap cached read — no CMIO calls on this path.
     func anyCameraRunning() -> Bool {
-        let devices = Self.fetchDevices()
-        for d in devices where Self.isRunningSomewhere(d) { return true }
-        return false
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return runningByDevice.values.contains(true)
+    }
+
+    /// Authoritative rebuild: re-enumerates devices and re-reads every
+    /// device's running flag. Called by the coordinator's periodic backstop.
+    /// Must not be called from `listenerQueue` (it hops onto it with `sync`).
+    func refresh() {
+        listenerQueue.sync { self.reconcileDeviceListeners() }
     }
 
     func observe(_ handler: @escaping () -> Void) -> DetectionToken {
@@ -74,16 +94,25 @@ final class CoreMediaIOCameraActivityProvider: CameraActivityProvider {
         }
     }
 
+    /// Caller must be on `listenerQueue` (CMIO list callback, `refresh()`, or
+    /// `init`'s sync hop). Always rebuilds the whole running map from a fresh
+    /// per-device read — camera counts are tiny (typically 1-3), so the full
+    /// authoritative read costs nothing and keeps the cache trivially correct.
     private func reconcileDeviceListeners() {
         let current = Set(Self.fetchDevices())
+        var fresh: [CMIOObjectID: Bool] = [:]
+        for d in current { fresh[d] = Self.isRunningSomewhere(d) }
+
         stateLock.lock()
         let known = Set(perDeviceTeardowns.keys)
         let added = current.subtracting(known)
-        let removed = known.subtracting(current)
-        for d in removed {
-            perDeviceTeardowns.removeValue(forKey: d)?()
+        var teardowns: [() -> Void] = []
+        for d in known.subtracting(current) {
+            if let t = perDeviceTeardowns.removeValue(forKey: d) { teardowns.append(t) }
         }
+        runningByDevice = fresh
         stateLock.unlock()
+        for t in teardowns { t() }
         for d in added {
             installRunningListener(d)
         }
@@ -91,6 +120,7 @@ final class CoreMediaIOCameraActivityProvider: CameraActivityProvider {
 
     private func installRunningListener(_ device: CMIOObjectID) {
         let block: CMIOObjectPropertyListenerBlock = { [weak self] _, _ in
+            self?.updateRunning(device)
             self?.notify()
         }
         var address = CMIOObjectPropertyAddress(
@@ -111,6 +141,18 @@ final class CoreMediaIOCameraActivityProvider: CameraActivityProvider {
         }
         stateLock.lock()
         perDeviceTeardowns[device] = tear
+        stateLock.unlock()
+    }
+
+    /// Push listener fired for one device: re-read just that device's flag
+    /// and patch the cache. Ignores devices already dropped from the map (a
+    /// late callback racing a list-change removal).
+    private func updateRunning(_ device: CMIOObjectID) {
+        let running = Self.isRunningSomewhere(device)
+        stateLock.lock()
+        if runningByDevice[device] != nil {
+            runningByDevice[device] = running
+        }
         stateLock.unlock()
     }
 

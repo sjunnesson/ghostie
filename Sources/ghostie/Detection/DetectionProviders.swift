@@ -14,6 +14,10 @@ import CoreAudio
 /// `kAudioProcessPropertyIsRunningInput` / `IsRunningOutput` (macOS 14.2+).
 protocol AudioActivityProvider: AnyObject {
     func snapshot() -> [AudioProcessInfo]
+    /// Authoritative rebuild of any internally cached state from a fresh
+    /// system read. The coordinator's periodic backstop calls this before
+    /// evaluating, so a missed push notification heals within one period.
+    func refresh()
     func observe(_ handler: @escaping () -> Void) -> DetectionToken
 }
 
@@ -24,6 +28,9 @@ protocol AudioActivityProvider: AnyObject {
 /// attribution but still useful as a corroborator for video calls.
 protocol CameraActivityProvider: AnyObject {
     func anyCameraRunning() -> Bool
+    /// Authoritative rebuild of any internally cached state from a fresh
+    /// system read (see `AudioActivityProvider.refresh`).
+    func refresh()
     func observe(_ handler: @escaping () -> Void) -> DetectionToken
 }
 

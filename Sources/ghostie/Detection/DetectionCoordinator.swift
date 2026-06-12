@@ -32,6 +32,10 @@ final class DetectionCoordinator {
     private var backstop: DispatchSourceTimer?
     private var lastDeviceSwapAt: VirtualTime?
     private static let deviceSwapQuiescenceSeconds: TimeInterval = 3
+    /// True while a debounced `evaluate()` is scheduled (see
+    /// `scheduleEvaluate()`). Only touched on `queue`.
+    private var evaluatePending = false
+    private static let changeDebounceSeconds: TimeInterval = 0.3
     private var running = false
     /// Lowercased main-app bundle IDs from `config.triggerBundleIds`. The
     /// audio-side filter passes these through `matchesTeamsBundle` which
@@ -51,15 +55,20 @@ final class DetectionCoordinator {
     private static var promptedAXThisSession = false
     private static let promptedAXLock = NSLock()
 
+    /// `audio` defaults to a `CoreAudioActivityProvider` scoped to the config's
+    /// trigger bundle IDs (it needs the matcher list to avoid installing
+    /// per-process CoreAudio listeners on every audio process on the system),
+    /// hence the optional-with-nil default rather than a default expression.
     init(config: Config,
-         audio: AudioActivityProvider = CoreAudioActivityProvider(),
+         audio: AudioActivityProvider? = nil,
          ax: MeetingWindowProvider = AXMeetingWindowProvider(),
          camera: CameraActivityProvider = CoreMediaIOCameraActivityProvider(),
          device: DefaultInputDeviceProvider = CoreAudioDefaultDeviceProvider(),
          presence: AppPresenceProvider? = nil,
          clock: Clock = SystemClock()) {
+        let mainIds = config.triggerBundleIds.map { $0.lowercased() }
         self.config = config
-        self.audio = audio
+        self.audio = audio ?? CoreAudioActivityProvider(matchers: mainIds)
         self.ax = ax
         self.camera = camera
         self.device = device
@@ -67,7 +76,6 @@ final class DetectionCoordinator {
         var smConfig = CallStateMachine.Config()
         smConfig.endGraceSeconds = config.endGraceSeconds
         self.stateMachine = CallStateMachine(config: smConfig, clock: clock)
-        let mainIds = config.triggerBundleIds.map { $0.lowercased() }
         self.teamsBundleMatchers = mainIds
         self.presence = presence ?? WorkspaceAppPresenceProvider(triggerBundleIds: mainIds)
 
@@ -96,25 +104,36 @@ final class DetectionCoordinator {
             guard let self, !self.running else { return }
             self.running = true
             self.audioToken = self.audio.observe { [weak self] in
-                self?.queue.async { self?.evaluate() }
+                self?.queue.async { self?.scheduleEvaluate() }
             }
             self.cameraToken = self.camera.observe { [weak self] in
-                self?.queue.async { self?.evaluate() }
+                self?.queue.async { self?.scheduleEvaluate() }
             }
             self.deviceToken = self.device.observe { [weak self] in
                 self?.queue.async {
                     guard let self else { return }
+                    // Record the swap timestamp immediately so the 3 s
+                    // quiescence window runs from notification arrival, not
+                    // from the debounced evaluate ~300 ms later.
                     self.lastDeviceSwapAt = self.clock.now
                     Log.info("detector: default input device changed; entering \(Int(Self.deviceSwapQuiescenceSeconds))s swap quiescence.")
-                    self.evaluate()
+                    self.scheduleEvaluate()
                 }
             }
             self.presenceToken = self.presence.observe { [weak self] in
-                self?.queue.async { self?.evaluate() }
+                self?.queue.async { self?.scheduleEvaluate() }
             }
             let t = DispatchSource.makeTimerSource(queue: self.queue)
             t.schedule(deadline: .now() + 5, repeating: 5)
-            t.setEventHandler { [weak self] in self?.evaluate() }
+            t.setEventHandler { [weak self] in
+                guard let self else { return }
+                // The audio/camera providers serve incrementally-maintained
+                // caches between push events; the backstop is the staleness
+                // safety net, so force an authoritative rebuild before reading.
+                self.audio.refresh()
+                self.camera.refresh()
+                self.evaluate()
+            }
             t.resume()
             self.backstop = t
             self.evaluate()
@@ -166,7 +185,29 @@ final class DetectionCoordinator {
     /// and `snapshot()` (which both arrange to be on the queue first).
     private func buildEvidenceLocked() -> CallEvidence {
         let mainPids = presence.teamsApps().map(\.pid).sorted()
-        let meetingWindow = Self.resolveMeetingWindow(ax: ax, pids: mainPids)
+        let audioProcs = audio.snapshot()
+        // AX gate: the meeting-window walk is synchronous IPC into the Teams
+        // Electron process, and the state machine consults AX purely as a
+        // corroborator — it can only influence promotion when a primary
+        // signal (Teams mic input) exists or the machine is already past
+        // idle. In the dominant "Teams open all day, no call" case
+        // (idle + no Teams input I/O) skip the walk entirely and report the
+        // corroborator as honestly unqueried (`.unavailable`, which the state
+        // machine treats identically to `.notMatched`: no "ax" corroborator).
+        // The gate cannot starve confirmation: it reads the *same* fresh
+        // audio snapshot this evidence is built from, so the evaluate that
+        // first observes primary already re-queries AX. Reading
+        // `stateMachine.stage` here is safe — the machine is only mutated on
+        // `queue` (evaluate/forceStop) and this method requires `queue` too.
+        let primaryAudio = audioProcs.contains { p in
+            guard let b = p.bundleId else { return false }
+            return p.isRunningInput
+                && Self.matchesTeamsBundle(b, matchers: teamsBundleMatchers)
+        }
+        let meetingWindow: MeetingWindowMatch =
+            (stateMachine.stage == .idle && !primaryAudio)
+            ? .unavailable(reason: "not queried (idle, no primary signal)")
+            : Self.resolveMeetingWindow(ax: ax, pids: mainPids)
         let cameraPids: [pid_t] = (camera.anyCameraRunning() && !mainPids.isEmpty)
             ? mainPids : []
         let now = clock.now
@@ -175,7 +216,7 @@ final class DetectionCoordinator {
             return (now - t) < Self.deviceSwapQuiescenceSeconds
         }()
         return Self.buildEvidence(
-            audio: audio.snapshot(),
+            audio: audioProcs,
             now: now,
             matchers: teamsBundleMatchers,
             defaultDeviceId: device.currentDeviceId(),
@@ -231,9 +272,30 @@ final class DetectionCoordinator {
 
     // MARK: - Internals
 
+    /// Trailing debounce for provider change notifications. The first
+    /// notification of a burst schedules one `evaluate()`
+    /// `changeDebounceSeconds` (~300 ms) out; every further notification
+    /// inside that window is absorbed into the pending evaluation. The window
+    /// deliberately does **not** reset on later notifications, so a continuous
+    /// stream of changes can never starve evaluation — worst-case added
+    /// latency is a flat 300 ms, far inside the state machine's 3 s confirm
+    /// window. The 5 s backstop timer and `start()`'s initial pass call
+    /// `evaluate()` directly and are unaffected. Caller must be on `queue`.
+    private func scheduleEvaluate() {
+        if evaluatePending { return }
+        evaluatePending = true
+        queue.asyncAfter(deadline: .now() + Self.changeDebounceSeconds) { [weak self] in
+            guard let self else { return }
+            self.evaluatePending = false
+            guard self.running else { return }
+            self.evaluate()
+        }
+    }
+
     private func evaluate() {
-        // Caller is always on `queue` (listener callbacks marshal here, the
-        // backstop timer fires on this queue, start()/stop() dispatch here).
+        // Caller is always on `queue` (listener callbacks marshal here and
+        // coalesce through `scheduleEvaluate()`, the backstop timer fires on
+        // this queue, start()/stop() dispatch here).
         let evidence = buildEvidenceLocked()
         stateMachine.evaluate(evidence: evidence)
     }
