@@ -52,8 +52,12 @@ struct Transcriber {
             "-sns",                // suppress non-speech tokens ([music] etc.)
             "-oj",                 // write <prefix>.json
             "-of", prefix,
-            "-np",                 // no progress prints
-            "-nt"                  // no inline timestamps in text
+            "-np"                  // no progress prints
+            // NOTE: never pass -nt here — verified empirically (whisper-cpp
+            // 1.8.4): with --vad it collapses the <prefix>.json transcription
+            // to a single whole-file segment at offset 0, which breaks the
+            // cross-track timestamp merge. Stdout text is unused, so dropping
+            // it loses nothing.
         ]
         if !config.initialPrompt.isEmpty {
             args += ["--prompt", config.initialPrompt]
@@ -69,10 +73,13 @@ struct Transcriber {
 
         Log.info("Transcribing \(speaker) track…")
         try proc.run()
+        // Drain the pipe BEFORE waiting: whisper-cli prints the transcript to
+        // stdout, so on long calls it fills the ~64 KB pipe buffer and blocks
+        // on write — waitUntilExit() would then never return.
+        let outData = pipe.fileHandleForReading.readDataToEndOfFile()
         proc.waitUntilExit()
         guard proc.terminationStatus == 0 else {
-            let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(),
-                             encoding: .utf8) ?? ""
+            let out = String(data: outData, encoding: .utf8) ?? ""
             throw NSError(domain: "ghostie", code: 3, userInfo: [
                 NSLocalizedDescriptionKey: "whisper exited \(proc.terminationStatus): \(out)"
             ])

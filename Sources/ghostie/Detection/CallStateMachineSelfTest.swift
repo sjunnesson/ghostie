@@ -70,17 +70,34 @@ func runDetectorStateMachineSelfTest() -> Bool {
     //    indefinitely and never commits a call. A corroborator-less primary
     //    is harmless (no recording is started until promotion).
     do {
-        let (sm, clock, starts, _) = newMachine()
+        let (sm, clock, starts, stops) = newMachine()
         sm.evaluate(evidence: ev(at: clock.now, input: true))
         drive(sm, clock, for: 60) { ev(at: $0, input: true) }
         check("primary-only: stays candidate, never promotes",
               sm.stage == .candidate && starts() == 0,
               "stage=\(sm.stage) starts=\(starts())")
-        // Once primary drops for >8s, candidate is abandoned.
+        // Once primary drops for >8s, candidate is abandoned. Tightened to
+        // also assert stops()==0: the original assertion only checked starts
+        // and missed that demotion used to emit a phantom onCallStop for a
+        // session that never announced a start (bug fix pin).
         drive(sm, clock, for: 10) { ev(at: $0, input: false) }
-        check("primary-only: demoted to idle after primary loss >8s",
-              sm.stage == .idle && starts() == 0,
-              "stage=\(sm.stage) starts=\(starts())")
+        check("primary-only: demoted to idle after primary loss >8s, silently",
+              sm.stage == .idle && starts() == 0 && stops() == 0,
+              "stage=\(sm.stage) starts=\(starts()) stops=\(stops())")
+    }
+
+    // 2b. Candidate -> idle demotion is silent even when the candidate had a
+    //     corroborator: the session never confirmed, so onCallStop must not
+    //     fire — consumers expect start/stop as a balanced pair.
+    do {
+        let (sm, clock, starts, stops) = newMachine()
+        drive(sm, clock, for: 2) { ev(at: $0, input: true, output: true) }
+        check("candidate-demotion: in candidate before primary drop",
+              sm.stage == .candidate, "got \(sm.stage)")
+        drive(sm, clock, for: 9) { ev(at: $0, input: false) }
+        check("candidate-demotion: idle with no start and no stop",
+              sm.stage == .idle && starts() == 0 && stops() == 0,
+              "stage=\(sm.stage) starts=\(starts()) stops=\(stops())")
     }
 
     // 3. Listener-only meeting: only output present, no input. Primary stays
@@ -161,12 +178,52 @@ func runDetectorStateMachineSelfTest() -> Bool {
         drive(sm, clock, for: 4) { ev(at: $0, input: true, output: true) }
         check("hot-swap@confirmed: setup confirmed", sm.stage == .confirmed)
         drive(sm, clock, for: 2.5) { ev(at: $0, input: false, output: true, swap: true) }
+        // Also assert no confirmed->ending edge was even logged: the stage
+        // alone could mask an ending bounce-and-recover. Pins the legitimate
+        // ride-over so tightening quiescence elsewhere can't overcorrect.
         check("hot-swap@confirmed: quiescence suppresses ending",
-              sm.stage == .confirmed,
-              "stage=\(sm.stage)")
+              sm.stage == .confirmed
+              && !sm.transitions.contains { $0.from == .confirmed && $0.to == .ending },
+              "stage=\(sm.stage) edges=\(sm.transitions.map { "\($0.from.rawValue)->\($0.to.rawValue)" })")
         drive(sm, clock, for: 5) { ev(at: $0, input: true, output: true) }
         check("hot-swap@confirmed: still confirmed, no stop emitted",
               sm.stage == .confirmed && starts() == 1 && stops() == 0)
+    }
+
+    // 7b. Device swap while idle must NOT create a candidate: quiescence
+    //     suppresses primary loss during a call, it never synthesizes primary
+    //     presence from idle. (Bug fix pin: unplugging AirPods at the desk
+    //     used to create a phantom session — and a phantom "call ended".)
+    do {
+        let (sm, clock, starts, stops) = newMachine()
+        drive(sm, clock, for: 5) { ev(at: $0, input: false, swap: true) }
+        check("idle-swap: stays idle, no session, no transitions",
+              sm.stage == .idle && sm.sessionId == nil
+              && starts() == 0 && stops() == 0 && sm.transitions.isEmpty,
+              "stage=\(sm.stage) sid=\(String(describing: sm.sessionId)) transitions=\(sm.transitions.count)")
+    }
+
+    // 7c. Continuous device flapping (a flaky Bluetooth device cycling
+    //     faster than the 3 s swap window) must not pin a dead call open
+    //     forever: quiescence alone may sustain effectivePrimary for at most
+    //     2x endGraceSeconds (60 s) past the last REAL primary observation,
+    //     after which the normal 30 s ending grace runs and the call closes
+    //     with a single stop.
+    do {
+        let (sm, clock, starts, stops) = newMachine()
+        drive(sm, clock, for: 4) { ev(at: $0, input: true, output: true) }
+        check("flap-cap: setup confirmed", sm.stage == .confirmed)
+        // Device flaps forever: swap stays asserted, real primary never returns.
+        drive(sm, clock, for: 59) { ev(at: $0, input: false, output: true, swap: true) }
+        check("flap-cap: still confirmed within the 60s sustain cap",
+              sm.stage == .confirmed, "stage=\(sm.stage)")
+        drive(sm, clock, for: 2) { ev(at: $0, input: false, output: true, swap: true) }
+        check("flap-cap: enters ending once the cap is exceeded",
+              sm.stage == .ending, "stage=\(sm.stage)")
+        drive(sm, clock, for: 31) { ev(at: $0, input: false, output: true, swap: true) }
+        check("flap-cap: idle after grace despite continued flapping, single stop",
+              sm.stage == .idle && starts() == 1 && stops() == 1,
+              "stage=\(sm.stage) starts=\(starts()) stops=\(stops())")
     }
 
     // 8. Teams process death with another Teams PID resuming input within

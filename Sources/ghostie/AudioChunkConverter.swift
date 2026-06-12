@@ -48,7 +48,7 @@ final class AudioChunkConverter {
             return nil
         }
 
-        if converter == nil || inFormat?.streamDescription.pointee.mSampleRate != input.streamDescription.pointee.mSampleRate {
+        if needsNewConverter(for: asbd) {
             converter = AVAudioConverter(from: input, to: outFormat)
             inFormat = input
         }
@@ -76,5 +76,22 @@ final class AudioChunkConverter {
 
         let count = Int(pcmOut.frameLength)
         return Array(UnsafeBufferPointer(start: channelData[0], count: count))
+    }
+
+    /// A device swap can change channel count, sample format, or interleaving
+    /// without changing the rate; comparing only the sample rate left the
+    /// cached converter failing on every subsequent buffer (audio silently
+    /// lost). Compare every relevant field of the incoming ASBD instead.
+    private func needsNewConverter(for asbd: AudioStreamBasicDescription) -> Bool {
+        guard converter != nil,
+              let cached = inFormat?.streamDescription.pointee else { return true }
+        return cached.mSampleRate != asbd.mSampleRate
+            || cached.mFormatID != asbd.mFormatID
+            || cached.mFormatFlags != asbd.mFormatFlags
+            || cached.mChannelsPerFrame != asbd.mChannelsPerFrame
+            || cached.mBitsPerChannel != asbd.mBitsPerChannel
+            || cached.mBytesPerFrame != asbd.mBytesPerFrame
+            || cached.mBytesPerPacket != asbd.mBytesPerPacket
+            || cached.mFramesPerPacket != asbd.mFramesPerPacket
     }
 }

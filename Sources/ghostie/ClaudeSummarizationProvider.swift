@@ -61,25 +61,67 @@ struct ClaudeSummarizationProvider: SummarizationProvider {
             ])
         }
 
-        // Feed the transcript on stdin, then close it.
-        if let data = userContent.data(using: .utf8) {
-            stdinPipe.fileHandleForWriting.write(data)
+        // All pipe I/O happens on background queues so the only thing this
+        // thread ever blocks on is the watchdog below. Inline reads/writes
+        // would re-introduce two hangs: a CLI that never reads stdin stalls
+        // the write (transcripts exceed the 64 KB pipe buffer), and a CLI
+        // that holds stdout open (auth prompt, network hang) stalls
+        // `readDataToEndOfFile()` forever — wedging the serial work queue
+        // with the app stuck on "Summarizing call…" for its lifetime.
+        let io = DispatchQueue(label: "ghostie.claude.io", attributes: .concurrent)
+
+        // Feed the transcript on stdin, then close it. F_SETNOSIGPIPE so a
+        // CLI killed by the watchdog mid-write surfaces as EPIPE (a thrown
+        // error we discard) instead of a process-killing SIGPIPE.
+        let stdinHandle = stdinPipe.fileHandleForWriting
+        _ = fcntl(stdinHandle.fileDescriptor, F_SETNOSIGPIPE, 1)
+        io.async {
+            if let data = userContent.data(using: .utf8) {
+                try? stdinHandle.write(contentsOf: data)
+            }
+            try? stdinHandle.close()
         }
-        try? stdinPipe.fileHandleForWriting.close()
 
-        // Read fully before waiting (avoids pipe-buffer deadlock on long output).
-        let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
-        let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+        // Drain stdout and stderr concurrently while the process runs, so
+        // >64 KB of early stderr can't wedge both processes against a full
+        // pipe buffer. Each stream signals once at EOF.
+        var outData = Data()
+        var errData = Data()
+        let drained = DispatchSemaphore(value: 0)
+        io.async { outData = outPipe.fileHandleForReading.readDataToEndOfFile(); drained.signal() }
+        io.async { errData = errPipe.fileHandleForReading.readDataToEndOfFile(); drained.signal() }
 
-        // Watchdog: don't hang forever if the CLI stalls.
+        // Watchdog: the 5-minute cap covers the *running* process, not just
+        // the post-EOF wait. On timeout: SIGTERM, brief grace, SIGKILL —
+        // mirroring the whisper-server teardown in `LanguageIdentifier`.
         let deadline = DispatchTime.now() + 300
         let waiter = DispatchQueue(label: "ghostie.claude.wait")
-        let sem = DispatchSemaphore(value: 0)
-        waiter.async { proc.waitUntilExit(); sem.signal() }
-        if sem.wait(timeout: deadline) == .timedOut {
-            proc.terminate()
+        let exited = DispatchSemaphore(value: 0)
+        waiter.async { proc.waitUntilExit(); exited.signal() }
+        if exited.wait(timeout: deadline) == .timedOut {
+            proc.terminate()                                   // SIGTERM
+            if exited.wait(timeout: .now() + 2) == .timedOut {
+                kill(proc.processIdentifier, SIGKILL)
+                _ = exited.wait(timeout: .now() + 2)
+            }
+            // Death closes the CLI's pipe ends so the drains unblock; the
+            // waits are bounded in case a stray child inherited the fds.
+            _ = drained.wait(timeout: .now() + 2)
+            _ = drained.wait(timeout: .now() + 2)
             throw NSError(domain: "ghostie", code: 6, userInfo: [
-                NSLocalizedDescriptionKey: "claude timed out after 5 minutes."
+                NSLocalizedDescriptionKey:
+                    "claude produced no result within 5 minutes and was terminated — it may have been waiting on login or the network. Run `claude` once interactively to check."
+            ])
+        }
+
+        // Exited in time; both drains finish at EOF moments later. Bounded by
+        // the same 5-minute budget so an inherited fd held open by a stray
+        // child can't re-introduce the forever-hang.
+        if drained.wait(timeout: deadline) == .timedOut
+            || drained.wait(timeout: deadline) == .timedOut {
+            throw NSError(domain: "ghostie", code: 6, userInfo: [
+                NSLocalizedDescriptionKey:
+                    "claude exited but its output streams never closed within 5 minutes."
             ])
         }
 

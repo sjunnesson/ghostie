@@ -8,15 +8,27 @@ import Foundation
 ///
 ///     idle ──primary signal──> candidate
 ///     candidate ──confirmable for confirmSeconds──> confirmed   (onCallStart)
-///     candidate ──primary lost >8s OR 30s no promotion──> idle
+///     candidate ──primary lost >8s──> idle              (silent: no start fired)
 ///     confirmed ──primary lost──> ending
 ///     ending ──primary returns within endGraceSeconds──> confirmed
 ///     ending ──grace elapses──> idle                            (onCallStop)
+///
+/// `onCallStart`/`onCallStop` are a balanced pair: stop only ever fires for a
+/// session that already emitted start. A candidate that demotes back to idle
+/// never announced itself, so it ends silently (the transition log still
+/// records the demotion).
 ///
 /// Device-swap quiescence: when the default input device changes, the
 /// coordinator marks `evidence.deviceSwapWithinLast3s = true` for 3 s; the
 /// state machine then treats `primarySignal=false` as effectively true,
 /// suppressing spurious `ending` transitions while audio routing reconverges.
+/// The asymmetry is deliberate: quiescence only suppresses primary LOSS in
+/// candidate/confirmed/ending — it never synthesizes primary PRESENCE in
+/// idle (unplugging headphones at the desk must not create a candidate).
+/// It is also bounded: quiescence alone can sustain a call for at most
+/// 2× endGraceSeconds past the last real primary observation, so a flaky
+/// device flapping faster than the 3 s window cannot hold a dead call open
+/// forever (see `quiescenceSustains`).
 final class CallStateMachine {
 
     struct Config {
@@ -46,7 +58,9 @@ final class CallStateMachine {
 
     /// Fires when candidate is promoted to confirmed.
     var onCallStart: ((UUID) -> Void)?
-    /// Fires when ending grace elapses (or stop() is called while non-idle).
+    /// Fires when ending grace elapses (or forceStop() is called while a
+    /// confirmed session is live). Never fires for a session that did not
+    /// emit `onCallStart` — start/stop are a balanced pair.
     var onCallStop: ((UUID) -> Void)?
     /// Fires on every transition, for diagnostics and logging.
     var onTransition: ((Transition) -> Void)?
@@ -59,6 +73,15 @@ final class CallStateMachine {
     /// Start of the current run of `effectivePrimary=false` evidence
     /// (candidate, confirmed, or ending).
     private var primaryFalseRunStart: VirtualTime?
+    /// True once `onCallStart` has fired for the current `sessionId`.
+    /// Gates `onCallStop` so a candidate that demotes without ever
+    /// confirming ends silently — consumers must never see "call ended"
+    /// for a call that was never announced.
+    private var sessionStarted = false
+    /// Time of the most recent evaluate() that observed the REAL primary
+    /// signal (not swap-quiescence standing in for it). Caps how long
+    /// quiescence alone may sustain a call (`quiescenceSustains`).
+    private var lastRealPrimaryAt: VirtualTime?
 
     init(config: Config = .init(), clock: Clock) {
         self.config = config
@@ -72,12 +95,19 @@ final class CallStateMachine {
     /// detector queue).
     func evaluate(evidence: CallEvidence) {
         let now = clock.now
-        let effectivePrimary = evidence.primarySignal || evidence.deviceSwapWithinLast3s
+        if evidence.primarySignal { lastRealPrimaryAt = now }
+        let effectivePrimary = evidence.primarySignal
+            || quiescenceSustains(evidence: evidence, now: now)
         lastEvidence = evidence
 
         switch stage {
         case .idle:
-            if effectivePrimary {
+            // Deliberately the real signal, NOT effectivePrimary: swap
+            // quiescence exists to ride over the input-device handoff
+            // DURING a call (primary briefly drops while the audio unit
+            // moves). It must never promote idle -> candidate on its own —
+            // a device swap with zero Teams evidence is not a call.
+            if evidence.primarySignal {
                 enter(.candidate, at: now, evidence: evidence,
                       reason: "primary signal observed")
                 evaluateCandidate(now: now, evidence: evidence,
@@ -95,8 +125,26 @@ final class CallStateMachine {
         }
     }
 
+    /// Whether device-swap quiescence may stand in for a missing primary
+    /// signal right now. Quiescence only ever *suppresses primary loss* in
+    /// candidate/confirmed/ending (the idle branch checks the real signal
+    /// directly), and it is capped: a flaky device cycling faster than the
+    /// 3 s swap window would otherwise pin `effectivePrimary` true forever,
+    /// holding a dead call in confirmed/ending indefinitely. So quiescence
+    /// alone may only bridge up to 2× endGraceSeconds (60 s by default)
+    /// since the last REAL primary observation — generous against any
+    /// plausible device handoff, but bounded; once exceeded, the normal
+    /// ending grace runs and the call closes.
+    private func quiescenceSustains(evidence: CallEvidence,
+                                    now: VirtualTime) -> Bool {
+        guard evidence.deviceSwapWithinLast3s,
+              let lastReal = lastRealPrimaryAt else { return false }
+        return now - lastReal <= 2 * config.endGraceSeconds
+    }
+
     /// Force-stop the current call (e.g. user toggled the menu bar off, or
-    /// shutdown). Emits `onCallStop` if a session is live, then returns to idle.
+    /// shutdown). Emits `onCallStop` if a confirmed session is live (a bare
+    /// candidate clears silently), then returns to idle.
     func forceStop(reason: String = "external stop") {
         let now = clock.now
         let ev = lastEvidence ?? CallEvidence(
@@ -193,18 +241,30 @@ final class CallStateMachine {
             confirmableRunStart = nil
             primaryFalseRunStart = nil
             let dead = sessionId
+            let started = sessionStarted
             sessionId = nil
-            if let s = dead { onCallStop?(s) }
+            sessionStarted = false
+            // Stop only fires for sessions that emitted start. A demoted
+            // candidate never existed as far as consumers know, so it
+            // clears silently — the transition (with reason) is still
+            // recorded and logged via onTransition.
+            if started, let s = dead { onCallStop?(s) }
         case .candidate:
             sessionId = UUID()
+            sessionStarted = false
             confirmableRunStart = evidence.confirmable ? at : nil
-            primaryFalseRunStart = (evidence.primarySignal || evidence.deviceSwapWithinLast3s) ? nil : at
+            // Candidate is only ever entered on a real primary observation
+            // (idle ignores swap quiescence), so no false-run is pending.
+            primaryFalseRunStart = nil
         case .confirmed:
             confirmableRunStart = nil
             primaryFalseRunStart = nil
             // Only emit start when this is the first promotion of this session.
             // ending -> confirmed re-entries do NOT re-fire start.
-            if from == .candidate, let s = sessionId { onCallStart?(s) }
+            if from == .candidate, let s = sessionId {
+                sessionStarted = true
+                onCallStart?(s)
+            }
         case .ending:
             if primaryFalseRunStart == nil { primaryFalseRunStart = at }
         }

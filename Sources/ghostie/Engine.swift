@@ -22,14 +22,33 @@ enum EngineState: Equatable {
 /// State is synchronized through the private `gate` and `work` dispatch queues
 /// rather than the actor model, so the class manages its own thread safety and
 /// is declared `@unchecked Sendable` to allow it across `@Sendable` closures.
+/// Every mutable field below is owned by exactly one queue (see each comment);
+/// `…Locked` helpers must only run on `gate`.
 final class Engine: @unchecked Sendable {
     private(set) var config: Config
     private var detector: CallDetector
+    /// The live call's recorder. Gate-only; handed off to a finalizer exactly
+    /// once via `takeRecorderLocked()` (stop, fatal stream error and shutdown
+    /// all race for it, whoever wins owns the stop).
     private var recorder: AudioRecorder?
-    private var recordingStartedAt = Date()
+    /// The in-flight `AudioRecorder.start()` for `recorder`. Finalizers await
+    /// it before taking the recorder, so a stop can never slip inside the
+    /// SCShareableContent/startCapture window and orphan a live SCStream.
+    /// Gate-only.
+    private var startTask: Task<Void, Never>?
+    /// "Run Test" capture — kept out of `recorder` so the detector's stop
+    /// can't cut a fixed-length test short. Gate-only.
+    private var testRecorder: AudioRecorder?
+    private var recordingStartedAt = Date()   // gate-only
+    /// Recordings currently on (or queued for) the `work` pipeline. Gate-only;
+    /// lets `settleStateLocked()` / `swapIsSafe()` see pipeline work even when
+    /// a new call has started while the previous one is still summarizing.
+    private var processingCount = 0
     private let work = DispatchQueue(label: "ghostie.pipeline")
     private let gate = DispatchQueue(label: "ghostie.gate")
     private var listening = false
+    /// Flipped on `work` (serial) so the orphan sweep runs exactly once.
+    private var orphanSweepDone = false
 
     /// Called (on an arbitrary queue) whenever state changes; UI must hop to main.
     var onStateChange: ((EngineState) -> Void)?
@@ -38,11 +57,14 @@ final class Engine: @unchecked Sendable {
     var onBacklogChange: ((Int) -> Void)?
     private var backlogTimer: DispatchSourceTimer?
 
-    private(set) var state: EngineState = .paused {
-        didSet { if state != oldValue { onStateChange?(state) } }
-    }
-    private(set) var lastNote: URL?
-    private(set) var callsProcessed = 0
+    /// Backing store for `state`. Gate-only, like every other mutable field;
+    /// always written through `setStateLocked` / `settleStateLocked`.
+    private var _state: EngineState = .paused
+    /// Snapshot for UI readers (menu bar tick, Settings). Hops through `gate`
+    /// so a read can never tear against a transition on another queue.
+    var state: EngineState { gate.sync { _state } }
+    private(set) var lastNote: URL?        // mutated on `work` only (serial)
+    private(set) var callsProcessed = 0    // mutated on `work` only (serial)
 
     init(config: Config) {
         self.config = config
@@ -53,13 +75,50 @@ final class Engine: @unchecked Sendable {
 
     var isListening: Bool { listening }
 
+    // MARK: Gate-only helpers
+
+    /// Replaces the old stored-property `didSet`: fires `onStateChange` only
+    /// on an actual transition. Must run on `gate`.
+    private func setStateLocked(_ new: EngineState) {
+        guard new != _state else { return }
+        _state = new
+        onStateChange?(new)
+    }
+
+    /// Recompute `state` from current reality rather than last-writer-wins:
+    /// once calls overlap, a finishing pipeline must not stomp `.watching`
+    /// over a recording that started while it was busy (which also flipped
+    /// `swapIsSafe()` true and let the auto-updater relaunch mid-call).
+    /// Must run on `gate`.
+    private func settleStateLocked() {
+        if recorder != nil || testRecorder != nil {
+            setStateLocked(.recording(since: recordingStartedAt))
+        } else if processingCount > 0 {
+            setStateLocked(.processing)
+        } else {
+            setStateLocked(listening ? .watching : .paused)
+        }
+    }
+
+    /// Exactly-once handoff of the live recorder (+ its start date) to a
+    /// finalizer. Idempotent by construction — the second caller gets nil —
+    /// which is what makes stop / fatal-stream-error / shutdown safe to race.
+    /// Must run on `gate`.
+    private func takeRecorderLocked() -> (rec: AudioRecorder, startedAt: Date)? {
+        guard let rec = recorder else { return nil }
+        recorder = nil
+        return (rec, recordingStartedAt)
+    }
+
     /// Safe to replace the running .app bundle? Never mid-call or mid-summary
-    /// (those would lose the recording / kill the pipeline). Advisory read of
-    /// `state`, consistent with how the menu bar reads it.
+    /// (those would lose the recording / kill the pipeline). Checked through
+    /// `gate` against current reality — recorder presence, an in-flight
+    /// start, queued pipeline work — not the cached enum, which can lag one
+    /// transition behind when calls overlap.
     func swapIsSafe() -> Bool {
-        switch state {
-        case .recording, .processing: return false
-        case .paused, .watching:      return true
+        gate.sync {
+            recorder == nil && testRecorder == nil
+                && startTask == nil && processingCount == 0
         }
     }
 
@@ -82,7 +141,7 @@ final class Engine: @unchecked Sendable {
         guard !listening else { return }
         listening = true
         detector.start()
-        state = .watching
+        gate.async { self.settleStateLocked() }
         Log.ok("Listening for Teams calls (no bot joins your meetings).")
         drainBacklog()   // catch up on anything queued while we were away
         let t = DispatchSource.makeTimerSource(queue: gate)
@@ -97,8 +156,8 @@ final class Engine: @unchecked Sendable {
         listening = false
         detector.stop()
         backlogTimer?.cancel(); backlogTimer = nil
-        if recorder != nil { handleStop() } // finalize an in-progress call
-        state = .paused
+        handleStop()   // finalize an in-progress call (no-op when idle)
+        gate.async { self.settleStateLocked() }
         Log.info("Listening paused.")
     }
 
@@ -108,6 +167,14 @@ final class Engine: @unchecked Sendable {
     /// re-reads the model catalog) or any entry parsing happens.
     func drainBacklog() {
         work.async {
+            // One-shot launch sweep, sequenced on this same serial queue so
+            // it always lands before the first drain: recording dirs orphaned
+            // by a crash/kill mid-call would otherwise sit in workDir forever.
+            if !self.orphanSweepDone {
+                self.orphanSweepDone = true
+                let swept = Pipeline.sweepOrphanedRecordings(config: Config.load())
+                if swept > 0 { Log.info("Recovered \(swept) orphaned recording(s) from a previous run.") }
+            }
             guard !Backlog.isEmpty else {
                 self.onBacklogChange?(0)
                 return
@@ -125,15 +192,26 @@ final class Engine: @unchecked Sendable {
             self.recordingStartedAt = Date()
             let rec = AudioRecorder(config: self.config)
             self.recorder = rec
-            Task {
+            // Stream death mid-call (display sleep, permission revoked, SCK
+            // error): finalize through the normal stop path so the audio
+            // captured so far still becomes a note instead of accumulating
+            // nothing behind a stuck "Recording…". handleStop takes the
+            // recorder through `gate` exactly once, so the detector's own
+            // onCallStop firing later is a harmless no-op.
+            rec.onFatalError = { [weak self] in self?.handleStop() }
+            self.startTask = Task {
                 do {
                     try await rec.start()
-                    self.state = .recording(since: self.recordingStartedAt)
                 } catch {
                     Log.error("Could not start recording: \(error.localizedDescription)")
                     Log.error("Grant Screen Recording + Microphone in System Settings ▸ Privacy & Security.")
-                    self.gate.async { self.recorder = nil }
-                    self.state = self.listening ? .watching : .paused
+                    self.gate.async {
+                        if self.recorder === rec { self.recorder = nil }
+                    }
+                }
+                self.gate.async {
+                    self.startTask = nil
+                    self.settleStateLocked()   // .recording on success, idle on failure
                 }
             }
         }
@@ -141,30 +219,49 @@ final class Engine: @unchecked Sendable {
 
     private func handleStop() {
         gate.async {
-            guard let rec = self.recorder else { return }
-            self.recorder = nil
-            let started = self.recordingStartedAt
+            guard self.recorder != nil else { return }
+            let pendingStart = self.startTask
             Task {
+                // An in-flight start() may still be awaiting SCShareableContent
+                // or startCapture (a 1–2 s window). Stopping through it would
+                // find a nil stream, skip stopCapture, and leave a live
+                // SCStream recording with no owner — so wait the start out
+                // before taking the recorder.
+                await pendingStart?.value
+                // Exactly-once handoff: a concurrent finalizer (onFatalError,
+                // shutdown, a duplicate onCallStop) loses this race and just
+                // returns.
+                guard let (rec, started) = (self.gate.sync { self.takeRecorderLocked() })
+                else { return }
                 // AudioRecorder.stop() returns nil for sub-`minCallSeconds`
                 // calls (the in-memory ring is dropped without ever writing
                 // to disk). No post-hoc disk-discard needed here.
                 guard let result = await rec.stop() else {
-                    self.state = self.listening ? .watching : .paused
+                    self.gate.async { self.settleStateLocked() }
                     return
                 }
-                self.state = .processing
-                self.work.async {
-                    let note = Pipeline(config: Config.load()).process(result, startedAt: started)
-                    if let note {
-                        self.lastNote = note
-                        self.callsProcessed += 1
-                        self.onNote?(note)
+                // The work block is enqueued from inside the gate block so
+                // the count is visibly nonzero before the pipeline can start
+                // (otherwise swapIsSafe() has a microsecond window of "idle").
+                self.gate.async {
+                    self.processingCount += 1
+                    self.settleStateLocked()
+                    self.work.async {
+                        let note = Pipeline(config: Config.load()).process(result, startedAt: started)
+                        if let note {
+                            self.lastNote = note
+                            self.callsProcessed += 1
+                            self.onNote?(note)
+                        }
+                        // Dependencies are clearly healthy now — clear any backlog.
+                        let done = Pipeline.drain(config: Config.load())
+                        if done > 0 { self.callsProcessed += done }
+                        self.onBacklogChange?(Backlog.pendingCount)
+                        self.gate.async {
+                            self.processingCount -= 1
+                            self.settleStateLocked()
+                        }
                     }
-                    self.state = self.listening ? .watching : .paused
-                    // Dependencies are clearly healthy now — clear any backlog.
-                    let done = Pipeline.drain(config: Config.load())
-                    if done > 0 { self.callsProcessed += done }
-                    self.onBacklogChange?(Backlog.pendingCount)
                 }
             }
         }
@@ -172,50 +269,79 @@ final class Engine: @unchecked Sendable {
 
     /// One-shot N-second capture + full pipeline (menu "Run Test"). The
     /// short-call discard is bypassed so a sub-`minCallSeconds` test still
-    /// produces a note instead of silently dropping the audio.
+    /// produces a note instead of silently dropping the audio. Refused while
+    /// a real call is live (or starting) — a second concurrent SCStream would
+    /// clobber the live call.
     func runTest(seconds: Double, completion: @escaping (URL?) -> Void) {
-        let rec = AudioRecorder(config: config)
         let started = Date()
+        let rec: AudioRecorder? = gate.sync {
+            var busy = recorder != nil || startTask != nil || testRecorder != nil
+            if case .recording = _state { busy = true }
+            guard !busy else { return nil }
+            let r = AudioRecorder(config: config)
+            testRecorder = r
+            recordingStartedAt = started
+            return r
+        }
+        guard let rec else {
+            Log.warn("Test recording refused — a call is being recorded right now.")
+            completion(nil)
+            return
+        }
         Task {
             do {
                 try await rec.start()
-                self.state = .recording(since: started)
+                self.gate.async { self.settleStateLocked() }   // → .recording
                 try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
                 guard let result = await rec.stop(discardIfBelowMinCallSeconds: false) else {
-                    self.state = self.listening ? .watching : .paused
+                    self.gate.async { self.testRecorder = nil; self.settleStateLocked() }
                     completion(nil)
                     return
                 }
-                self.state = .processing
-                self.work.async {
-                    let note = Pipeline(config: Config.load()).process(result, startedAt: started)
-                    if let note { self.lastNote = note; self.onNote?(note) }
-                    self.state = self.listening ? .watching : .paused
-                    completion(note)
+                // Work enqueued from inside the gate block, same as
+                // handleStop: the count must be nonzero before the pipeline
+                // can start.
+                self.gate.async {
+                    self.testRecorder = nil
+                    self.processingCount += 1
+                    self.settleStateLocked()
+                    self.work.async {
+                        let note = Pipeline(config: Config.load()).process(result, startedAt: started)
+                        if let note { self.lastNote = note; self.onNote?(note) }
+                        self.gate.async {
+                            self.processingCount -= 1
+                            self.settleStateLocked()
+                        }
+                        completion(note)
+                    }
                 }
             } catch {
                 Log.error("Test failed: \(error.localizedDescription)")
-                self.state = self.listening ? .watching : .paused
+                self.gate.async { self.testRecorder = nil; self.settleStateLocked() }
                 completion(nil)
             }
         }
     }
 
     /// Finalize any active recording synchronously-ish before app quit.
+    /// Hops through `gate` (this used to poke `recorder` straight from the
+    /// caller's thread, racing handleStart/handleStop) and waits out an
+    /// in-flight start exactly like handleStop does.
     func shutdown(then: @escaping () -> Void) {
-        if let rec = recorder {
-            recorder = nil
-            let started = recordingStartedAt
+        gate.async {
+            guard self.recorder != nil else { then(); return }
+            let pendingStart = self.startTask
             Task {
-                if let r = await rec.stop(), r.duration >= config.minCallSeconds {
-                    work.async {
+                await pendingStart?.value
+                guard let (rec, started) = (self.gate.sync { self.takeRecorderLocked() })
+                else { then(); return }
+                if let r = await rec.stop(), r.duration >= self.config.minCallSeconds {
+                    self.work.async {
                         _ = Pipeline(config: Config.load()).process(r, startedAt: started)
                         then()
                     }
                 } else { then() }
             }
-        } else {
-            then()
         }
     }
 }

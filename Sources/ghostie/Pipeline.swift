@@ -7,10 +7,19 @@ import Foundation
 /// If transcription or summarization can't run (whisper missing, Claude Code
 /// not logged in, offline, …) the work is queued to the [Backlog] and the
 /// recording is kept, so nothing is lost. `drain(config:)` retries the queue
-/// whenever Ghostie can process again.
+/// whenever Ghostie can process again. After `maxAttempts` failed drains an
+/// entry stops being retried, but it is never deleted: the audio/transcript
+/// moves to the backlog's `given-up/` folder and the note says where it lives
+/// and how to retry it manually (`ghostie process <dir>`).
 struct Pipeline {
     let config: Config
     static let maxAttempts = 6
+
+    /// Marker `AudioRecorder` drops into a session directory when a recording
+    /// finalizes successfully. It only survives a quit mid-processing —
+    /// `cleanup` removes it (or the whole dir) once the session is handled —
+    /// so `sweepOrphanedRecordings` can use it to find stranded sessions.
+    static let pendingMarker = ".ghostie-pending"
 
     private struct Line {
         let startMs: Int
@@ -31,11 +40,12 @@ struct Pipeline {
         } catch {
             Log.error("Transcription failed: \(error.localizedDescription) — queued to backlog")
             Backlog.enqueueAudio(micWav: rec.micWav, systemWav: rec.systemWav,
-                                 startedAt: startedAt, durationMins: durationMins)
+                                 startedAt: startedAt, durationMins: durationMins,
+                                 copyingOriginals: config.keepAudio)
             let url = writeNote(meta: metaBlock(startedAt, durationMins),
                 summary: "> ⏳ **Queued.** Transcription wasn't available (\(error.localizedDescription)). Ghostie will process this recording automatically once it can run again.",
                 transcript: "_(Pending transcription.)_", startedAt: startedAt)
-            try? FileManager.default.removeItem(at: rec.sessionDir)
+            cleanup(rec.sessionDir)
             return url
         }
 
@@ -98,9 +108,7 @@ struct Pipeline {
             let meta = p.metaBlock(startedAt, entry.meta.durationMins)
 
             if entry.meta.attempts >= maxAttempts {
-                p.finalizeGivenUp(entry, meta: meta)
-                Backlog.remove(entry)
-                completed += 1
+                if p.finalizeGivenUp(entry, meta: meta) { completed += 1 }
                 continue
             }
 
@@ -157,19 +165,86 @@ struct Pipeline {
         return try? s.summarize(transcript: transcript, meta: meta)
     }
 
-    /// After too many attempts, salvage what we have and stop retrying.
-    private func finalizeGivenUp(_ entry: Backlog.Entry, meta: String) {
-        if entry.meta.stage == "summarize",
-           let transcript = try? String(contentsOf: entry.transcriptFile, encoding: .utf8) {
+    /// After too many attempts, stop retrying but lose nothing: the entry is
+    /// preserved under the backlog's `given-up/` folder and the note tells the
+    /// user where it lives and how to retry manually. Returns true when the
+    /// entry left the queue (false leaves it queued for the next drain).
+    private func finalizeGivenUp(_ entry: Backlog.Entry, meta: String) -> Bool {
+        // Read before the move below relocates the file.
+        let transcript = entry.meta.stage == "summarize"
+            ? (try? String(contentsOf: entry.transcriptFile, encoding: .utf8)) : nil
+        guard let preserved = Backlog.giveUp(entry) else { return false }
+        if entry.meta.stage == "summarize" {
             _ = writeNote(meta: meta,
-                summary: "> ⚠️ Summary could not be generated after several retries. The full transcript below is complete; run `claude` once to log in and future calls will summarize automatically.",
-                transcript: transcript, startedAt: entry.startedAtDate)
+                summary: "> ⚠️ Summary could not be generated after several retries. The full transcript below is complete; run `claude` once to log in and future calls will summarize automatically. (The transcript is also preserved at `\(preserved.path)`.)",
+                transcript: transcript ?? "_(Transcript file could not be read — preserved at `\(preserved.path)`.)_",
+                startedAt: entry.startedAtDate)
         } else {
             _ = writeNote(meta: meta,
-                summary: "> ⚠️ This recording could not be transcribed after several retries (check `ghostie doctor`).",
-                transcript: "_(Transcription failed.)_", startedAt: entry.startedAtDate)
+                summary: "> ⚠️ This recording could not be transcribed after several retries (check `ghostie doctor`). Nothing is lost: the audio is preserved at `\(preserved.path)` — once transcription works again, run `ghostie process \"\(preserved.path)\"` to transcribe it.",
+                transcript: "_(Transcription failed — audio preserved at `\(preserved.path)`.)_",
+                startedAt: entry.startedAtDate)
         }
-        Log.warn("Backlog: gave up on \(entry.dir.lastPathComponent) after \(entry.meta.attempts) attempts.")
+        Log.warn("Backlog: gave up on \(entry.dir.lastPathComponent) after \(entry.meta.attempts) attempts — preserved at \(preserved.path).")
+        return true
+    }
+
+    // MARK: Orphan sweep
+
+    /// Recover session directories stranded by a quit mid-processing: any dir
+    /// in the recordings folder that still carries the `.ghostie-pending`
+    /// marker plus recorded audio is moved into the backlog at the
+    /// `transcribe` stage and gets the usual queued-banner note, so the next
+    /// drain picks it up. Dirs without the marker — `keepAudio` leftovers from
+    /// already-processed calls, or a recording still in progress (the recorder
+    /// only writes the marker on successful finalize) — are never touched.
+    /// Synchronous; called once at launch on the engine's serial work queue.
+    /// Returns how many sessions were swept.
+    static func sweepOrphanedRecordings(config: Config) -> Int {
+        let fm = FileManager.default
+        guard let items = try? fm.contentsOfDirectory(
+            at: URL(fileURLWithPath: config.workDir),
+            includingPropertiesForKeys: [.isDirectoryKey, .contentModificationDateKey])
+        else { return 0 }
+        let p = Pipeline(config: config)
+        var swept = 0
+        for dir in items {
+            guard (try? dir.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true,
+                  fm.fileExists(atPath: dir.appendingPathComponent(pendingMarker).path)
+            else { continue }
+            let mic = dir.appendingPathComponent("me.wav")
+            let sys = dir.appendingPathComponent("participants.wav")
+            guard fm.fileExists(atPath: mic.path) || fm.fileExists(atPath: sys.path)
+            else { continue }
+
+            // Session dirs are named with AudioRecorder's start-time stamp;
+            // fall back to the directory's mtime for anything renamed.
+            let startedAt = AudioRecorder.stampFormatter.date(from: dir.lastPathComponent)
+                ?? (try? dir.resourceValues(forKeys: [.contentModificationDateKey]))?
+                    .contentModificationDate
+                ?? Date()
+            let durationMins = String(format: "%.1f", wavSeconds(mic, sys) / 60.0)
+            Log.info("Recovered orphaned recording \(dir.lastPathComponent) — queued to backlog.")
+            Backlog.enqueueAudio(micWav: mic, systemWav: sys,
+                                 startedAt: startedAt, durationMins: durationMins,
+                                 copyingOriginals: config.keepAudio)
+            _ = p.writeNote(meta: p.metaBlock(startedAt, durationMins),
+                summary: "> ⏳ **Queued.** Ghostie quit before this recording could be processed. It has been queued and will be processed automatically.",
+                transcript: "_(Pending transcription.)_", startedAt: startedAt)
+            p.cleanup(dir)
+            swept += 1
+        }
+        return swept
+    }
+
+    /// Best-effort duration of a session from its largest WAV. `WavWriter`
+    /// only produces 16 kHz mono 16-bit PCM, so payload is 32,000 bytes/s
+    /// after the 44-byte header.
+    private static func wavSeconds(_ wavs: URL...) -> Double {
+        let bytes = wavs.compactMap {
+            (try? FileManager.default.attributesOfItem(atPath: $0.path))?[.size] as? Int
+        }.max() ?? 0
+        return Double(max(0, bytes - 44)) / 32_000.0
     }
 
     // MARK: Shared steps
@@ -232,7 +307,12 @@ struct Pipeline {
         """
     }
 
+    /// The session has been fully handled (note written and/or audio queued):
+    /// drop the `.ghostie-pending` marker so the launch-time orphan sweep
+    /// never re-queues this directory, then honor `keepAudio`.
     private func cleanup(_ sessionDir: URL) {
+        try? FileManager.default.removeItem(
+            at: sessionDir.appendingPathComponent(Self.pendingMarker))
         if config.keepAudio {
             Log.info("Audio kept at \(sessionDir.path)")
         } else {
@@ -289,9 +369,13 @@ struct Pipeline {
         return f
     }()
 
+    /// Seconds precision so two calls in the same minute (short call + redial,
+    /// a test run next to a real call) can't overwrite each other's notes,
+    /// while staying a pure function of `startedAt` — backlog retries re-derive
+    /// the same name from meta.json and upgrade the queued note in place.
     private static let fileStamp: DateFormatter = {
         let f = DateFormatter()
-        f.dateFormat = "yyyy-MM-dd_HH-mm"
+        f.dateFormat = "yyyy-MM-dd_HH-mm-ss"
         return f
     }()
 }
