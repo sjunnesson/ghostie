@@ -254,6 +254,24 @@ models just live in `~/.ghostie/models/` and are larger.
 3-run split, cross-track flip vs. isolated fall-back) with synthetic
 detections — no audio or models required, so it stays green everywhere.
 
+### Optional: dedicated ONNX language identifier
+
+By default, per-segment language detection uses whisper's own language head.
+A dedicated **VoxLingua107 ECAPA-TDNN** identifier (faster and better on
+sub-2 s segments) activates automatically when two things are on disk:
+
+```bash
+brew install onnxruntime                 # the runtime (MIT), loaded at run time
+python3 scripts/export-voxlingua-lid.py  # one-time model export (Apache-2.0)
+```
+
+The export script converts `speechbrain/lang-id-voxlingua107-ecapa` to
+`~/.ghostie/models/lid-voxlingua107.onnx` with the feature pipeline inside
+the graph (needs `pip install torch speechbrain onnx onnxruntime` in any
+Python 3.10+ environment). Nothing links ONNX Runtime at build time — the
+dylib is `dlopen`ed only if present, so installs without it are unaffected.
+`ghostie doctor` shows which identifier is active either way.
+
 ## Summarization
 
 The structured note is written by a **summarization provider**, chosen in

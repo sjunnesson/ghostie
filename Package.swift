@@ -9,8 +9,16 @@ let package = Package(
         .macOS(.v15)
     ],
     targets: [
+        // Vendored ONNX Runtime C API declarations (MIT). Declaration-only:
+        // nothing links onnxruntime at build time — ORTRuntime.swift dlopens
+        // the dylib when present, so the ONNX LID is a zero-cost optional.
+        .target(
+            name: "CONNXRuntime",
+            path: "Sources/CONNXRuntime"
+        ),
         .executableTarget(
             name: "ghostie",
+            dependencies: ["CONNXRuntime"],
             path: "Sources/ghostie",
             resources: [
                 // Bundled assets shipped in the SwiftPM resource bundle. The

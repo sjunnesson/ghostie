@@ -42,11 +42,6 @@ struct LanguageSegmenter {
     /// model decision, not in the segmenter's hot loop.
     static func defaultIdentifier(config: Config,
                                   installed: InstalledModels) -> LanguageIdentifier {
-        // VoxLingua107LID stub returns isReady == false today, so this path
-        // is dormant — but it's wired so the eventual ONNX commit flips it
-        // on by changing one boolean, not by editing every call site.
-        let vox = VoxLingua107LID(modelPath: "")
-        if vox.isReady { return vox }
         let whitelist = config.codeSwitch.effectiveLanguages(installed: installed)
         let nordicRemap: (String) -> String = { raw in
             let lc = raw.lowercased()
@@ -58,6 +53,15 @@ struct LanguageSegmenter {
             return collapsible.contains(lc) && whitelist.contains("sv") && !whitelist.contains(lc)
                 ? "sv" : lc
         }
+        // Prefer the dedicated ONNX LID when the runtime + exported model are
+        // on this machine (fast on sub-2 s segments, no whisper spawn). The
+        // disk is the switch: `brew install onnxruntime` + running
+        // scripts/export-voxlingua-lid.py is all it takes; without them this
+        // is a cheap file-existence check and the whisper path runs unchanged.
+        let voxPath = ProcessInfo.processInfo.environment["GHOSTIE_VOXLINGUA_MODEL"]
+            ?? "\(Config.modelsDir)/lid-voxlingua107.onnx"
+        let vox = VoxLingua107LID(modelPath: voxPath, remap: nordicRemap)
+        if vox.isReady { return vox }
         let driver = Self.resolveDetectionModel(config: config, installed: installed)
         // Prefer the resident whisper-server head: one model load per call
         // (~0.95 s) instead of one per segment (~4.8 s each via whisper-cli),

@@ -7,37 +7,31 @@ that need a human in the loop.
 
 ## High priority — finish the v2 architecture
 
-### 1. Wire ONNX Runtime + VoxLingua107 LID
+### 1. Wire ONNX Runtime + VoxLingua107 LID ✅ done (dlopen approach)
 
-The protocol seam is in place (`LanguageIdentifier`, `VoxLingua107LID`);
-`isReady` is hard-coded to `false` so the segmenter falls through to
-`WhisperLID`. To turn the dedicated LID on:
+Landed differently from the sketch below — no SwiftPM binary dependency.
+The vendored ONNX Runtime C API headers (`Sources/CONNXRuntime`, MIT) give
+Swift the `OrtApi` table; `ORTRuntime.swift` dlopens `libonnxruntime.dylib`
+at runtime (Homebrew, `Ghostie.app/Contents/Frameworks`, or
+`GHOSTIE_ORT_DYLIB`) so builds and the `.dmg` stay dependency-free and the
+LID is a zero-cost optional. `VoxLingua107LID.identify` is fully
+implemented (Int16→Float32, in-graph features, softmax with look-alike
+remap folded before the argmax, whitelist renormalization via
+`restrictedPosterior`) and verified end-to-end against a live ORT session
+(`ghostie lid-probe` + a synthetic model; posterior hand-checked exact).
 
-- Add `onnxruntime-swift-package-manager`
-  (`https://github.com/microsoft/onnxruntime-swift-package-manager`) as a
-  SwiftPM dependency in `Package.swift`. Verify it works under the project's
-  Swift 5 language mode (`CLAUDE.md` is explicit: do **not** switch to
-  `.v6`).
-- Verify universal-binary support for the notarized `.dmg`
-  (`scripts/build-app.sh` already lipo's `whisper-cli`; mirror that for the
-  ORT framework). Confirm the framework is signable and notarizes.
-- Pick the actual model file. VoxLingua107 ECAPA-TDNN exports from the
-  SpeechBrain community are the obvious starting point; verify Apache-2.0
-  license terms on the export you choose. Target size budget: ~50–80 MB.
-- Register the model in `Models.swift` alongside the whisper models, with a
-  Hugging Face URL the existing `ModelDownloader` can stream + SHA-verify.
-- Implement `VoxLingua107LID.identify(...)`:
-  - Convert Int16-LE Data → Float32 normalized buffer
-  - Apply VoxLingua107's expected pre-processing (mean-stddev, possibly
-    mel filterbank — check the export's signature)
-  - Run the ORT session, get logits over 107 languages
-  - Restrict to `restrict`, renormalize via log-sum-exp, return log-probs
-- Flip `VoxLingua107LID.isReady` to:
-  `frameworkLoadable && FileManager.default.fileExists(atPath: modelPath)`
+Because no official ONNX export of the model exists,
+`scripts/export-voxlingua-lid.py` converts
+`speechbrain/lang-id-voxlingua107-ecapa` (Apache-2.0) locally — features
+inside the graph, labels sidecar, PyTorch/ONNX parity check. Activation is
+disk-driven: `brew install onnxruntime` + run the script; `ghostie doctor`
+shows the active identifier. `GHOSTIE_BUNDLE_ORT=1 ./scripts/build-app.sh
+--dmg` optionally bundles the dylib.
 
-When `isReady` is true, `LanguageSegmenter.defaultIdentifier` picks ONNX
-LID automatically; nothing else in the pipeline changes. Doctor already
-reports the active identifier (`description` getter).
+Remaining (needs a real mixed-language recording in front of a human):
+routing-accuracy comparison vs `WhisperLID` on the fixture set in #3, and
+a decision on hosting a converted model so `ModelDownloader` can fetch it
+instead of requiring the local export.
 
 ### 2. Hierarchical sliding-window LID
 

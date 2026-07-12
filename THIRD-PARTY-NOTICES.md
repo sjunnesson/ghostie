@@ -42,6 +42,26 @@ terms.
 | whisper-large-v3 (GGML) | English decode in code-switching | https://huggingface.co/ggerganov/whisper.cpp | Settings ▸ Download models, `ghostie fetch-models` | MIT (OpenAI Whisper) — see model card for authoritative terms |
 | KB-Whisper-large (GGML) | Swedish decode in code-switching | https://huggingface.co/KBLab/kb-whisper-large (KBLab / National Library of Sweden) | Settings ▸ Download models, `ghostie fetch-models` | **Apache-2.0** (verified against the model card metadata, 2026-05-19) |
 
+## Vendored source
+
+### ONNX Runtime C API headers (`Sources/CONNXRuntime/include/`)
+
+`onnxruntime_c_api.h` and `onnxruntime_ep_c_api.h` are vendored verbatim
+from ONNX Runtime 1.27.1 — Copyright (c) Microsoft Corporation, **MIT
+License** (https://github.com/microsoft/onnxruntime). Declarations only:
+Ghostie never links or redistributes the ONNX Runtime library itself by
+default; the dylib is loaded at runtime only if the user installed it
+(e.g. `brew install onnxruntime`, MIT). `build-app.sh` can optionally
+bundle `libonnxruntime.dylib` into the `.app` with `GHOSTIE_BUNDLE_ORT=1`
+— if you redistribute such a build, the MIT notice above covers it.
+
+### VoxLingua107 ECAPA-TDNN language-ID model (optional, user-generated)
+
+`scripts/export-voxlingua-lid.py` converts
+https://huggingface.co/speechbrain/lang-id-voxlingua107-ecapa
+(**Apache-2.0**, SpeechBrain) into a local ONNX file on the user's machine.
+Ghostie does not redistribute the model or its weights.
+
 ## Invoked, not bundled
 
 ### Claude Code CLI (`claude`)

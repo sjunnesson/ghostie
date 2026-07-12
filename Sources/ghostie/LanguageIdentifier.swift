@@ -648,44 +648,150 @@ final class ServerWhisperLID: LanguageIdentifier {
     }
 }
 
-// MARK: - VoxLingua107LID — stub for the v2 ONNX integration
+// MARK: - VoxLingua107LID — dedicated short-segment LID via ONNX Runtime
 
-/// Placeholder for the v2 dedicated short-segment LID
-/// (VoxLingua107 ECAPA-TDNN via ONNX Runtime; see `code-switching-v2.md` §2).
-/// Throws `notWired` until the ONNX integration commit lands — the segmenter
-/// degrades to `WhisperLID` when this identifier isn't usable, so installing
-/// the ONNX framework and the model is the only step needed to flip the
-/// real LID on.
+/// The v2 dedicated short-segment LID: VoxLingua107 ECAPA-TDNN running under
+/// ONNX Runtime (see `code-switching-v2.md` §2). Activates when BOTH are on
+/// disk — an onnxruntime dylib (Homebrew, `Ghostie.app/Frameworks`, or
+/// `GHOSTIE_ORT_DYLIB`) and the exported model + labels produced by
+/// `scripts/export-voxlingua-lid.py` — otherwise `isReady` is false and the
+/// segmenter keeps the whisper LID, so behaviour never regresses.
 ///
-/// Why a stub now: PRs 4–5 (snap-to-silence, post-decode re-verification)
-/// only need the *abstraction*, not a working ONNX session. Landing the
-/// protocol seam early means those PRs can be reviewed and tested without
-/// blocking on framework / model download work that needs the user's
-/// hardware in front of them.
-struct VoxLingua107LID: LanguageIdentifier {
+/// The export wraps SpeechBrain's feature extraction INSIDE the graph, so
+/// input is raw waveform: `[1, N] Float32` at 16 kHz → `[1, 107]` logits.
+/// The labels sidecar (`<model>.labels.json`, written by the export script)
+/// maps output indices to ISO codes in the model's own order.
+final class VoxLingua107LID: LanguageIdentifier {
     let modelPath: String
+    /// Same look-alike policy injection as `WhisperLID.remapTop`, applied to
+    /// every posterior key before the whitelist restriction (Nordic
+    /// look-alike mass folds into sv when sv is decodable and the look-alike
+    /// isn't).
+    let remap: (String) -> String
+
+    private let labels: [String]
+    private var session: ORTSession?
+    private let lock = NSLock()
+
+    init(modelPath: String, remap: @escaping (String) -> String = { $0 }) {
+        self.modelPath = modelPath
+        self.remap = remap
+        self.labels = Self.loadLabels(modelPath: modelPath)
+    }
 
     var description: String {
         let name = (modelPath as NSString).lastPathComponent
-        return "VoxLingua107 ECAPA-TDNN (ONNX, \(name.isEmpty ? "not installed" : name))"
+        if isReady {
+            return "VoxLingua107 ECAPA-TDNN (ONNX, \(name), \(labels.count) languages)"
+        }
+        let missing = !FileManager.default.fileExists(atPath: modelPath)
+            ? "model not installed — run scripts/export-voxlingua-lid.py"
+            : (ORTRuntime.shared == nil
+                ? "onnxruntime dylib not found — brew install onnxruntime"
+                : "labels sidecar missing")
+        return "VoxLingua107 ECAPA-TDNN (ONNX, \(missing))"
     }
 
-    enum LIDError: Error, LocalizedError {
-        case notWired
+    enum LIDError: Error, LocalizedError, ClassifiableLIDError {
+        case notReady
+        case inference(String)
         var errorDescription: String? {
-            "VoxLingua107 LID is not yet wired (no ONNX Runtime in this build). Falling back to WhisperLID."
+            switch self {
+            case .notReady: return "VoxLingua107 LID is not installed on this machine."
+            case .inference(let m): return "VoxLingua107 LID inference failed: \(m)"
+            }
         }
+        /// Missing runtime/model is structural (every segment fails the same
+        /// way → backlog and retry); a single inference failure is soft.
+        var isStructural: Bool {
+            if case .notReady = self { return true }
+            return false
+        }
+    }
+
+    /// Sidecar written by the export script: a JSON array of ISO codes in
+    /// output-index order.
+    static func loadLabels(modelPath: String) -> [String] {
+        let path = modelPath + ".labels.json"
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+              let labels = try? JSONDecoder().decode([String].self, from: data)
+        else { return [] }
+        return labels.map { $0.lowercased() }
+    }
+
+    /// Ready when the runtime loads, the model file exists, and the labels
+    /// sidecar parsed. `LanguageSegmenter.defaultIdentifier` consults this
+    /// to pick between the ONNX LID and the whisper fallback.
+    var isReady: Bool {
+        ORTRuntime.shared != nil
+            && !labels.isEmpty
+            && FileManager.default.fileExists(atPath: modelPath)
     }
 
     func identify(pcm: Data,
                   sampleRateHz: Int,
                   restrict: [String]) throws -> [String: Double] {
-        throw LIDError.notWired
+        guard isReady, let runtime = ORTRuntime.shared else { throw LIDError.notReady }
+        let session: ORTSession
+        do {
+            session = try ensureSession(runtime: runtime)
+        } catch {
+            // A model that cannot load will not load for any segment.
+            throw LIDError.notReady
+        }
+
+        // Int16-LE PCM → normalized Float32 waveform.
+        var wav = [Float](repeating: 0, count: pcm.count / 2)
+        pcm.withUnsafeBytes { (buf: UnsafeRawBufferPointer) in
+            let samples = buf.bindMemory(to: Int16.self)
+            for i in 0..<wav.count { wav[i] = Float(Int16(littleEndian: samples[i])) / 32_768 }
+        }
+        guard !wav.isEmpty else { throw LIDError.inference("empty segment") }
+
+        let logits: [Float]
+        do {
+            logits = try session.run(wav: wav)
+        } catch {
+            throw LIDError.inference(error.localizedDescription)
+        }
+        guard logits.count == labels.count else {
+            throw LIDError.inference("model emitted \(logits.count) logits for \(labels.count) labels — model/labels mismatch")
+        }
+
+        // Softmax in log-space over all 107, fold look-alike mass through
+        // `remap` BEFORE the argmax (same policy as ServerWhisperLID), then
+        // renormalize the whitelist languages' real competing masses.
+        let maxLogit = Double(logits.max() ?? 0)
+        var linear: [String: Double] = [:]
+        var total = 0.0
+        for (i, l) in logits.enumerated() {
+            let p = Foundation.exp(Double(l) - maxLogit)
+            linear[labels[i], default: 0] += p
+            total += p
+        }
+        guard total > 0,
+              let posterior = ServerWhisperLID.restrictedPosterior(
+                  linear.mapValues { $0 / total }, remap: remap, restrict: restrict)
+        else { throw LIDError.inference("degenerate posterior") }
+        return posterior.logprobs
     }
 
-    /// True once the ONNX framework is linked AND the model file is on disk.
-    /// `LanguageSegmenter` consults this to decide whether to use this
-    /// identifier or fall back to `WhisperLID`. Today it's always false
-    /// because no ONNX Runtime is linked; future commit flips it on.
-    var isReady: Bool { false }
+    private func ensureSession(runtime: ORTRuntime) throws -> ORTSession {
+        lock.lock()
+        defer { lock.unlock() }
+        if let session { return session }
+        let s = try runtime.makeSession(modelPath: modelPath)
+        session = s
+        Log.info("VoxLingua107 LID up (\((modelPath as NSString).lastPathComponent) via \((runtime.dylibPath as NSString).lastPathComponent))")
+        return s
+    }
+
+    /// Release the ORT session at end of the call's detect work (same
+    /// contract as ServerWhisperLID's server teardown).
+    func shutdown() {
+        lock.lock()
+        defer { lock.unlock() }
+        session?.close()
+        session = nil
+    }
 }

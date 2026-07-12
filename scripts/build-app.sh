@@ -160,6 +160,27 @@ if [ "$SELFCONTAINED" = "1" ]; then
       -o "$MODEL_CACHE/ggml-silero-v5.1.2.bin"
   fi
   cp "$MODEL_CACHE/ggml-silero-v5.1.2.bin" "$APP/Contents/Resources/"
+
+  # Optional: bundle the ONNX Runtime dylib for the dedicated VoxLingua107
+  # LID (GHOSTIE_BUNDLE_ORT=1). Off by default — it adds ~40 MB to the .dmg
+  # and the LID model itself still needs scripts/export-voxlingua-lid.py on
+  # the target machine. ORTRuntime.swift looks in Contents/Frameworks first.
+  if [ "${GHOSTIE_BUNDLE_ORT:-0}" = "1" ]; then
+    ORT_DYLIB=""
+    for c in /opt/homebrew/lib/libonnxruntime.dylib /usr/local/lib/libonnxruntime.dylib; do
+      [ -f "$c" ] && ORT_DYLIB="$c" && break
+    done
+    if [ -n "$ORT_DYLIB" ]; then
+      echo "==> Bundling ONNX Runtime ($(basename "$(readlink -f "$ORT_DYLIB")"))"
+      mkdir -p "$APP/Contents/Frameworks"
+      # readlink -f: copy the real versioned dylib, not the symlink chain.
+      cp "$(readlink -f "$ORT_DYLIB")" "$APP/Contents/Frameworks/libonnxruntime.dylib"
+      NESTED_BINS+=("$APP/Contents/Frameworks/libonnxruntime.dylib")
+      lipo -info "$APP/Contents/Frameworks/libonnxruntime.dylib" | sed 's/^/    /'
+    else
+      echo "    GHOSTIE_BUNDLE_ORT=1 but no libonnxruntime.dylib found (brew install onnxruntime) — skipping."
+    fi
+  fi
 fi
 
 # ---- Code signing -----------------------------------------------------------
