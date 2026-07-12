@@ -68,8 +68,8 @@ struct CodeSwitchTranscriber {
         // resident whisper-server stays loaded across BOTH tracks' detect
         // passes (and the verify pass below), and this defer tears it down
         // exactly once whether we return or throw — a throw backlogs the call
-        // and a retry starts a fresh server. (A hard crash skips the defer;
-        // that's the one path that can orphan a whisper-server.)
+        // and a retry starts a fresh server. (A hard crash skips the defer,
+        // but the server's sh watchdog notices the dead parent and kills it.)
         let lid = LanguageSegmenter.defaultIdentifier(config: config, installed: installed)
         defer { lid.shutdown() }
         let seg = LanguageSegmenter(config: config, installed: installed, identifier: lid)

@@ -309,6 +309,7 @@ Edit `~/.ghostie/config.json` (created on first run). Notable keys:
 | `vadModel` | `…/ggml-silero-v5.1.2.bin` | Auto-used if present (`setup.sh --vad`) |
 | `summaryProvider` | `claude` | Summarizer backend: `claude` (cloud) or `ollama` (local) |
 | `summaryModel` | `claude-sonnet-4-6` | Model for `claude -p` (alias or full id); `claude` provider only |
+| `summaryTimeoutSeconds` | `300` | Wall-clock cap per summarization request (both providers); raise for big local models |
 | `claudeBinary` | _(auto-detected)_ | Path to the `claude` CLI; `claude` provider only |
 | `ollamaUrl` | `http://localhost:11434` | Ollama server URL (LAN host also fine); `ollama` provider only |
 | `ollamaModel` | _(empty)_ | Ollama model name from `ollama list`; `ollama` provider only |

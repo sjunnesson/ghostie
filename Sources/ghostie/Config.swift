@@ -123,6 +123,11 @@ struct Config: Codable {
     /// `summaryProvider == "ollama"`.
     var ollamaModel: String = ""
 
+    /// Wall-clock cap on one summarization request, both providers. The 300 s
+    /// default matches the old hardcoded watchdog; raise it for big local
+    /// Ollama models on slow hardware. Clamped to >= 60 at use.
+    var summaryTimeoutSeconds: Double = 300
+
     // MARK: Updates (in-app OTA — see Updater.swift)
 
     /// Check GitHub Releases on launch + ~daily and surface a newer version.
@@ -160,6 +165,7 @@ struct Config: Codable {
         case initialPrompt, vadModel
         case cleanTranscript, transcriptionQuality, codeSwitch
         case summaryProvider, summaryModel, claudeBinary, ollamaUrl, ollamaModel
+        case summaryTimeoutSeconds
         case workDir
         case autoCheckUpdates, lastUpdateCheck, updateFeedOverride
     }
@@ -193,6 +199,7 @@ struct Config: Codable {
         claudeBinary = g(.claudeBinary, d.claudeBinary)
         ollamaUrl = g(.ollamaUrl, d.ollamaUrl)
         ollamaModel = g(.ollamaModel, d.ollamaModel)
+        summaryTimeoutSeconds = g(.summaryTimeoutSeconds, d.summaryTimeoutSeconds)
         workDir = g(.workDir, d.workDir)
         autoCheckUpdates = g(.autoCheckUpdates, d.autoCheckUpdates)
         lastUpdateCheck = g(.lastUpdateCheck, d.lastUpdateCheck)

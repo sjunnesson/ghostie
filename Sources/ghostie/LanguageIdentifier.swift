@@ -249,12 +249,13 @@ struct WhisperLID: LanguageIdentifier {
 /// posterior (see `restrictedPosterior`) instead of being replaced by
 /// `WhisperLID.spread`'s fabricated uniform residual.
 ///
-/// Lifecycle is strictly owned by Ghostie: the server has no idle-exit or
-/// parent-death option, so whoever builds this identifier must call
-/// `shutdown()` when the call's detect work finishes, success OR throw —
-/// `CodeSwitchTranscriber.transcribeBoth` does that with a `defer`. `deinit`
-/// is only a safety net; it cannot run on a hard crash (SIGKILL), which can
-/// orphan one `whisper-server` until the user notices or reboots.
+/// Lifecycle is strictly owned by Ghostie: whoever builds this identifier
+/// must call `shutdown()` when the call's detect work finishes, success OR
+/// throw — `CodeSwitchTranscriber.transcribeBoth` does that with a `defer`.
+/// `deinit` is only a safety net. The server itself is spawned under a tiny
+/// sh watchdog (see `ensureStartedLocked`) that kills it if ghostie dies by
+/// any means — including SIGKILL, which skips every in-process cleanup — so
+/// a hard crash can no longer orphan a whisper-server until reboot.
 ///
 /// A class (not a struct) because it owns mutable process state; all entry
 /// points serialize on `lock`, matching the pipeline's sequential use (the
@@ -442,9 +443,10 @@ final class ServerWhisperLID: LanguageIdentifier {
 
     // MARK: Lifecycle
 
-    /// Deterministic teardown: SIGTERM (clean exit within ~500 ms, verified),
-    /// brief wait, SIGKILL fallback. Idempotent — safe to call from both the
-    /// owner's `defer` and `deinit`.
+    /// Deterministic teardown: SIGTERM to the sh watchdog (its trap kills the
+    /// server; the shell may finish a 1 s liveness sleep first), wait, SIGKILL
+    /// fallback. Idempotent — safe to call from both the owner's `defer` and
+    /// `deinit`.
     func shutdown() {
         lock.lock()
         defer { lock.unlock() }
@@ -455,8 +457,8 @@ final class ServerWhisperLID: LanguageIdentifier {
         guard let p = process else { return }
         process = nil
         guard p.isRunning else { return }
-        p.terminate()                                  // SIGTERM
-        let deadline = Date().addingTimeInterval(1.5)
+        p.terminate()                                  // SIGTERM → trap kills server
+        let deadline = Date().addingTimeInterval(3)
         while p.isRunning && Date() < deadline {
             Thread.sleep(forTimeInterval: 0.05)
         }
@@ -475,11 +477,32 @@ final class ServerWhisperLID: LanguageIdentifier {
         for _ in 0..<3 {
             guard let candidate = Self.freePort() else { continue }
             let p = Process()
-            p.executableURL = URL(fileURLWithPath: serverBinary)
-            // NEVER pass `-nlp` here — it strips `language_probabilities`
-            // from the response (verified), which is the whole point.
-            p.arguments = ["-m", model,
-                           "--host", "127.0.0.1", "--port", "\(candidate)"]
+            // The server is spawned through a tiny sh watchdog so a hard
+            // ghostie crash (SIGKILL — the one path that skips the owner's
+            // `defer { shutdown() }`) can no longer orphan a resident
+            // whisper-server until reboot: the wrapper polls its original
+            // parent PID ($PPID is captured at shell start) once a second
+            // and kills the server when ghostie is gone. It also exits when
+            // the server itself dies, and its TERM/EXIT trap makes a normal
+            // `terminate()` from stopLocked() take the server down with it.
+            // NEVER pass `-nlp` to the server — it strips
+            // `language_probabilities` from the response (verified), which
+            // is the whole point. Paths travel via the environment, not the
+            // script, so spaces never need quoting.
+            p.executableURL = URL(fileURLWithPath: "/bin/sh")
+            p.arguments = ["-c", """
+                "$GHOSTIE_LID_BIN" -m "$GHOSTIE_LID_MODEL" --host 127.0.0.1 --port "$GHOSTIE_LID_PORT" &
+                W=$!
+                trap 'kill $W 2>/dev/null' TERM INT EXIT
+                while kill -0 $PPID 2>/dev/null && kill -0 $W 2>/dev/null; do sleep 1; done
+                kill $W 2>/dev/null
+                wait $W 2>/dev/null
+                """]
+            p.environment = ProcessInfo.processInfo.environment.merging([
+                "GHOSTIE_LID_BIN": serverBinary,
+                "GHOSTIE_LID_MODEL": model,
+                "GHOSTIE_LID_PORT": "\(candidate)",
+            ]) { _, new in new }
             // Discard server logs; an unread Pipe would fill up and stall the
             // server on a long call.
             p.standardOutput = FileHandle.nullDevice

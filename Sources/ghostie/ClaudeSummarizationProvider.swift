@@ -21,7 +21,13 @@ struct ClaudeSummarizationProvider: SummarizationProvider {
         isConfigured ? "Signed in" : "Missing"
     }
 
-    func summarize(transcript: String, meta: String) throws -> String {
+    /// ~150k tokens at ~4 chars/token — comfortable inside the Claude models'
+    /// 200k context with the analyst prompt and the note itself.
+    var maxTranscriptChars: Int { 600_000 }
+
+    private var timeout: TimeInterval { max(60, config.summaryTimeoutSeconds) }
+
+    func complete(system: String, user userContent: String) throws -> String {
         let binary = claudeBinary
         guard !binary.isEmpty,
               FileManager.default.isExecutableFile(atPath: binary) else {
@@ -31,8 +37,6 @@ struct ClaudeSummarizationProvider: SummarizationProvider {
             ])
         }
 
-        let userContent = SummarizerPrompt.userContent(transcript: transcript, meta: meta)
-
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: binary)
         proc.arguments = [
@@ -40,7 +44,7 @@ struct ClaudeSummarizationProvider: SummarizationProvider {
             "--output-format", "text",
             "--model", config.summaryModel,
             // Replace Claude Code's agentic system prompt with our analyst one.
-            "--system-prompt", SummarizerPrompt.system
+            "--system-prompt", system
         ]
         // Neutral cwd so no unrelated project CLAUDE.md is picked up.
         proc.currentDirectoryURL = URL(fileURLWithPath: NSTemporaryDirectory())
@@ -91,10 +95,11 @@ struct ClaudeSummarizationProvider: SummarizationProvider {
         io.async { outData = outPipe.fileHandleForReading.readDataToEndOfFile(); drained.signal() }
         io.async { errData = errPipe.fileHandleForReading.readDataToEndOfFile(); drained.signal() }
 
-        // Watchdog: the 5-minute cap covers the *running* process, not just
-        // the post-EOF wait. On timeout: SIGTERM, brief grace, SIGKILL —
-        // mirroring the whisper-server teardown in `LanguageIdentifier`.
-        let deadline = DispatchTime.now() + 300
+        // Watchdog: the cap (config.summaryTimeoutSeconds) covers the
+        // *running* process, not just the post-EOF wait. On timeout: SIGTERM,
+        // brief grace, SIGKILL — mirroring the whisper-server teardown in
+        // `LanguageIdentifier`.
+        let deadline = DispatchTime.now() + timeout
         let waiter = DispatchQueue(label: "ghostie.claude.wait")
         let exited = DispatchSemaphore(value: 0)
         waiter.async { proc.waitUntilExit(); exited.signal() }
@@ -110,18 +115,18 @@ struct ClaudeSummarizationProvider: SummarizationProvider {
             _ = drained.wait(timeout: .now() + 2)
             throw NSError(domain: "ghostie", code: 6, userInfo: [
                 NSLocalizedDescriptionKey:
-                    "claude produced no result within 5 minutes and was terminated — it may have been waiting on login or the network. Run `claude` once interactively to check."
+                    "claude produced no result within \(Int(timeout)) s and was terminated — it may have been waiting on login or the network. Run `claude` once interactively to check, or raise summaryTimeoutSeconds."
             ])
         }
 
         // Exited in time; both drains finish at EOF moments later. Bounded by
-        // the same 5-minute budget so an inherited fd held open by a stray
-        // child can't re-introduce the forever-hang.
+        // the same budget so an inherited fd held open by a stray child can't
+        // re-introduce the forever-hang.
         if drained.wait(timeout: deadline) == .timedOut
             || drained.wait(timeout: deadline) == .timedOut {
             throw NSError(domain: "ghostie", code: 6, userInfo: [
                 NSLocalizedDescriptionKey:
-                    "claude exited but its output streams never closed within 5 minutes."
+                    "claude exited but its output streams never closed within \(Int(timeout)) s."
             ])
         }
 

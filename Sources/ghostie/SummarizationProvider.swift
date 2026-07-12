@@ -15,8 +15,26 @@ protocol SummarizationProvider {
     /// "Signed in", "Not reachable", "Pick a model".
     var displayStatus: String { get }
 
-    /// Block until a summary is produced or throw. Errors should use the
-    /// `"ghostie"` `NSError` domain so the existing Pipeline + Backlog error
-    /// handling treats every provider's failures identically.
-    func summarize(transcript: String, meta: String) throws -> String
+    /// The largest transcript (in characters) one request can safely carry
+    /// without blowing the model's context window. Transcripts beyond this
+    /// are summarized in parts by `Summarizer` (map-reduce) instead of
+    /// failing the whole call.
+    var maxTranscriptChars: Int { get }
+
+    /// One completion round-trip with an arbitrary system prompt — the
+    /// primitive that both the single-shot summary and the chunked
+    /// map-reduce path build on. Blocks until a result is produced or
+    /// throws. Errors should use the `"ghostie"` `NSError` domain so the
+    /// existing Pipeline + Backlog error handling treats every provider's
+    /// failures identically.
+    func complete(system: String, user: String) throws -> String
+}
+
+extension SummarizationProvider {
+    /// Single-shot analyst summary; `Summarizer` calls this when the
+    /// transcript fits `maxTranscriptChars`.
+    func summarize(transcript: String, meta: String) throws -> String {
+        try complete(system: SummarizerPrompt.system,
+                     user: SummarizerPrompt.userContent(transcript: transcript, meta: meta))
+    }
 }

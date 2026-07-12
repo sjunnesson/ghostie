@@ -7,10 +7,10 @@ import Foundation
 struct OllamaSummarizationProvider: SummarizationProvider {
     let config: Config
 
-    /// Five-minute wall-clock cap on summarization, matching the Claude path.
-    /// Long-context local models on slower hardware can take several minutes,
-    /// so this is deliberately generous.
-    private static let summarizeTimeout: TimeInterval = 300
+    /// Wall-clock cap on one summarization request (config-driven, default
+    /// 300 s, min 60). Long-context local models on slower hardware can take
+    /// several minutes, so the default is deliberately generous.
+    private var summarizeTimeout: TimeInterval { max(60, config.summaryTimeoutSeconds) }
 
     /// Short timeout for the `/api/tags` health check — we'd rather show
     /// "Not reachable" promptly than block the Settings UI for ten seconds
@@ -35,7 +35,13 @@ struct OllamaSummarizationProvider: SummarizationProvider {
         return models.contains(config.ollamaModel) ? "Ready" : "Model not pulled"
     }
 
-    func summarize(transcript: String, meta: String) throws -> String {
+    /// Local models commonly run 8k-token contexts (Ollama's default window
+    /// is smaller still); ~6k tokens of transcript leaves room for the
+    /// analyst prompt and the note. Long calls go through the map-reduce
+    /// path in `Summarizer` rather than silently overflowing the window.
+    var maxTranscriptChars: Int { 24_000 }
+
+    func complete(system: String, user userContent: String) throws -> String {
         guard !config.ollamaModel.isEmpty else {
             throw NSError(domain: "ghostie", code: 10, userInfo: [
                 NSLocalizedDescriptionKey:
@@ -50,11 +56,10 @@ struct OllamaSummarizationProvider: SummarizationProvider {
             ])
         }
 
-        let userContent = SummarizerPrompt.userContent(transcript: transcript, meta: meta)
         let body: [String: Any] = [
             "model": config.ollamaModel,
             "messages": [
-                ["role": "system", "content": SummarizerPrompt.system],
+                ["role": "system", "content": system],
                 ["role": "user",   "content": userContent]
             ],
             "stream": false,
@@ -73,11 +78,11 @@ struct OllamaSummarizationProvider: SummarizationProvider {
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.httpBody = payload
-        req.timeoutInterval = Self.summarizeTimeout
+        req.timeoutInterval = summarizeTimeout
 
         Log.info("Summarizing via Ollama (\(config.ollamaModel) at \(baseURL.absoluteString))…")
 
-        let result = Self.syncDataTask(request: req, timeout: Self.summarizeTimeout)
+        let result = Self.syncDataTask(request: req, timeout: summarizeTimeout)
         switch result {
         case .failure(let err):
             throw NSError(domain: "ghostie", code: 13, userInfo: [

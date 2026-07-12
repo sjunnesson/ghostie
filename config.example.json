@@ -38,6 +38,7 @@
 
   "summaryProvider": "claude",
   "summaryModel": "claude-sonnet-4-6",
+  "summaryTimeoutSeconds": 300,
   "claudeBinary": "",
   "ollamaUrl": "http://localhost:11434",
   "ollamaModel": "",
