@@ -370,7 +370,8 @@ struct CodeSwitchTranscriber {
     /// Run boundaries can clip a word and produce a duplicated half-word on
     /// each side. Drop a segment whose normalized text is (near-)equal to its
     /// time-adjacent predecessor — conservative, so real repeats survive.
-    private func dedupeBoundaries(_ segs: [Transcriber.Segment]) -> [Transcriber.Segment] {
+    // Internal (not private) for the selftest.
+    func dedupeBoundaries(_ segs: [Transcriber.Segment]) -> [Transcriber.Segment] {
         guard segs.count > 1 else { return segs }
         func toks(_ s: String) -> [String] {
             s.lowercased().split { !$0.isLetter && !$0.isNumber }.map(String.init)

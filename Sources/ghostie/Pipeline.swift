@@ -21,10 +21,23 @@ struct Pipeline {
     /// so `sweepOrphanedRecordings` can use it to find stranded sessions.
     static let pendingMarker = ".ghostie-pending"
 
-    private struct Line {
+    struct Line {
         let startMs: Int
         let speaker: String
         let text: String
+    }
+
+    /// Deterministic timestamp merge across tracks. Swift's sort is not
+    /// guaranteed stable, so a bare `startMs` comparison ordered concurrent
+    /// cross-talk (equal timestamps) arbitrarily between runs; the
+    /// speaker-then-text tie-break makes re-processing a recording
+    /// byte-identical. Internal (not private) for the selftest.
+    static func merge(_ lines: [Line]) -> [Line] {
+        lines.sorted {
+            if $0.startMs != $1.startMs { return $0.startMs < $1.startMs }
+            if $0.speaker != $1.speaker { return $0.speaker < $1.speaker }
+            return $0.text < $1.text
+        }
     }
 
     // MARK: Live processing
@@ -290,10 +303,10 @@ struct Pipeline {
             collect(try transcriber.transcribe(mic, speaker: "Me"), "Me")
             collect(try transcriber.transcribe(sys, speaker: "Participants"), "Participants")
         }
-        return lines.sorted { $0.startMs < $1.startMs }
+        return Self.merge(lines)
     }
 
-    private func render(_ lines: [Line]) -> String {
+    func render(_ lines: [Line]) -> String {
         lines.isEmpty
             ? "_(No speech was transcribed.)_"
             : lines.map { "**[\(Self.clock($0.startMs))] \($0.speaker):** \($0.text)" }
