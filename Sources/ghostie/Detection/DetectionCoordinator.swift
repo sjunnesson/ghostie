@@ -242,8 +242,9 @@ final class DetectionCoordinator {
     /// unavailable; if even one PID was successfully introspected and just
     /// did not match, that's `.notMatched`, not unavailable. (A transient
     /// launching or quitting Teams instance must not poison a clean read.)
-    private static func resolveMeetingWindow(ax: MeetingWindowProvider,
-                                             pids: [pid_t]) -> MeetingWindowMatch {
+    // Internal (not private) for the selftest.
+    static func resolveMeetingWindow(ax: MeetingWindowProvider,
+                                     pids: [pid_t]) -> MeetingWindowMatch {
         if pids.isEmpty {
             return ax.permissionGranted ? .notMatched
                 : .unavailable(reason: "Accessibility permission not granted")

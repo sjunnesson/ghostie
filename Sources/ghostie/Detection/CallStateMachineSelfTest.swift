@@ -455,6 +455,142 @@ func runDetectorStateMachineSelfTest() -> Bool {
         }
     }
 
+    // 17b. Pure coordinator transforms: bundle matcher, evidence builder,
+    //      meeting-window resolution — no providers needed.
+    do {
+        let m = ["com.microsoft.teams", "com.microsoft.teams2"]
+        check("matcher: exact id matches",
+              DetectionCoordinator.matchesTeamsBundle("com.microsoft.teams", matchers: m))
+        check("matcher: classic prefix does not swallow new Teams",
+              DetectionCoordinator.matchesTeamsBundle("com.microsoft.teams2", matchers: ["com.microsoft.teams2"])
+              && !DetectionCoordinator.matchesTeamsBundle("com.microsoft.teams2", matchers: ["com.microsoft.teams"]))
+        check("matcher: helper matches via dot-prefix",
+              DetectionCoordinator.matchesTeamsBundle("com.microsoft.teams2.helper.plugin", matchers: m))
+        check("matcher: unrelated bundle rejected",
+              !DetectionCoordinator.matchesTeamsBundle("com.apple.safari", matchers: m))
+        check("matcher: case-insensitive",
+              DetectionCoordinator.matchesTeamsBundle("Com.Microsoft.Teams2.Helper", matchers: m))
+
+        let procs = [
+            AudioProcessInfo(pid: 10, bundleId: "com.microsoft.teams2", isRunningInput: true, isRunningOutput: false),
+            AudioProcessInfo(pid: 11, bundleId: "com.microsoft.teams2.helper", isRunningInput: false, isRunningOutput: true),
+            AudioProcessInfo(pid: 99, bundleId: "us.zoom.xos", isRunningInput: true, isRunningOutput: true),
+            AudioProcessInfo(pid: 12, bundleId: nil, isRunningInput: true, isRunningOutput: true),
+        ]
+        let e = DetectionCoordinator.buildEvidence(
+            audio: procs, now: 0, matchers: m, defaultDeviceId: 42,
+            meetingWindow: .notMatched, cameraPids: [], deviceSwapWithinLast3s: false)
+        check("buildEvidence: input/output PIDs filtered to Teams and sorted",
+              e.teamsInputPids == [10] && e.teamsOutputPids == [11]
+              && e.teamsMainPids == [10, 11],
+              "in=\(e.teamsInputPids) out=\(e.teamsOutputPids) all=\(e.teamsMainPids)")
+
+        func isUnavailable(_ m: MeetingWindowMatch) -> Bool {
+            if case .unavailable = m { return true } else { return false }
+        }
+        let ax = FakeDetectionWorld.AX()
+        ax.granted = false
+        check("resolveMeetingWindow: no PIDs + denied → unavailable",
+              isUnavailable(DetectionCoordinator.resolveMeetingWindow(ax: ax, pids: [])))
+        ax.granted = true
+        check("resolveMeetingWindow: no PIDs + granted → notMatched",
+              DetectionCoordinator.resolveMeetingWindow(ax: ax, pids: []) == .notMatched)
+        ax.perPid = [1: .unavailable(reason: "launching"), 2: .notMatched]
+        check("resolveMeetingWindow: one clean read beats a transient unavailable",
+              DetectionCoordinator.resolveMeetingWindow(ax: ax, pids: [1, 2]) == .notMatched)
+        ax.perPid = [1: .unavailable(reason: "launching"),
+                     2: .matched(reason: "title", heuristicsVersion: 1)]
+        check("resolveMeetingWindow: matched wins",
+              DetectionCoordinator.resolveMeetingWindow(ax: ax, pids: [1, 2]).isMatched)
+        ax.perPid = [1: .unavailable(reason: "a"), 2: .unavailable(reason: "b")]
+        check("resolveMeetingWindow: all unavailable propagates unavailable",
+              isUnavailable(DetectionCoordinator.resolveMeetingWindow(ax: ax, pids: [1, 2])))
+    }
+
+    // 17c. Full lifecycle through a REAL coordinator wired to
+    //      FakeDetectionWorld — the scripted-fake harness the rearchitecture
+    //      design promised. The VirtualClock scrubs the confirm/grace
+    //      windows; only the coordinator's real 300 ms notification debounce
+    //      needs short wall-clock waits.
+    do {
+        final class Counters: @unchecked Sendable {
+            private let lock = NSLock()
+            private var counts: [String: Int] = [:]
+            func bump(_ k: String) { lock.withLock { counts[k, default: 0] += 1 } }
+            func get(_ k: String) -> Int { lock.withLock { counts[k] ?? 0 } }
+        }
+        let world = FakeDetectionWorld()
+        let coord = world.makeCoordinator()
+        let c = Counters()
+        coord.onTentativeStart = { _ in c.bump("tent") }
+        coord.onTentativeDiscard = { _ in c.bump("discard") }
+        coord.onCallStart = { _ in c.bump("start") }
+        coord.onCallStop = { _ in c.bump("stop") }
+
+        func teamsAudio(input: Bool, output: Bool) -> [AudioProcessInfo] {
+            [AudioProcessInfo(pid: 100, bundleId: "com.microsoft.teams2",
+                              isRunningInput: input, isRunningOutput: output)]
+        }
+        // Push a change and wait out the 300 ms trailing debounce.
+        func settle() { world.audio.notify(); Thread.sleep(forTimeInterval: 0.45) }
+
+        world.presence.apps = [RunningAppInfo(pid: 100, bundleId: "com.microsoft.teams2")]
+        coord.start()
+        Thread.sleep(forTimeInterval: 0.2)   // start()'s direct initial evaluate
+        check("coordinator: idle with no audio", coord.snapshot().stage == .idle)
+
+        world.audio.procs = teamsAudio(input: true, output: true)
+        settle()
+        check("coordinator: input+output enters candidate, tentative capture starts",
+              coord.snapshot().stage == .candidate && c.get("tent") == 1,
+              "stage=\(coord.snapshot().stage) tent=\(c.get("tent"))")
+
+        world.clock.advance(by: 3.5)
+        settle()
+        check("coordinator: confirmable 3.5 s promotes (onCallStart)",
+              coord.snapshot().stage == .confirmed && c.get("start") == 1,
+              "stage=\(coord.snapshot().stage) start=\(c.get("start"))")
+
+        // Device swap quiescence: the coordinator stamps lastDeviceSwapAt
+        // from the VirtualClock, so an input loss right after the swap
+        // notification carries deviceSwapWithinLast3s and stays confirmed.
+        world.device.deviceId = 43
+        world.device.notify()
+        world.audio.procs = []
+        settle()
+        check("coordinator: input loss inside swap quiescence stays confirmed",
+              coord.snapshot().stage == .confirmed,
+              "stage=\(coord.snapshot().stage)")
+
+        // Past the 3 s quiescence window the loss counts: ending → idle.
+        world.clock.advance(by: 4)
+        settle()
+        check("coordinator: loss past quiescence enters ending",
+              coord.snapshot().stage == .ending, "stage=\(coord.snapshot().stage)")
+        world.clock.advance(by: 31)
+        settle()
+        check("coordinator: grace elapsed → idle with balanced stop",
+              coord.snapshot().stage == .idle && c.get("stop") == 1 && c.get("discard") == 0,
+              "stage=\(coord.snapshot().stage) stop=\(c.get("stop")) discard=\(c.get("discard"))")
+
+        // Candidate that never confirms: primary only, then lost for > 8 s.
+        world.audio.procs = teamsAudio(input: true, output: false)
+        settle()
+        check("coordinator: primary-only re-enters candidate",
+              coord.snapshot().stage == .candidate && c.get("tent") == 2,
+              "stage=\(coord.snapshot().stage) tent=\(c.get("tent"))")
+        world.audio.procs = []
+        settle()
+        world.clock.advance(by: 9)
+        settle()
+        check("coordinator: demoted candidate discards tentative capture, no stop",
+              coord.snapshot().stage == .idle && c.get("discard") == 1
+              && c.get("start") == 1 && c.get("stop") == 1,
+              "discard=\(c.get("discard")) start=\(c.get("start")) stop=\(c.get("stop"))")
+
+        coord.stop()
+    }
+
     // 18. diagnose-detect --json emits line-delimited JSON that round-trips
     //     through JSONSerialization. Driven against a real
     //     DetectionCoordinator (no fake providers); short duration so the
