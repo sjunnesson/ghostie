@@ -75,11 +75,19 @@ protocol LanguageIdentifier {
     /// when detect work finishes, success or throw — see the `defer` in
     /// `CodeSwitchTranscriber.transcribeBoth`.
     func shutdown()
+
+    /// True for identifiers cheap enough (≲ tens of ms per window) that the
+    /// segmenter may run the fine sliding-window pass, which multiplies
+    /// `identify` calls by the window count. Whisper-based LIDs (~1.2 s per
+    /// window even warm) return the default false and skip the fine pass.
+    var isLowLatency: Bool { get }
 }
 
 extension LanguageIdentifier {
     /// Default no-op so existing identifiers and test stubs conform unchanged.
     func shutdown() {}
+    /// Conservative default: only identifiers that opt in get the fine pass.
+    var isLowLatency: Bool { false }
 }
 
 /// Lets the segmenter tell a *structural* identifier failure (model/binary/
@@ -718,6 +726,10 @@ final class VoxLingua107LID: LanguageIdentifier {
         else { return [] }
         return labels.map { $0.lowercased() }
     }
+
+    /// ~10 ms per window on Apple Silicon (measured via lid-probe) — cheap
+    /// enough for the sliding-window fine pass.
+    var isLowLatency: Bool { true }
 
     /// Ready when the runtime loads, the model file exists, and the labels
     /// sidecar parsed. `LanguageSegmenter.defaultIdentifier` consults this

@@ -33,34 +33,28 @@ routing-accuracy comparison vs `WhisperLID` on the fixture set in #3, and
 a decision on hosting a converted model so `ModelDownloader` can fetch it
 instead of requiring the local export.
 
-### 2. Hierarchical sliding-window LID
+### 2. Hierarchical sliding-window LID ✅ done
 
-**Partially landed (accuracy pass, 2026-07):** long VAD segments are now
-split into equal ≤ `cs.maxDetectMs` (default 8 s) chunks that are detected
-independently (`LanguageSegmenter.splitForDetect`), so a switch inside one
-long segment is no longer averaged into a single label and the LID's 30 s
-slice cap no longer silently hides the tail. The same pass also made
-`ServerWhisperLID` return the full renormalized `language_probabilities`
-posterior (Nordic look-alike mass folded *before* the argmax —
-`restrictedPosterior`), and fixed `WhisperLID.spread` so a weak top-1 can
-never invert into evidence against itself. What remains here is the finer
-*overlapping* sliding window + change-point detection:
+Coarse pass (≤ `cs.maxDetectMs` chunks) landed in the 2026-07 accuracy
+pass; the fine pass is now in too (`LanguageSegmenter.fineDetections`):
+inside chunks longer than `cs.intraSegmentRefineMs` (default 4000) or with
+a coarse top1−top2 log-margin ≤ `cs.intraSegmentMarginThreshold` (default
+0.15), the chunk is re-LID'd with `cs.lidWindowMs` × `cs.lidHopMs`
+(default 1500 × 500) overlapping windows and a CUSUM change-point scan
+(`LanguageSegmenter.changePoints`) splits it at sustained switches —
+requiring accumulated log-likelihood-ratio evidence ≥ 2.0, dwell ≥
+`cs.minDwellMs` (default 1500), and ≥ 2 corroborating windows, so a
+single-window blip never breaks a sentence. Sub-span posteriors aggregate
+(product in log space, renormalized) into one detection per span; the
+smoother + snap-to-silence still own final boundary placement.
 
-- Coarse pass: one `identifier.identify` per ≤ maxDetectMs chunk (today's path).
-- Fine pass: re-LID with `cs.lidWindowMs` × `cs.lidHopMs` (default 1500 ×
-  500) inside segments where either `segment.durationMs >
-  intraSegmentRefineMs` (default 4000) OR the coarse top1−top2 margin is
-  ≤ `intraSegmentMarginThreshold` (default 0.15).
-- Detect language change points on the fine-pass posterior, then run them
-  through the existing snap-to-silence rule
-  (`CodeSwitchTranscriber.snapBoundaries`) before they become run
-  boundaries.
-- CUSUM-style change-point detector with `cs.minDwellMs` (default 1500)
-  prevents half-second blips from breaking sentences.
-
-The selftest for this case already exists in spirit (the 3-language fixture
-and the snap test); add a sliding-window mock that emits a known posterior
-timeline.
+The fine pass only runs under a low-latency identifier
+(`LanguageIdentifier.isLowLatency` — the ONNX VoxLingua107 LID; whisper
+LIDs at ~1.2 s/window would multiply detect time by the window count).
+Selftest: CUSUM scan over synthetic posterior timelines (mono, sustained
+switch, blip, ambiguous, 3-language) plus an end-to-end detect() run with
+a position-sniffing stub that must split a 10 s segment near the true 5 s
+boundary.
 
 ### 3. Audio fixtures + end-to-end selftest assertions
 

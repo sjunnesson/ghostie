@@ -28,6 +28,11 @@
     "silencePadMs": 500,
     "minDetectMs": 1500,
     "maxDetectMs": 8000,
+    "lidWindowMs": 1500,
+    "lidHopMs": 500,
+    "intraSegmentRefineMs": 4000,
+    "intraSegmentMarginThreshold": 0.15,
+    "minDwellMs": 1500,
     "crossTrackPriorStrength": 0.75,
     "priorLookbackMs": 8000,
     "prompts": {

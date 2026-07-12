@@ -633,6 +633,105 @@ func runCodeSwitchSelfTest() -> Bool {
                                                maxMs: 8_000).count == 1)
     }
 
+    // Fine (sliding-window) LID pass: CUSUM change-point scan over synthetic
+    // posterior timelines — the mock the followups doc asked for.
+    do {
+        func win(_ startMs: Int, _ lang: String, strength: Double = 0.95) -> (segment: VADSegment, logprobs: [String: Double]) {
+            let other = lang == "sv" ? "en" : "sv"
+            return (VADSegment(startMs: startMs, endMs: startMs + 1_500),
+                    [lang: Foundation.log(strength), other: Foundation.log(1 - strength)])
+        }
+        // Clean single language → no change points.
+        let mono = (0..<8).map { win($0 * 500, "sv") }
+        check("changePoints: single language → none",
+              LanguageSegmenter.changePoints(windows: mono, minDwellMs: 1_500).isEmpty)
+
+        // Clear sustained switch at 4000 ms → one boundary exactly there.
+        let switched = (0..<8).map { win($0 * 500, "sv") }
+            + (8..<16).map { win($0 * 500, "en") }
+        check("changePoints: sustained switch cuts at the excursion start",
+              LanguageSegmenter.changePoints(windows: switched, minDwellMs: 1_500) == [4_000],
+              "got \(LanguageSegmenter.changePoints(windows: switched, minDwellMs: 1_500))")
+
+        // One-window blip → dwell never reached, no cut.
+        var blip = (0..<10).map { win($0 * 500, "sv") }
+        blip[5] = win(5 * 500, "en")
+        check("changePoints: single-window blip never cuts",
+              LanguageSegmenter.changePoints(windows: blip, minDwellMs: 1_500).isEmpty)
+
+        // Ambiguous stretch (≈ 50/50) → evidence never accumulates, no cut.
+        let mushy = (0..<6).map { win($0 * 500, "sv") }
+            + (6..<12).map { win($0 * 500, "en", strength: 0.52) }
+        check("changePoints: weak evidence never crosses the threshold",
+              LanguageSegmenter.changePoints(windows: mushy, minDwellMs: 1_500).isEmpty)
+
+        // Three languages, two sustained switches → two cuts in order.
+        func win3(_ startMs: Int, _ lang: String) -> (segment: VADSegment, logprobs: [String: Double]) {
+            var lp = ["sv": Foundation.log(0.025), "en": Foundation.log(0.025), "de": Foundation.log(0.025)]
+            lp[lang] = Foundation.log(0.95)
+            return (VADSegment(startMs: startMs, endMs: startMs + 1_500), lp)
+        }
+        let tri = (0..<6).map { win3($0 * 500, "sv") }
+            + (6..<12).map { win3($0 * 500, "en") }
+            + (12..<18).map { win3($0 * 500, "de") }
+        check("changePoints: three languages → two ordered cuts",
+              LanguageSegmenter.changePoints(windows: tri, minDwellMs: 1_500) == [3_000, 6_000],
+              "got \(LanguageSegmenter.changePoints(windows: tri, minDwellMs: 1_500))")
+
+        // aggregate: product of posteriors renormalizes to a valid posterior.
+        let agg = LanguageSegmenter.aggregate([
+            ["sv": Foundation.log(0.8), "en": Foundation.log(0.2)],
+            ["sv": Foundation.log(0.6), "en": Foundation.log(0.4)],
+        ])
+        let aggSum = agg.map { $0.values.reduce(0) { $0 + Foundation.exp($1) } } ?? 0
+        check("aggregate: renormalized posterior sums to 1 with the right top",
+              abs(aggSum - 1) < 1e-9 && agg?.max(by: { $0.value < $1.value })?.key == "sv",
+              "sum=\(aggSum)")
+        check("aggregate: empty input is nil", LanguageSegmenter.aggregate([]) == nil)
+    }
+
+    // Fine-pass integration: detect() on one 10 s segment whose PCM encodes
+    // the language in its sample values (first-sample sniffing stub), under
+    // a low-latency identifier. The coarse label would average the switch
+    // away; the fine pass must split it near 5 s.
+    do {
+        struct PositionStub: LanguageIdentifier {
+            var description: String { "position stub" }
+            var isLowLatency: Bool { true }
+            func identify(pcm: Data, sampleRateHz: Int,
+                          restrict: [String]) throws -> [String: Double] {
+                // First Int16 sample: 100 → sv, 200 → en (the test PCM sets
+                // every sample in a region to the region's marker value).
+                let first = pcm.withUnsafeBytes { $0.load(as: Int16.self) }
+                let lang = first == 100 ? "sv" : "en"
+                var lp: [String: Double] = [:]
+                for l in restrict {
+                    lp[l] = Foundation.log(l == lang ? 0.95 : 0.05 / Double(max(1, restrict.count - 1)))
+                }
+                return lp
+            }
+        }
+        var cfg = Config()
+        cfg.codeSwitch.languages = ["sv", "en"]
+        let installed = InstalledModels(perLanguage: ["sv": "/x", "en": "/y"])
+        let seg = LanguageSegmenter(config: cfg, installed: installed,
+                                    identifier: PositionStub())
+        let bytesPerMs = 32
+        var pcm = Data(capacity: 10_000 * bytesPerMs)
+        for ms in 0..<10_000 {
+            let v: Int16 = ms < 5_000 ? 100 : 200
+            for _ in 0..<16 { withUnsafeBytes(of: v.littleEndian) { pcm.append(contentsOf: $0) } }
+        }
+        let dets = try! seg.detect([VADSegment(startMs: 0, endMs: 10_000)], pcm: pcm)
+        let langs = dets.map(\.top)
+        let hasCutNear5s = dets.contains { $0.segment.startMs >= 4_500 && $0.segment.startMs <= 5_500 }
+        check("fine pass: intra-chunk switch splits near the true boundary",
+              langs.contains("sv") && langs.contains("en") && hasCutNear5s && dets.count >= 2,
+              "got \(dets.map { "\($0.top)@\($0.segment.startMs)-\($0.segment.endMs)" })")
+        check("fine pass: sv precedes en in timeline order",
+              langs.firstIndex(of: "sv")! < langs.firstIndex(of: "en")!)
+    }
+
     // AudioStitcher: stitch + offset-table round trip — the timestamp-fidelity
     // path every decoded code-switch segment travels back through. Synthetic
     // zero PCM (the table only cares about geometry); temp-dir WAV, no models.

@@ -461,6 +461,26 @@ struct CodeSwitchConfig: Codable {
     /// decide the decode boundaries. Clamped at use to ≥ 2×minDetectMs.
     var maxDetectMs: Int = 8000
 
+    // Fine (sliding-window) LID pass — only runs under a low-latency
+    // identifier (the ONNX VoxLingua107 LID); whisper-based LIDs at ~1.2 s
+    // per window would multiply detect time by the window count.
+
+    /// Sliding-window width for the fine LID pass inside long/ambiguous
+    /// detect chunks.
+    var lidWindowMs: Int = 1500
+    /// Hop between consecutive fine-pass windows.
+    var lidHopMs: Int = 500
+    /// A detect chunk longer than this gets the fine pass (a switch could
+    /// hide inside it).
+    var intraSegmentRefineMs: Int = 4000
+    /// A coarse detection whose top1−top2 log-prob margin is at or under
+    /// this is ambiguous enough to warrant the fine pass regardless of
+    /// length.
+    var intraSegmentMarginThreshold: Double = 0.15
+    /// A fine-pass language change must sustain itself this long to become a
+    /// change point — half-second blips never break a sentence.
+    var minDwellMs: Int = 1500
+
     /// 0.5 disables cross-track refinement (Pass 2 becomes a no-op); 1.0 makes
     /// the other track's recent language absolute. 0.75 flips ambiguous
     /// segments without overruling a confident local detection.
@@ -520,6 +540,8 @@ struct CodeSwitchConfig: Codable {
         case smoothingWindowMe, smoothingWindowParticipants, minSwitchSegments
         case minSwitchMs, maxFillGapMs, runPaddingMs, silencePadMs, minDetectMs
         case maxDetectMs
+        case lidWindowMs, lidHopMs, intraSegmentRefineMs
+        case intraSegmentMarginThreshold, minDwellMs
         case crossTrackPriorStrength, priorLookbackMs, prompts
         case snapSearchMs, snapMinMs, snapEnergyDb
         case verifyMarginDb
@@ -554,6 +576,11 @@ struct CodeSwitchConfig: Codable {
         silencePadMs = g(.silencePadMs, d.silencePadMs)
         minDetectMs = g(.minDetectMs, d.minDetectMs)
         maxDetectMs = g(.maxDetectMs, d.maxDetectMs)
+        lidWindowMs = g(.lidWindowMs, d.lidWindowMs)
+        lidHopMs = g(.lidHopMs, d.lidHopMs)
+        intraSegmentRefineMs = g(.intraSegmentRefineMs, d.intraSegmentRefineMs)
+        intraSegmentMarginThreshold = g(.intraSegmentMarginThreshold, d.intraSegmentMarginThreshold)
+        minDwellMs = g(.minDwellMs, d.minDwellMs)
         crossTrackPriorStrength = g(.crossTrackPriorStrength, d.crossTrackPriorStrength)
         priorLookbackMs = g(.priorLookbackMs, d.priorLookbackMs)
         snapSearchMs = g(.snapSearchMs, d.snapSearchMs)

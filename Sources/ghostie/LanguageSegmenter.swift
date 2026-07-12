@@ -215,12 +215,143 @@ struct LanguageSegmenter {
                 } catch {
                     dets.append(unknownDetection(chunk)); continue
                 }
-                dets.append(Self.detection(from: posterior,
-                                           whitelist: whitelist,
-                                           segment: chunk))
+                let coarse = Self.detection(from: posterior,
+                                            whitelist: whitelist,
+                                            segment: chunk)
+                // Fine pass: a switch can hide inside a long chunk (the
+                // coarse label averages it away), and an ambiguous coarse
+                // margin means the chunk may straddle one. Only under a
+                // low-latency identifier — see `isLowLatency`.
+                let ambiguous = coarse.top != LanguageDetection.unknown
+                    && coarse.margin <= cs.intraSegmentMarginThreshold
+                if identifier.isLowLatency,
+                   chunk.durationMs > cs.intraSegmentRefineMs || ambiguous,
+                   let refined = fineDetections(chunk: chunk, pcm: pcm,
+                                                whitelist: whitelist,
+                                                bytesPerMs: bytesPerMs),
+                   refined.count > 1 {
+                    dets.append(contentsOf: refined)
+                } else {
+                    dets.append(coarse)
+                }
             }
         }
         return dets
+    }
+
+    // MARK: Fine (sliding-window) LID pass
+
+    /// Re-LID `chunk` with overlapping `lidWindowMs × lidHopMs` windows,
+    /// find sustained language change points on the posterior timeline
+    /// (`changePoints`), and return one aggregated detection per sub-span.
+    /// nil / single-element results mean "no sustained switch inside" — the
+    /// caller keeps the coarse detection. Window-level identifier errors
+    /// just drop that window; boundaries come only from evidence we have.
+    private func fineDetections(chunk: VADSegment, pcm: Data,
+                                whitelist: [String],
+                                bytesPerMs: Int) -> [LanguageDetection]? {
+        let windowMs = max(200, cs.lidWindowMs)
+        let hopMs = max(100, min(cs.lidHopMs, windowMs))
+        guard chunk.durationMs >= windowMs else { return nil }
+        var windows: [(segment: VADSegment, logprobs: [String: Double])] = []
+        var start = chunk.startMs
+        while start + windowMs <= chunk.endMs {
+            let w = VADSegment(startMs: start, endMs: start + windowMs)
+            let lo = min(pcm.count, w.startMs * bytesPerMs)
+            let hi = min(pcm.count, w.endMs * bytesPerMs)
+            if hi > lo,
+               let p = try? identifier.identify(pcm: pcm.subdata(in: lo..<hi),
+                                                sampleRateHz: 16_000,
+                                                restrict: whitelist) {
+                windows.append((w, p))
+            }
+            start += hopMs
+        }
+        guard windows.count >= 2 else { return nil }
+        let cuts = Self.changePoints(windows: windows, minDwellMs: cs.minDwellMs)
+        guard !cuts.isEmpty else { return nil }
+
+        // Split the chunk at the cut timestamps and aggregate each sub-span's
+        // window posteriors (sum of log-probs = product of posteriors,
+        // renormalized) into one detection.
+        var bounds = [chunk.startMs] + cuts + [chunk.endMs]
+        bounds = Array(Set(bounds)).sorted()
+        var out: [LanguageDetection] = []
+        for (lo, hi) in zip(bounds, bounds.dropFirst()) {
+            let span = VADSegment(startMs: lo, endMs: hi)
+            let inside = windows.filter {
+                let center = ($0.segment.startMs + $0.segment.endMs) / 2
+                return center >= lo && center < hi
+            }.map(\.logprobs)
+            guard let agg = Self.aggregate(inside) else {
+                out.append(unknownDetection(span)); continue
+            }
+            out.append(Self.detection(from: agg, whitelist: whitelist, segment: span))
+        }
+        return out
+    }
+
+    /// CUSUM-style change-point scan over a fine-pass posterior timeline.
+    /// Walks the windows tracking the current language (argmax of the first
+    /// window); a candidate switch accumulates the per-window log-likelihood
+    /// ratio `logP(candidate) − logP(current)`, and becomes a change point —
+    /// placed at the START of the first window of the excursion — only when
+    /// the accumulated evidence crosses `evidenceThreshold` AND the excursion
+    /// has lasted `minDwellMs`. A single-window blip therefore never breaks
+    /// a sentence, and a genuinely ambiguous stretch (ratios ≈ 0) never
+    /// crosses the threshold. Static + pure for the selftest.
+    static func changePoints(windows: [(segment: VADSegment, logprobs: [String: Double])],
+                             minDwellMs: Int,
+                             evidenceThreshold: Double = 2.0) -> [Int] {
+        func top(_ lp: [String: Double]) -> String? {
+            lp.max(by: { $0.value < $1.value })?.key
+        }
+        guard windows.count >= 2, var current = top(windows[0].logprobs) else { return [] }
+        var out: [Int] = []
+        var candidate: String?
+        var excursionStart = 0
+        var excursionCount = 0
+        var evidence = 0.0
+        for (i, w) in windows.enumerated() {
+            guard let t = top(w.logprobs),
+                  let curLp = w.logprobs[current],
+                  let topLp = w.logprobs[t] else { continue }
+            if t == current {
+                candidate = nil; evidence = 0; excursionCount = 0
+                continue
+            }
+            if candidate != t {
+                candidate = t; evidence = 0; excursionStart = i; excursionCount = 0
+            }
+            evidence += topLp - curLp
+            excursionCount += 1
+            // Dwell needs corroboration: overlapping windows mean ONE window
+            // spans a full `windowMs` by itself, so a single-window blip
+            // would otherwise satisfy any minDwellMs ≤ the window width.
+            let dwell = w.segment.endMs - windows[excursionStart].segment.startMs
+            if evidence >= evidenceThreshold, dwell >= minDwellMs, excursionCount >= 2 {
+                out.append(windows[excursionStart].segment.startMs)
+                current = t
+                candidate = nil; evidence = 0; excursionCount = 0
+            }
+        }
+        return out
+    }
+
+    /// Product of posteriors in log space, renormalized (log-sum-exp). nil
+    /// for an empty input or a degenerate (all -inf) result. Static + pure
+    /// for the selftest.
+    static func aggregate(_ posteriors: [[String: Double]]) -> [String: Double]? {
+        guard !posteriors.isEmpty else { return nil }
+        var sum: [String: Double] = [:]
+        for p in posteriors {
+            for (k, v) in p { sum[k, default: 0] += v }
+        }
+        guard let maxLp = sum.values.max(), maxLp > -.infinity else { return nil }
+        let z = sum.values.reduce(0) { $0 + Foundation.exp($1 - maxLp) }
+        guard z > 0 else { return nil }
+        let logZ = maxLp + Foundation.log(z)
+        return sum.mapValues { $0 - logZ }
     }
 
     /// Split one VAD segment into `ceil(duration / maxMs)` equal, contiguous
