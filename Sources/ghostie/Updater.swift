@@ -360,13 +360,10 @@ final class Updater: NSObject, URLSessionDownloadDelegate {
                      didWriteData _: Int64, totalBytesWritten w: Int64,
                      totalBytesExpectedToWrite e: Int64) {
         guard let tag = release?.tag else { return }
-        func mb(_ b: Int64) -> String {
-            b >= 1_000_000 ? "\(b / 1_000_000) MB" : "\(max(0, b) / 1000) KB"
-        }
         if e > 0 {
-            post("Downloading \(tag)… \(Int(Double(w) / Double(e) * 100))%  (\(mb(w))/\(mb(e)))")
+            post("Downloading \(tag)… \(Int(Double(w) / Double(e) * 100))%  (\(mbString(w))/\(mbString(e)))")
         } else {
-            post("Downloading \(tag)… \(mb(w))")
+            post("Downloading \(tag)… \(mbString(w))")
         }
     }
 
@@ -532,15 +529,6 @@ final class Updater: NSObject, URLSessionDownloadDelegate {
 
     @discardableResult
     static func run(_ path: String, _ args: [String]) -> (status: Int32, output: String) {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: path)
-        p.arguments = args
-        let pipe = Pipe()
-        p.standardOutput = pipe
-        p.standardError = pipe
-        do { try p.run() } catch { return (-1, "") }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        p.waitUntilExit()
-        return (p.terminationStatus, String(data: data, encoding: .utf8) ?? "")
+        runProcess(path, args)
     }
 }

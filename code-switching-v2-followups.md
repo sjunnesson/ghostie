@@ -114,13 +114,11 @@ Adjacent: surface the per-language prompt fields (today only `prompts["sv"]`
 / `prompts["en"]` are in the default map; the UI can't yet edit a `prompts`
 entry for a third language).
 
-### 6. Doctor — flag KB-Whisper-only English
+### 6. Doctor — flag KB-Whisper-only English ✅ done
 
-When the only English-capable model installed is KB-Whisper, the
-Swedish-biased LID head will mislabel English audio. Doctor should
-explicitly warn: "no English-capable model installed; English audio will be
-decoded by KB-Whisper (Swedish-biased)." Cheap to add; meaningful for
-users who only run `--codeswitch --no-en` or similar.
+`cmdDoctor` now emits a failing row ("English-capable model — none
+installed…") whenever a Swedish model is on disk with no model registered
+for `en`.
 
 ### 7. Backlog re-runs across the v2 pipeline
 
@@ -157,7 +155,5 @@ revisiting if cold-start ever becomes the bottleneck.
 - The `LegacyPromptKeys` enum in `Config.swift` can come out after enough
   releases that no live config still has `promptSv`/`promptEn` on disk.
   Cite the release tag of v2-ship before deleting.
-- `Config.requiredModelPaths` is still around as a backward-compat shim.
-  Once Settings + doctor + `cmdFetchModels` all read from
-  `effectiveModelPath(for:installed:)` (most already do), it can be
-  removed.
+- ~~`Config.requiredModelPaths`~~ — already removed; every caller reads
+  `effectiveModelPath(for:installed:)`.

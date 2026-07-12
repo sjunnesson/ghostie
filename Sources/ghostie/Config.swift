@@ -23,7 +23,7 @@ struct Config: Codable {
     ///
     /// Deprecated: superseded by `triggerBundleIds`. Left readable for one
     /// release so existing user configs do not need editing. A non-default
-    /// value triggers a warning log at load time.
+    /// value triggers a warning log when the detector starts.
     var triggerBundlePrefixes: [String] = ["com.microsoft.teams"]
 
     /// Exact bundle IDs of the Teams **main** apps. The detector queries AX
@@ -34,13 +34,6 @@ struct Config: Codable {
     /// (classic Teams does not silently swallow new Teams helpers, or vice
     /// versa).
     var triggerBundleIds: [String] = ["com.microsoft.teams", "com.microsoft.teams2"]
-
-    /// Require a trigger app (Teams) to be running for a call to be detected.
-    /// If false, ANY microphone session is treated as a call.
-    var requireTriggerApp: Bool = true
-
-    /// How often to poll for call start/stop, in seconds.
-    var pollIntervalSeconds: Double = 2.0
 
     /// Teams must continuously not be holding the mic for this long before a
     /// call is considered finished (rides over mute toggles, AirPods reconnects,
@@ -162,7 +155,7 @@ struct Config: Codable {
     enum CodingKeys: String, CodingKey {
         case notesFolder, keepAudio, saveTranscript, triggerBundlePrefixes
         case triggerBundleIds
-        case requireTriggerApp, pollIntervalSeconds, endGraceSeconds, minCallSeconds
+        case endGraceSeconds, minCallSeconds
         case whisperBinary, whisperServerBinary, whisperModel, language
         case initialPrompt, vadModel
         case cleanTranscript, transcriptionQuality, codeSwitch
@@ -184,8 +177,6 @@ struct Config: Codable {
         saveTranscript = g(.saveTranscript, d.saveTranscript)
         triggerBundlePrefixes = g(.triggerBundlePrefixes, d.triggerBundlePrefixes)
         triggerBundleIds = g(.triggerBundleIds, d.triggerBundleIds)
-        requireTriggerApp = g(.requireTriggerApp, d.requireTriggerApp)
-        pollIntervalSeconds = g(.pollIntervalSeconds, d.pollIntervalSeconds)
         endGraceSeconds = g(.endGraceSeconds, d.endGraceSeconds)
         minCallSeconds = g(.minCallSeconds, d.minCallSeconds)
         whisperBinary = g(.whisperBinary, d.whisperBinary)
@@ -341,16 +332,8 @@ struct Config: Codable {
             return c
         }
         // Fall back to a login-shell PATH lookup.
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/bin/zsh")
-        p.arguments = ["-lc", "command -v claude"]
-        let pipe = Pipe()
-        p.standardOutput = pipe
-        p.standardError = FileHandle.nullDevice
-        try? p.run()
-        p.waitUntilExit()
-        let path = String(data: pipe.fileHandleForReading.readDataToEndOfFile(),
-                          encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let path = runProcess("/bin/zsh", ["-lc", "command -v claude"], stderrToNull: true)
+            .output.trimmingCharacters(in: .whitespacesAndNewlines)
         return FileManager.default.isExecutableFile(atPath: path) ? path : ""
     }
 

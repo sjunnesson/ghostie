@@ -311,14 +311,11 @@ final class ModelDownloader: NSObject, URLSessionDataDelegate {
 
     private func emitProgress() {
         guard let a = current else { return }
-        func mb(_ b: Int64) -> String {
-            b >= 1_000_000 ? "\(b / 1_000_000) MB" : "\(max(0, b) / 1000) KB"
-        }
         if a.expectedSize > 0 {
             let pct = Int(Double(a.bytesWritten) / Double(a.expectedSize) * 100)
-            post("Downloading \(a.label)… \(pct)%  (\(mb(a.bytesWritten))/\(mb(a.expectedSize)))")
+            post("Downloading \(a.label)… \(pct)%  (\(mbString(a.bytesWritten))/\(mbString(a.expectedSize)))")
         } else {
-            post("Downloading \(a.label)… \(mb(a.bytesWritten))")
+            post("Downloading \(a.label)… \(mbString(a.bytesWritten))")
         }
     }
 }

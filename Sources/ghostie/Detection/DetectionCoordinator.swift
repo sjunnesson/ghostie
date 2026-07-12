@@ -7,13 +7,12 @@ import AppKit
 /// machine. The `start` / `stop` semantics match the legacy `CallDetector` so
 /// `Engine.swift` does not change.
 ///
-/// For task 2, only `AudioActivityProvider` is wired with a real
-/// implementation. `MeetingWindowProvider` (AX), `CameraActivityProvider`,
-/// `DefaultInputDeviceProvider` (with swap quiescence), and
-/// `AppPresenceProvider` (push-based) come in tasks 4-7. The state machine
-/// already tolerates absent corroborators (AX `.unavailable` plus empty
-/// camera) by promoting on input + output alone, which is the dominant real-
-/// world case.
+/// All five providers are live: `CoreAudioActivityProvider` (per-PID
+/// input/output I/O), `AXMeetingWindowProvider`, `CoreMediaIOCameraActivityProvider`,
+/// `CoreAudioDefaultDeviceProvider` (swap quiescence), and
+/// `WorkspaceAppPresenceProvider`. The state machine tolerates absent
+/// corroborators (AX `.unavailable` plus empty camera) by promoting on
+/// input + output alone, which is the dominant real-world case.
 final class DetectionCoordinator {
 
     private let config: Config
@@ -137,7 +136,7 @@ final class DetectionCoordinator {
             t.resume()
             self.backstop = t
             self.evaluate()
-            Log.info("Call detector started (PID-attributed input + output + AX corroborator; camera + device-swap providers pending).")
+            Log.info("Call detector started (PID-attributed input + output; AX, camera and device-swap corroborators live).")
         }
     }
 

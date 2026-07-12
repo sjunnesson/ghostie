@@ -293,6 +293,12 @@ func cmdDoctor(_ config: Config) {
         installed.languages.isEmpty
             ? "none — single-language path only"
             : installed.languages.joined(separator: ", "))
+    // KB-Whisper's language head is Swedish-biased; with no English-capable
+    // model on disk, English audio gets decoded (and language-detected) by it.
+    if installed.modelPath(for: "en") == nil, installed.languages.contains("sv") {
+        row(false, "English-capable model",
+            "none installed — English audio will be decoded by KB-Whisper (Swedish-biased); fetch large-v3 or base.en")
+    }
     if willCodeSwitch {
         row(true, "code-switching", "on — \(effective.joined(separator: "+")), dominant \(cs.dominantLanguage), KB variant \(cs.kbWhisperVariant)")
         let lid = LanguageSegmenter.defaultIdentifier(config: config, installed: installed)
@@ -410,13 +416,7 @@ func cmdUninstallService() {
 
 @discardableResult
 func shell(_ path: String, _ args: [String]) -> String {
-    let p = Process()
-    p.executableURL = URL(fileURLWithPath: path)
-    p.arguments = args
-    let pipe = Pipe()
-    p.standardOutput = pipe; p.standardError = pipe
-    try? p.run(); p.waitUntilExit()
-    return String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+    runProcess(path, args).output
 }
 
 func launchMenuBar(_ config: Config) {
