@@ -212,11 +212,22 @@ struct WhisperLID: LanguageIdentifier {
     /// Spread a top-1 + confidence across `restrict` as a log-prob map: mass
     /// `confidence` on `top` (clamped to (0.001, 0.999)), the residual
     /// uniformly across the rest. Off-whitelist `top` returns uniform.
-    /// Thin wrapper over `LogProb.skewed` — the single definition of the shape.
+    ///
+    /// `confidence` is whisper's mass over its full ~100-language softmax.
+    /// Re-spread verbatim over a small whitelist, a weak top-1 (p < 1/N)
+    /// would put more mass on every *other* whitelist language than on the
+    /// model's own best guess — inverting the evidence, so `detect` labels
+    /// the segment with a language the LID did NOT pick. Conditional on the
+    /// whitelist the top's true share is ≥ 1/N by construction, so clamp the
+    /// mass to a strict edge above uniform: weak detections stay weak (the
+    /// smoother's prior can still overrule them) but never flip sign.
     static func spread(top: String,
                        confidence: Double,
                        restrict: [String]) -> [String: Double] {
-        LogProb.skewed(toward: top, mass: confidence, over: restrict)
+        let uniform = 1.0 / Double(max(1, restrict.count))
+        return LogProb.skewed(toward: top,
+                              mass: max(confidence, uniform + 0.05),
+                              over: restrict)
     }
 }
 
@@ -228,8 +239,15 @@ struct WhisperLID: LanguageIdentifier {
 /// and every spawn reloads the ~1.1 GB driver model from scratch
 /// (~4.8 s/segment measured). This identifier starts `whisper-server` ONCE
 /// per call (model loads at startup, ~1 s) and answers each segment with a
-/// multipart POST to `/inference` (~1.2 s warm, bit-identical probabilities
-/// to the CLI head — verified on whisper.cpp 1.8.4).
+/// multipart POST to `/inference` (~1.2 s warm, bit-identical head
+/// probabilities to the CLI — verified on whisper.cpp 1.8.4).
+///
+/// Unlike the CLI head (which prints only a top-1 + confidence), the server
+/// returns the full `language_probabilities` map, and this identifier uses
+/// it: look-alike mass is folded through `remap` BEFORE the argmax, and the
+/// whitelist languages' real competing masses are renormalized into the
+/// posterior (see `restrictedPosterior`) instead of being replaced by
+/// `WhisperLID.spread`'s fabricated uniform residual.
 ///
 /// Lifecycle is strictly owned by Ghostie: the server has no idle-exit or
 /// parent-death option, so whoever builds this identifier must call
@@ -244,9 +262,12 @@ struct WhisperLID: LanguageIdentifier {
 final class ServerWhisperLID: LanguageIdentifier {
     let serverBinary: String
     let model: String
-    /// Same policy injection as `WhisperLID.remapTop`: folds Nordic
-    /// look-alikes into `sv` before whitelist enforcement. Identity by default.
-    let remapTop: (String) -> String
+    /// Same policy injection as `WhisperLID.remapTop`, but applied to EVERY
+    /// language in the server's probability map (not just the top-1): each
+    /// key is remapped and colliding masses are summed, so Nordic look-alike
+    /// mass (`no`/`nb`/`nn`/`da`) folds INTO `sv` before the argmax instead
+    /// of merely relabeling the winner. Identity by default.
+    let remap: (String) -> String
 
     private let lock = NSLock()
     private var process: Process?
@@ -259,10 +280,10 @@ final class ServerWhisperLID: LanguageIdentifier {
 
     init(serverBinary: String,
          model: String,
-         remapTop: @escaping (String) -> String = { $0 }) {
+         remap: @escaping (String) -> String = { $0 }) {
         self.serverBinary = serverBinary
         self.model = model
-        self.remapTop = remapTop
+        self.remap = remap
     }
 
     deinit { shutdown() }
@@ -335,46 +356,70 @@ final class ServerWhisperLID: LanguageIdentifier {
             throw LIDError.badStatus(http.statusCode,
                                      String(data: data, encoding: .utf8) ?? "")
         }
-        guard let (code, prob) = Self.parseDetection(data) else {
+        guard let raw = Self.parseProbabilities(data),
+              let (top, logprobs) = Self.restrictedPosterior(raw, remap: remap,
+                                                             restrict: restrict) else {
             throw LIDError.unparseable(String(data: data, encoding: .utf8) ?? "<binary>")
         }
-        let mapped = remapTop(code.lowercased())
-        guard restrict.contains(mapped) else {
-            throw LIDError.offWhitelist(mapped)
+        guard restrict.contains(top) else {
+            throw LIDError.offWhitelist(top)
         }
-        // EXACT output parity with WhisperLID: collapse to top-1 + confidence
-        // and spread the residual uniformly, so the Smoother sees the same
-        // distribution family no matter which whisper LID answered. A richer
-        // option — renormalizing the full `language_probabilities` map over
-        // `restrict` — is a future refinement once the smoother is calibrated
-        // against real multi-mass posteriors.
-        return WhisperLID.spread(top: mapped, confidence: prob, restrict: restrict)
+        return logprobs
     }
 
-    /// Parse whisper-server's `verbose_json` LID response into (code, prob).
+    /// Parse whisper-server's `verbose_json` LID response into the full
+    /// per-language probability map (lowercased ISO code → prob).
     ///
     /// Gotcha (verified on whisper.cpp 1.8.4): `detected_language` is the
     /// FULL ENGLISH NAME ("english", "swedish"), never an ISO code — do not
-    /// parse it as a label. The code comes from the argmax of
-    /// `language_probabilities` (an ISO-code → prob map, thresholded so it
-    /// sums to < 1) and the confidence from `detected_language_probability`
-    /// (falling back to the argmax's own value if absent).
+    /// parse it as a label. Everything needed lives in
+    /// `language_probabilities` (thresholded, so it sums to < 1); the
+    /// separate `detected_language_probability` field is redundant with the
+    /// map's argmax and deliberately ignored.
     ///
     /// Static + pure so `runCodeSwitchSelfTest` exercises it with canned JSON,
     /// no process or network.
-    static func parseDetection(_ data: Data) -> (code: String, prob: Double)? {
+    static func parseProbabilities(_ data: Data) -> [String: Double]? {
         guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let rawProbs = root["language_probabilities"] as? [String: Any] else {
             return nil
         }
-        var top: (code: String, p: Double)?
+        var out: [String: Double] = [:]
         for (code, v) in rawProbs {
             guard let p = (v as? NSNumber)?.doubleValue else { continue }
-            if top == nil || p > top!.p { top = (code, p) }
+            out[code.lowercased(), default: 0] += p
         }
-        guard let top else { return nil }
-        let prob = (root["detected_language_probability"] as? NSNumber)?.doubleValue ?? top.p
-        return (top.code.lowercased(), prob)
+        return out.isEmpty ? nil : out
+    }
+
+    /// Fold `raw` through `remap` (summing colliding masses), take the global
+    /// argmax, and renormalize the whitelist languages' mass into a proper
+    /// log-prob posterior over `restrict` — the full-distribution upgrade
+    /// over `WhisperLID.spread`'s top-1 + uniform-residual shape. The smoother
+    /// gets the head's real competing evidence (sv 0.62 vs en 0.38), which is
+    /// what lets a cross-track prior flip a genuinely ambiguous segment
+    /// without overruling a confident one. Folding before the argmax also
+    /// catches what a top-1 remap never could: `en 0.40 / no 0.32 / da 0.10`
+    /// on short Swedish audio has top-1 "en", but the folded sv mass wins.
+    ///
+    /// `top` may be off-whitelist (e.g. German audio on an sv/en install);
+    /// the caller throws `offWhitelist` so the segment falls to the
+    /// segmenter's `unknown` floor rather than being force-labeled from
+    /// near-zero whitelist mass. Whitelist languages absent from the
+    /// (thresholded) map get a `1e-3` floor so the posterior always carries
+    /// every whitelist key — `Smoother.likelihood` requires the full set —
+    /// while still reading as "~1000× less likely".
+    static func restrictedPosterior(_ raw: [String: Double],
+                                    remap: (String) -> String,
+                                    restrict: [String])
+        -> (top: String, logprobs: [String: Double])? {
+        var folded: [String: Double] = [:]
+        for (code, p) in raw { folded[remap(code.lowercased()), default: 0] += p }
+        guard let top = folded.max(by: { $0.value < $1.value })?.key else { return nil }
+        var mass: [String: Double] = [:]
+        for l in restrict { mass[l] = max(folded[l] ?? 0, 1e-3) }
+        let sum = mass.values.reduce(0, +)
+        return (top, mass.mapValues { Foundation.log($0 / sum) })
     }
 
     /// `/inference` multipart payload: the WAV plus `detect_language=true`

@@ -70,7 +70,7 @@ struct LanguageSegmenter {
            FileManager.default.isExecutableFile(atPath: config.whisperServerBinary),
            !driver.isEmpty, FileManager.default.fileExists(atPath: driver) {
             return ServerWhisperLID(serverBinary: config.whisperServerBinary,
-                                    model: driver, remapTop: nordicRemap)
+                                    model: driver, remap: nordicRemap)
         }
         return WhisperLID(binary: config.whisperBinary, model: driver, remapTop: nordicRemap)
     }
@@ -159,6 +159,15 @@ struct LanguageSegmenter {
     /// shorter than `minDetectMs` are `unknown` *without* invoking the LID —
     /// this is why backchannels ("mm", "ja", "yeah") never fake a switch.
     ///
+    /// Segments longer than `maxDetectMs` are split into equal contiguous
+    /// chunks and each chunk is labeled independently (see `splitForDetect`).
+    /// One VAD segment can therefore yield several `LanguageDetection`s —
+    /// that's the point: a language switch *inside* one long segment used to
+    /// be averaged into a single label (from the first 30 s only, the LID
+    /// slice cap), i.e. invisible. The smoother's hysteresis + snap-to-silence
+    /// still own the final boundary placement, so finer detection granularity
+    /// can't by itself introduce mid-word cuts.
+    ///
     /// The LID model itself is held behind `self.identifier`; this method
     /// owns the per-segment slicing, the minDetectMs floor, and the
     /// pcm/segment plumbing only. Any LID error on one segment falls back to
@@ -173,35 +182,59 @@ struct LanguageSegmenter {
             return segs.map(unknownDetection)
         }
         let bytesPerMs = 16_000 * 2 / 1000   // 16 kHz mono Int16
+        // Floor the chunk size at 2×minDetectMs so a split can never produce
+        // chunks below the detect floor (equal split of anything > maxMs
+        // yields chunks > maxMs/2).
+        let maxDetect = max(cs.maxDetectMs, 2 * cs.minDetectMs)
 
         var dets: [LanguageDetection] = []
         for s in segs {
             if s.durationMs < cs.minDetectMs || pcm.isEmpty {
                 dets.append(unknownDetection(s)); continue
             }
-            let lo = min(pcm.count, s.startMs * bytesPerMs)
-            let hi = min(pcm.count, lo + min(s.durationMs, 30_000) * bytesPerMs)
-            guard hi > lo else { dets.append(unknownDetection(s)); continue }
-            let slice = pcm.subdata(in: lo..<hi)
-            let posterior: [String: Double]
-            do {
-                posterior = try identifier.identify(pcm: slice,
-                                                    sampleRateHz: 16_000,
-                                                    restrict: whitelist)
-            } catch let e as ClassifiableLIDError where e.isStructural {
-                // The identifier itself can't run (missing binary/model) — fail
-                // the call so Pipeline backlogs it for a clean retry, rather
-                // than silently labeling every segment unknown and mis-routing
-                // the whole track to the dominant language.
-                throw SegmenterError.whisperUnavailable
-            } catch {
-                dets.append(unknownDetection(s)); continue
+            for chunk in Self.splitForDetect(s, maxMs: maxDetect) {
+                let lo = min(pcm.count, chunk.startMs * bytesPerMs)
+                let hi = min(pcm.count, lo + min(chunk.durationMs, 30_000) * bytesPerMs)
+                guard hi > lo else { dets.append(unknownDetection(chunk)); continue }
+                let slice = pcm.subdata(in: lo..<hi)
+                let posterior: [String: Double]
+                do {
+                    posterior = try identifier.identify(pcm: slice,
+                                                        sampleRateHz: 16_000,
+                                                        restrict: whitelist)
+                } catch let e as ClassifiableLIDError where e.isStructural {
+                    // The identifier itself can't run (missing binary/model) —
+                    // fail the call so Pipeline backlogs it for a clean retry,
+                    // rather than silently labeling every segment unknown and
+                    // mis-routing the whole track to the dominant language.
+                    throw SegmenterError.whisperUnavailable
+                } catch {
+                    dets.append(unknownDetection(chunk)); continue
+                }
+                dets.append(Self.detection(from: posterior,
+                                           whitelist: whitelist,
+                                           segment: chunk))
             }
-            dets.append(Self.detection(from: posterior,
-                                       whitelist: whitelist,
-                                       segment: s))
         }
         return dets
+    }
+
+    /// Split one VAD segment into `ceil(duration / maxMs)` equal, contiguous
+    /// chunks that exactly cover it. Segments at or under `maxMs` come back
+    /// untouched. Equal division (not fixed-size + remainder) keeps every
+    /// chunk > maxMs/2, so with `maxMs ≥ 2×minDetectMs` no chunk can fall
+    /// under the detect floor. Static + pure for `runCodeSwitchSelfTest`.
+    static func splitForDetect(_ s: VADSegment, maxMs: Int) -> [VADSegment] {
+        guard maxMs > 0, s.durationMs > maxMs else { return [s] }
+        let n = (s.durationMs + maxMs - 1) / maxMs
+        var out: [VADSegment] = []
+        var start = s.startMs
+        for i in 1...n {
+            let end = i == n ? s.endMs : s.startMs + s.durationMs * i / n
+            out.append(VADSegment(startMs: start, endMs: end))
+            start = end
+        }
+        return out
     }
 
     /// Convert an identifier's log-prob posterior into a `LanguageDetection`.

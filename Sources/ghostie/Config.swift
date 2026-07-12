@@ -463,6 +463,14 @@ struct CodeSwitchConfig: Codable {
     var silencePadMs: Int = 500
     var minDetectMs: Int = 1500
 
+    /// A VAD segment longer than this is split into equal chunks (each ≤ this,
+    /// each > half of it) that are language-detected independently. Without
+    /// the split, a switch *inside* one long segment is averaged into a single
+    /// label — and the LID only ever saw the first 30 s anyway (its slice
+    /// cap). Detection granularity only; the smoother + snap-to-silence still
+    /// decide the decode boundaries. Clamped at use to ≥ 2×minDetectMs.
+    var maxDetectMs: Int = 8000
+
     /// 0.5 disables cross-track refinement (Pass 2 becomes a no-op); 1.0 makes
     /// the other track's recent language absolute. 0.75 flips ambiguous
     /// segments without overruling a confident local detection.
@@ -521,6 +529,7 @@ struct CodeSwitchConfig: Codable {
         case languages, dominantLanguage, modelPerLanguage, kbWhisperVariant
         case smoothingWindowMe, smoothingWindowParticipants, minSwitchSegments
         case minSwitchMs, maxFillGapMs, runPaddingMs, silencePadMs, minDetectMs
+        case maxDetectMs
         case crossTrackPriorStrength, priorLookbackMs, prompts
         case snapSearchMs, snapMinMs, snapEnergyDb
         case verifyMarginDb
@@ -554,6 +563,7 @@ struct CodeSwitchConfig: Codable {
         runPaddingMs = g(.runPaddingMs, d.runPaddingMs)
         silencePadMs = g(.silencePadMs, d.silencePadMs)
         minDetectMs = g(.minDetectMs, d.minDetectMs)
+        maxDetectMs = g(.maxDetectMs, d.maxDetectMs)
         crossTrackPriorStrength = g(.crossTrackPriorStrength, d.crossTrackPriorStrength)
         priorLookbackMs = g(.priorLookbackMs, d.priorLookbackMs)
         snapSearchMs = g(.snapSearchMs, d.snapSearchMs)

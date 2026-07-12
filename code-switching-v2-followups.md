@@ -41,11 +41,18 @@ reports the active identifier (`description` getter).
 
 ### 2. Hierarchical sliding-window LID
 
-Once ONNX LID is reliable on short audio, refine the segmenter to slide
-inside long or low-margin VAD segments rather than one LID call per
-segment:
+**Partially landed (accuracy pass, 2026-07):** long VAD segments are now
+split into equal ≤ `cs.maxDetectMs` (default 8 s) chunks that are detected
+independently (`LanguageSegmenter.splitForDetect`), so a switch inside one
+long segment is no longer averaged into a single label and the LID's 30 s
+slice cap no longer silently hides the tail. The same pass also made
+`ServerWhisperLID` return the full renormalized `language_probabilities`
+posterior (Nordic look-alike mass folded *before* the argmax —
+`restrictedPosterior`), and fixed `WhisperLID.spread` so a weak top-1 can
+never invert into evidence against itself. What remains here is the finer
+*overlapping* sliding window + change-point detection:
 
-- Coarse pass: one `identifier.identify` per VAD segment (today's path).
+- Coarse pass: one `identifier.identify` per ≤ maxDetectMs chunk (today's path).
 - Fine pass: re-LID with `cs.lidWindowMs` × `cs.lidHopMs` (default 1500 ×
   500) inside segments where either `segment.durationMs >
   intraSegmentRefineMs` (default 4000) OR the coarse top1−top2 margin is

@@ -989,6 +989,15 @@ func runCodeSwitchSelfTest() -> Bool {
               abs((off["sv"] ?? 0) - Foundation.log(0.5)) < 1e-9
               && abs((off["en"] ?? 0) - Foundation.log(0.5)) < 1e-9)
 
+        // Anti-inversion clamp: whisper's confidence is over its full
+        // ~100-language softmax, so a weak top-1 (p = 0.2) re-spread over a
+        // 2-language whitelist used to become en 0.2 / sv 0.8 — evidence
+        // AGAINST the LID's own pick. The top must keep a strict edge.
+        let weak = WhisperLID.spread(top: "en", confidence: 0.2, restrict: ["sv", "en"])
+        check("spread: weak top-1 keeps a strict edge over uniform (no inversion)",
+              (weak["en"] ?? -1) > (weak["sv"] ?? 0)
+              && abs(Foundation.exp(weak["en"] ?? 0) - 0.55) < 1e-9)
+
         // detection(from:whitelist:segment:): the static helper that
         // LanguageSegmenter uses to wrap an identifier's posterior into the
         // LanguageDetection shape the smoother consumes.
@@ -1035,34 +1044,68 @@ func runCodeSwitchSelfTest() -> Bool {
 
     // ServerWhisperLID's pure helpers (the resident whisper-server LID).
     // verbose_json gotcha (verified on whisper.cpp 1.8.4): `detected_language`
-    // is the FULL ENGLISH NAME ("english"), never a code — the ISO code must
-    // come from the argmax of `language_probabilities` (a thresholded map
-    // summing to < 1) and the confidence from
-    // `detected_language_probability`. No process, network, or models here.
+    // is the FULL ENGLISH NAME ("english"), never a code — everything comes
+    // from `language_probabilities` (a thresholded map summing to < 1),
+    // folded through the look-alike remap and renormalized over the
+    // whitelist. No process, network, or models here.
     do {
         let en = #"{"task":"transcribe","detected_language":"english","detected_language_probability":0.9937,"language_probabilities":{"en":0.9937,"ja":0.0014,"sv":0.0008},"text":""}"#
-        let pEn = ServerWhisperLID.parseDetection(Data(en.utf8))
-        check("server parse: ISO code from probabilities argmax, not the English name",
-              pEn?.code == "en" && abs((pEn?.prob ?? 0) - 0.9937) < 1e-9,
-              "got \(String(describing: pEn))")
-
-        let sv = #"{"detected_language":"swedish","detected_language_probability":0.71,"language_probabilities":{"sv":0.71,"no":0.18,"da":0.06},"text":""}"#
-        let pSv = ServerWhisperLID.parseDetection(Data(sv.utf8))
-        check("server parse: thresholded map (sums < 1) still argmaxes correctly",
-              pSv?.code == "sv" && abs((pSv?.prob ?? 0) - 0.71) < 1e-9,
-              "got \(String(describing: pSv))")
-
-        let noProb = #"{"detected_language":"swedish","language_probabilities":{"sv":0.8,"en":0.1}}"#
-        check("server parse: missing detected_language_probability falls back to argmax value",
-              abs((ServerWhisperLID.parseDetection(Data(noProb.utf8))?.prob ?? 0) - 0.8) < 1e-9)
+        let full = ServerWhisperLID.parseProbabilities(Data(en.utf8))
+        check("server parse: full probability map with lowercased ISO-code keys",
+              abs((full?["en"] ?? 0) - 0.9937) < 1e-9
+              && abs((full?["ja"] ?? 0) - 0.0014) < 1e-9
+              && abs((full?["sv"] ?? 0) - 0.0008) < 1e-9,
+              "got \(String(describing: full))")
 
         let noMap = #"{"detected_language":"english","detected_language_probability":0.99}"#
         check("server parse: missing language_probabilities → nil (name is never parsed)",
-              ServerWhisperLID.parseDetection(Data(noMap.utf8)) == nil)
+              ServerWhisperLID.parseProbabilities(Data(noMap.utf8)) == nil)
 
         // Errors come back as HTTP 400 with a PLAIN TEXT body, not JSON.
         check("server parse: plain-text error body ('Invalid request') → nil",
-              ServerWhisperLID.parseDetection(Data("Invalid request".utf8)) == nil)
+              ServerWhisperLID.parseProbabilities(Data("Invalid request".utf8)) == nil)
+
+        // restrictedPosterior: fold → argmax → whitelist renormalize.
+        let fold: (String) -> String = {
+            ["no", "nb", "nn", "da"].contains($0) ? "sv" : $0
+        }
+        // Top-1 is "en" (0.40), but folded Swedish mass (0.32+0.10+0.15=0.57)
+        // wins — the case a top-1-only remap could never catch.
+        let nordic: [String: Double] = ["en": 0.40, "no": 0.32, "da": 0.10, "sv": 0.15]
+        let rpN = ServerWhisperLID.restrictedPosterior(nordic, remap: fold,
+                                                       restrict: ["sv", "en"])
+        check("server posterior: look-alike mass folds BEFORE the argmax (en top-1 → sv)",
+              rpN?.top == "sv"
+              && abs(Foundation.exp(rpN?.logprobs["sv"] ?? 0) - 0.57 / 0.97) < 1e-9
+              && abs(Foundation.exp(rpN?.logprobs["en"] ?? 0) - 0.40 / 0.97) < 1e-9,
+              "got \(String(describing: rpN))")
+
+        // Real competing mass reaches the smoother: sv 0.5 / en 0.3 must
+        // renormalize to 0.625 / 0.375, not collapse to top-1 + residual.
+        let mixed: [String: Double] = ["sv": 0.5, "en": 0.3, "de": 0.15]
+        let rpM = ServerWhisperLID.restrictedPosterior(mixed, remap: { $0 },
+                                                       restrict: ["sv", "en"])
+        check("server posterior: whitelist masses renormalize (0.5/0.3 → 0.625/0.375)",
+              rpM?.top == "sv"
+              && abs(Foundation.exp(rpM?.logprobs["sv"] ?? 0) - 0.625) < 1e-9
+              && abs(Foundation.exp(rpM?.logprobs["en"] ?? 0) - 0.375) < 1e-9)
+
+        // Off-whitelist winner surfaces as `top` so identify can throw and the
+        // segment falls to the unknown floor instead of being force-labeled.
+        let german: [String: Double] = ["de": 0.7, "sv": 0.1, "en": 0.05]
+        check("server posterior: off-whitelist argmax is surfaced, not swallowed",
+              ServerWhisperLID.restrictedPosterior(german, remap: { $0 },
+                                                   restrict: ["sv", "en"])?.top == "de")
+
+        // A whitelist language absent from the thresholded map gets the 1e-3
+        // floor: the posterior carries every whitelist key with finite mass.
+        let solo: [String: Double] = ["sv": 0.95]
+        let rpS = ServerWhisperLID.restrictedPosterior(solo, remap: { $0 },
+                                                       restrict: ["sv", "en"])
+        let enLp = rpS?.logprobs["en"] ?? -.infinity
+        check("server posterior: absent whitelist language floors at 1e-3, never -inf",
+              rpS?.top == "sv" && enLp > -.infinity
+              && abs(Foundation.exp(enLp) - 0.001 / 0.951) < 1e-9)
 
         // Multipart body: the three verified fields, proper boundary framing.
         let body = String(data: ServerWhisperLID.multipartBody(
@@ -1072,6 +1115,27 @@ func runCodeSwitchSelfTest() -> Bool {
               && body.contains("name=\"detect_language\"\r\n\r\ntrue")
               && body.contains("name=\"response_format\"\r\n\r\nverbose_json")
               && body.hasSuffix("--B--\r\n"))
+    }
+
+    // Long-segment chunking for detection: a switch inside one long VAD
+    // segment used to be invisible (one label from the first 30 s).
+    do {
+        let long = VADSegment(startMs: 1_000, endMs: 21_000)   // 20 s
+        let chunks = LanguageSegmenter.splitForDetect(long, maxMs: 8_000)
+        let contiguous = zip(chunks, chunks.dropFirst()).allSatisfy { $0.endMs == $1.startMs }
+        check("splitForDetect: 20 s → 3 contiguous chunks covering exactly",
+              chunks.count == 3 && contiguous
+              && chunks.first?.startMs == 1_000 && chunks.last?.endMs == 21_000,
+              "got \(chunks)")
+        check("splitForDetect: every chunk ≤ maxMs and > maxMs/2 (stays above detect floor)",
+              chunks.allSatisfy { $0.durationMs <= 8_000 && $0.durationMs > 4_000 })
+
+        let short = VADSegment(startMs: 0, endMs: 5_000)
+        check("splitForDetect: at-or-under maxMs comes back untouched",
+              LanguageSegmenter.splitForDetect(short, maxMs: 8_000) == [short])
+        check("splitForDetect: exactly maxMs is not split",
+              LanguageSegmenter.splitForDetect(VADSegment(startMs: 0, endMs: 8_000),
+                                               maxMs: 8_000).count == 1)
     }
 
     // Optional end-to-end audio fixtures (Tests/Fixtures) — skipped cleanly
