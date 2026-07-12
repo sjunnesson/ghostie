@@ -56,10 +56,13 @@ the same code drives the menu-bar app and the headless daemon.
   retry timer. Thread safety is **manual** via the private `gate` and `work`
   `DispatchQueue`s (not actors), which is why it is `@unchecked Sendable`;
   preserve that model when editing — don't introduce actor isolation.
-- **`CallDetector.swift`** — the "no bot" mechanism: polls CoreAudio
-  `kAudioDevicePropertyDeviceIsRunningSomewhere` on the default input device and
-  checks a trigger app (Teams) is running. Debounced start (2 positive polls),
-  grace-period end (rides over mute toggles).
+- **`CallDetector.swift`** — the "no bot" mechanism, now a thin shim over
+  `Detection/` (DetectionCoordinator + CallStateMachine + providers): per-PID
+  CoreAudio input/output attribution on Teams bundle IDs, corroborated by
+  AX meeting-window / camera signals. idle → candidate (tentative capture
+  starts, so the confirm window's audio is kept) → confirmed (3 s;
+  `onCallStart`) → ending → idle (30 s grace; `onCallStop`). A demoted
+  candidate fires `onTentativeDiscard` and its capture is thrown away.
 - **`AudioRecorder.swift`** — ScreenCaptureKit with two taps:
   `.audio` (system → everyone else → `participants.wav`) and `.microphone`
   (you → `me.wav`), both 16 kHz mono. Speaker labels are **track-based**, not

@@ -31,6 +31,11 @@ final class Engine: @unchecked Sendable {
     /// once via `takeRecorderLocked()` (stop, fatal stream error and shutdown
     /// all race for it, whoever wins owns the stop).
     private var recorder: AudioRecorder?
+    /// True while `recorder` is a tentative (candidate-stage) capture that
+    /// has not been confirmed as a call. Tentative captures are invisible in
+    /// `EngineState` (the icon stays "watching") and are discarded — never
+    /// processed — if the candidate demotes. Gate-only.
+    private var isTentative = false
     /// The in-flight `AudioRecorder.start()` for `recorder`. Finalizers await
     /// it before taking the recorder, so a stop can never slip inside the
     /// SCShareableContent/startCapture window and orphan a live SCStream.
@@ -69,8 +74,17 @@ final class Engine: @unchecked Sendable {
     init(config: Config) {
         self.config = config
         self.detector = CallDetector(config: config)
+        wireDetector()
+    }
+
+    /// The four detector callbacks, shared by init and applyConfig. Tentative
+    /// start/discard bracket the candidate window so the confirm window's
+    /// audio (a call's opening seconds) is captured, not lost.
+    private func wireDetector() {
         detector.onCallStart = { [weak self] in self?.handleStart() }
         detector.onCallStop  = { [weak self] in self?.handleStop() }
+        detector.onTentativeStart = { [weak self] in self?.handleTentativeStart() }
+        detector.onTentativeDiscard = { [weak self] in self?.handleStop() }
     }
 
     var isListening: Bool { listening }
@@ -91,11 +105,15 @@ final class Engine: @unchecked Sendable {
     /// `swapIsSafe()` true and let the auto-updater relaunch mid-call).
     /// Must run on `gate`.
     private func settleStateLocked() {
-        if recorder != nil || testRecorder != nil {
+        if (recorder != nil && !isTentative) || testRecorder != nil {
             setStateLocked(.recording(since: recordingStartedAt))
         } else if processingCount > 0 {
             setStateLocked(.processing)
         } else {
+            // A tentative (unconfirmed-candidate) capture deliberately reads
+            // as "watching": most candidates confirm within ~3 s, and one
+            // that demotes was never a call — the icon should not flicker
+            // "recording" for it.
             setStateLocked(listening ? .watching : .paused)
         }
     }
@@ -104,10 +122,12 @@ final class Engine: @unchecked Sendable {
     /// finalizer. Idempotent by construction — the second caller gets nil —
     /// which is what makes stop / fatal-stream-error / shutdown safe to race.
     /// Must run on `gate`.
-    private func takeRecorderLocked() -> (rec: AudioRecorder, startedAt: Date)? {
+    private func takeRecorderLocked() -> (rec: AudioRecorder, startedAt: Date, tentative: Bool)? {
         guard let rec = recorder else { return nil }
         recorder = nil
-        return (rec, recordingStartedAt)
+        let tentative = isTentative
+        isTentative = false
+        return (rec, recordingStartedAt, tentative)
     }
 
     /// Safe to replace the running .app bundle? Never mid-call or mid-summary
@@ -130,8 +150,7 @@ final class Engine: @unchecked Sendable {
         if wasListening { detector.stop() }
         config = newConfig
         detector = CallDetector(config: newConfig)
-        detector.onCallStart = { [weak self] in self?.handleStart() }
-        detector.onCallStop  = { [weak self] in self?.handleStop() }
+        wireDetector()
         if wasListening { detector.start() }
         Log.info("Settings updated\(wasListening ? " — detector restarted" : "").")
         drainBacklog()   // settings may have fixed whisper / Claude Code
@@ -186,9 +205,34 @@ final class Engine: @unchecked Sendable {
         }
     }
 
+    /// Candidate stage: first primary evidence. Start capturing now — into
+    /// AudioRecorder's in-memory ring — so the ~3 s confirm window (the
+    /// call's opening words) is part of the recording when the candidate
+    /// confirms. Nothing is announced yet; a demotion discards it all.
+    private func handleTentativeStart() {
+        startRecorderLocked(tentative: true)
+    }
+
+    /// Confirmed call. Normally the tentative capture is already running and
+    /// is simply adopted (recordingStartedAt keeps the tentative start, so
+    /// the menu timer matches the audio). Falls back to a fresh start when
+    /// no tentative capture exists — e.g. its start() failed.
     private func handleStart() {
+        startRecorderLocked(tentative: false)
+    }
+
+    private func startRecorderLocked(tentative: Bool) {
         gate.async {
-            guard self.recorder == nil else { return }
+            if self.recorder != nil {
+                // Confirm adopting the live tentative capture; duplicate
+                // starts are otherwise ignored (same as before).
+                if !tentative && self.isTentative {
+                    self.isTentative = false
+                    self.settleStateLocked()   // → .recording
+                }
+                return
+            }
+            self.isTentative = tentative
             self.recordingStartedAt = Date()
             let rec = AudioRecorder(config: self.config)
             self.recorder = rec
@@ -197,7 +241,8 @@ final class Engine: @unchecked Sendable {
             // captured so far still becomes a note instead of accumulating
             // nothing behind a stuck "Recording…". handleStop takes the
             // recorder through `gate` exactly once, so the detector's own
-            // onCallStop firing later is a harmless no-op.
+            // onCallStop firing later is a harmless no-op. (For a tentative
+            // capture the same path discards instead of processing.)
             rec.onFatalError = { [weak self] in self?.handleStop() }
             self.startTask = Task {
                 do {
@@ -206,7 +251,10 @@ final class Engine: @unchecked Sendable {
                     Log.error("Could not start recording: \(error.localizedDescription)")
                     Log.error("Grant Screen Recording + Microphone in System Settings ▸ Privacy & Security.")
                     self.gate.async {
-                        if self.recorder === rec { self.recorder = nil }
+                        if self.recorder === rec {
+                            self.recorder = nil
+                            self.isTentative = false
+                        }
                     }
                 }
                 self.gate.async {
@@ -231,8 +279,19 @@ final class Engine: @unchecked Sendable {
                 // Exactly-once handoff: a concurrent finalizer (onFatalError,
                 // shutdown, a duplicate onCallStop) loses this race and just
                 // returns.
-                guard let (rec, started) = (self.gate.sync { self.takeRecorderLocked() })
+                guard let (rec, started, tentative) = (self.gate.sync { self.takeRecorderLocked() })
                 else { return }
+                if tentative {
+                    // Candidate demoted without confirming: this was never a
+                    // call. Discard everything — usually just the in-memory
+                    // ring, but a long-lived candidate may have flushed to
+                    // disk, so remove the session dir too.
+                    if let r = await rec.stop(discardIfBelowMinCallSeconds: false) {
+                        try? FileManager.default.removeItem(at: r.sessionDir)
+                    }
+                    self.gate.async { self.settleStateLocked() }
+                    return
+                }
                 // AudioRecorder.stop() returns nil for sub-`minCallSeconds`
                 // calls (the in-memory ring is dropped without ever writing
                 // to disk). No post-hoc disk-discard needed here.
@@ -333,8 +392,16 @@ final class Engine: @unchecked Sendable {
             let pendingStart = self.startTask
             Task {
                 await pendingStart?.value
-                guard let (rec, started) = (self.gate.sync { self.takeRecorderLocked() })
+                guard let (rec, started, tentative) = (self.gate.sync { self.takeRecorderLocked() })
                 else { then(); return }
+                if tentative {
+                    // Quit during an unconfirmed candidate: not a call.
+                    if let r = await rec.stop(discardIfBelowMinCallSeconds: false) {
+                        try? FileManager.default.removeItem(at: r.sessionDir)
+                    }
+                    then()
+                    return
+                }
                 if let r = await rec.stop(), r.duration >= self.config.minCallSeconds {
                     self.work.async {
                         _ = Pipeline(config: Config.load()).process(r, startedAt: started)

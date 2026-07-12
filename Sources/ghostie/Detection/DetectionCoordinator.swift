@@ -45,6 +45,8 @@ final class DetectionCoordinator {
 
     var onCallStart: ((UUID) -> Void)?
     var onCallStop: ((UUID) -> Void)?
+    var onTentativeStart: ((UUID) -> Void)?
+    var onTentativeDiscard: ((UUID) -> Void)?
 
     /// AX prompt is process-wide, not per-coordinator. Engine.applyConfig
     /// recreates the coordinator on every Settings save, and we don't want
@@ -91,6 +93,16 @@ final class DetectionCoordinator {
             guard let self else { return }
             Log.ok("Teams call ended (session \(sid.uuidString.prefix(8))) — finalizing.")
             self.onCallStop?(sid)
+        }
+        stateMachine.onTentativeStart = { [weak self] sid in
+            guard let self else { return }
+            Log.info("Possible Teams call (session \(sid.uuidString.prefix(8))) — tentative capture started.")
+            self.onTentativeStart?(sid)
+        }
+        stateMachine.onTentativeDiscard = { [weak self] sid in
+            guard let self else { return }
+            Log.info("Candidate never confirmed (session \(sid.uuidString.prefix(8))) — tentative capture discarded.")
+            self.onTentativeDiscard?(sid)
         }
         stateMachine.onTransition = { t in
             Log.info("detector \(t.from.rawValue) -> \(t.to.rawValue): \(t.reason) [\(t.evidence.summary)]")

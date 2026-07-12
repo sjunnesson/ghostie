@@ -29,10 +29,13 @@ meeting** — automatically transcribes each call and writes a markdown summary
 
 2. **Record.** `ScreenCaptureKit` captures two independent local audio taps,
    system audio (the other participants) and your microphone (you), as two
-   16 kHz mono WAV files. No virtual audio driver, no bot participant. The
-   first 30 seconds of every recording sit in a bounded in-memory PCM ring;
-   if the call ends before crossing `minCallSeconds`, no file ever reaches
-   disk.
+   16 kHz mono WAV files. No virtual audio driver, no bot participant.
+   Capture begins **tentatively at first evidence** — before the detector's
+   3-second confirm window has elapsed — so a call's opening words are part
+   of the recording; a candidate that never confirms is discarded unheard.
+   The first 30 seconds of every recording sit in a bounded in-memory PCM
+   ring; if the call ends before crossing `minCallSeconds`, no file ever
+   reaches disk.
 
 3. **Transcribe.** [whisper.cpp](https://github.com/ggerganov/whisper.cpp)
    runs entirely on your machine. Call audio never leaves your Mac. Decoding

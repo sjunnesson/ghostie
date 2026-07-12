@@ -68,7 +68,8 @@ func runDetectorStateMachineSelfTest() -> Bool {
 
     // 2. Cold start with primary only (no corroborators) stays in candidate
     //    indefinitely and never commits a call. A corroborator-less primary
-    //    is harmless (no recording is started until promotion).
+    //    costs only a tentative capture (in-memory ring; discarded on
+    //    demotion, never announced or processed).
     do {
         let (sm, clock, starts, stops) = newMachine()
         sm.evaluate(evidence: ev(at: clock.now, input: true))
@@ -343,6 +344,64 @@ func runDetectorStateMachineSelfTest() -> Bool {
         sm.forceStop(reason: "selftest")
         check("forceStop: idle + stop emitted",
               sm.stage == .idle && starts() == 1 && stops() == 1)
+    }
+
+    // 15b. Tentative capture callbacks. onTentativeStart fires on entering
+    //      candidate; onTentativeDiscard fires only for a candidate that
+    //      demotes without confirming; a confirmed session emits stop, never
+    //      discard — the pairs are mutually exclusive.
+    do {
+        func newTentativeMachine() -> (CallStateMachine, VirtualClock,
+                                       () -> Int, () -> Int, () -> Int, () -> Int) {
+            let clock = VirtualClock()
+            let sm = CallStateMachine(clock: clock)
+            var starts = 0, stops = 0, tentStarts = 0, discards = 0
+            sm.onCallStart = { _ in starts += 1 }
+            sm.onCallStop  = { _ in stops  += 1 }
+            sm.onTentativeStart   = { _ in tentStarts += 1 }
+            sm.onTentativeDiscard = { _ in discards += 1 }
+            return (sm, clock, { starts }, { stops }, { tentStarts }, { discards })
+        }
+
+        // Confirmed lifecycle: tentative start on candidate entry, call start
+        // on promotion, stop on grace expiry — and no discard anywhere.
+        do {
+            let (sm, clock, starts, stops, tentStarts, discards) = newTentativeMachine()
+            sm.evaluate(evidence: ev(at: clock.now, input: true, output: true))
+            check("tentative: fires on idle->candidate",
+                  tentStarts() == 1 && starts() == 0,
+                  "tentStarts=\(tentStarts()) starts=\(starts())")
+            drive(sm, clock, for: 4) { ev(at: $0, input: true, output: true) }
+            check("tentative: promotion adopts capture (start fired, no discard)",
+                  starts() == 1 && discards() == 0,
+                  "starts=\(starts()) discards=\(discards())")
+            drive(sm, clock, for: 35) { ev(at: $0, input: false) }
+            check("tentative: confirmed session ends with stop, never discard",
+                  sm.stage == .idle && stops() == 1 && discards() == 0,
+                  "stage=\(sm.stage) stops=\(stops()) discards=\(discards())")
+        }
+
+        // Demoted candidate: discard fires exactly once, start/stop never.
+        do {
+            let (sm, clock, starts, stops, tentStarts, discards) = newTentativeMachine()
+            drive(sm, clock, for: 2) { ev(at: $0, input: true) }
+            drive(sm, clock, for: 10) { ev(at: $0, input: false) }
+            check("tentative: demoted candidate discards exactly once",
+                  sm.stage == .idle && tentStarts() == 1 && discards() == 1
+                      && starts() == 0 && stops() == 0,
+                  "tentStarts=\(tentStarts()) discards=\(discards()) starts=\(starts()) stops=\(stops())")
+        }
+
+        // forceStop mid-candidate is also a discard, not a stop.
+        do {
+            let (sm, clock, starts, stops, _, discards) = newTentativeMachine()
+            drive(sm, clock, for: 1.5) { ev(at: $0, input: true, output: true) }
+            check("tentative: forceStop setup in candidate", sm.stage == .candidate)
+            sm.forceStop(reason: "selftest")
+            check("tentative: forceStop mid-candidate discards silently",
+                  sm.stage == .idle && discards() == 1 && starts() == 0 && stops() == 0,
+                  "discards=\(discards()) starts=\(starts()) stops=\(stops())")
+        }
     }
 
     // 16. Transition log: at least one transition appears for each lifecycle

@@ -23,6 +23,19 @@ final class CallDetector {
             coordinator.onCallStop = { [weak self] _ in self?.onCallStop?() }
         }
     }
+    /// First primary evidence (idle → candidate): begin a tentative capture
+    /// so the confirm window's audio is kept if the call confirms.
+    var onTentativeStart: (() -> Void)? {
+        didSet {
+            coordinator.onTentativeStart = { [weak self] _ in self?.onTentativeStart?() }
+        }
+    }
+    /// Candidate demoted without confirming: throw the tentative capture away.
+    var onTentativeDiscard: (() -> Void)? {
+        didSet {
+            coordinator.onTentativeDiscard = { [weak self] _ in self?.onTentativeDiscard?() }
+        }
+    }
 
     init(config: Config) {
         self.coordinator = DetectionCoordinator(config: config)

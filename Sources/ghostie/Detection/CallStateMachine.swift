@@ -18,6 +18,13 @@ import Foundation
 /// never announced itself, so it ends silently (the transition log still
 /// records the demotion).
 ///
+/// `onTentativeStart`/`onTentativeDiscard` bracket the candidate window the
+/// same way: tentative-start fires on idle → candidate so the engine can
+/// begin capturing into the in-memory ring immediately (a call's opening
+/// seconds would otherwise be lost to the confirm window), and discard fires
+/// only for a candidate that demotes without confirming. A confirmed session
+/// never emits discard — its tentative capture is simply kept.
+///
 /// Device-swap quiescence: when the default input device changes, the
 /// coordinator marks `evidence.deviceSwapWithinLast3s = true` for 3 s; the
 /// state machine then treats `primarySignal=false` as effectively true,
@@ -62,6 +69,14 @@ final class CallStateMachine {
     /// confirmed session is live). Never fires for a session that did not
     /// emit `onCallStart` — start/stop are a balanced pair.
     var onCallStop: ((UUID) -> Void)?
+    /// Fires on idle → candidate: first primary evidence. The engine starts
+    /// a tentative capture here so the confirm window isn't lost audio.
+    var onTentativeStart: ((UUID) -> Void)?
+    /// Fires when a candidate demotes to idle without ever confirming
+    /// (primary lost too long, or forceStop mid-candidate). The paired
+    /// tentative capture must be discarded, never processed. A session that
+    /// confirmed emits `onCallStop` instead — the two are mutually exclusive.
+    var onTentativeDiscard: ((UUID) -> Void)?
     /// Fires on every transition, for diagnostics and logging.
     var onTransition: ((Transition) -> Void)?
 
@@ -245,10 +260,15 @@ final class CallStateMachine {
             sessionId = nil
             sessionStarted = false
             // Stop only fires for sessions that emitted start. A demoted
-            // candidate never existed as far as consumers know, so it
-            // clears silently — the transition (with reason) is still
-            // recorded and logged via onTransition.
-            if started, let s = dead { onCallStop?(s) }
+            // candidate never announced itself, so it clears via
+            // onTentativeDiscard (the engine throws the tentative capture
+            // away); the transition (with reason) is still recorded and
+            // logged via onTransition.
+            if started, let s = dead {
+                onCallStop?(s)
+            } else if let s = dead {
+                onTentativeDiscard?(s)
+            }
         case .candidate:
             sessionId = UUID()
             sessionStarted = false
@@ -256,6 +276,7 @@ final class CallStateMachine {
             // Candidate is only ever entered on a real primary observation
             // (idle ignores swap quiescence), so no false-run is pending.
             primaryFalseRunStart = nil
+            if let s = sessionId { onTentativeStart?(s) }
         case .confirmed:
             confirmableRunStart = nil
             primaryFalseRunStart = nil
