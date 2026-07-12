@@ -50,6 +50,11 @@ enum TranscriptCleaner {
         "yeah", "okay", "ok", "you", "uh", "um", "hmm", "mm", "mhm", "so", "right"
     ]
 
+    // English + the highest-frequency non-English YouTube-subtitle leaks.
+    // Whisper's training-data hallucinations are language-specific: a Swedish
+    // decode pass (code-switching) emits the Swedish leak phrases, which the
+    // English-only list used to sail right past. Exact normalized phrases
+    // only — nothing here can occur as legitimate business-call speech.
     private static let knownHallucinations: Set<String> = [
         "thank you for watching", "thanks for watching",
         "thank you so much for watching", "please subscribe to our channel",
@@ -60,11 +65,40 @@ enum TranscriptCleaner {
         "transcribed by the amara.org community",
         "translated by the amara.org community",
         "the amara.org community", "amara.org community",
-        "captions by the cyclope"
+        "captions by the cyclope",
+        // Swedish
+        "tack för att du tittade", "tack för att ni tittade",
+        "tack för att du har tittat", "tack för visningen",
+        "glöm inte att prenumerera", "prenumerera på kanalen",
+        "vi ses i nästa video", "vi ses nästa gång",
+        "undertexter från amara.org-gemenskapen",
+        "svensktextning.nu",
+        // German
+        "vielen dank fürs zuschauen", "danke fürs zuschauen",
+        "bis zum nächsten mal", "vergesst nicht zu abonnieren",
+        "untertitel der amara.org-community",
+        // French
+        "merci d'avoir regardé", "merci d'avoir regardé cette vidéo",
+        "abonnez-vous à la chaîne", "à la prochaine",
+        "sous-titres réalisés para la communauté d'amara.org",
+        "sous-titres réalisés par la communauté d'amara.org",
+        // Spanish
+        "gracias por ver", "gracias por ver el video",
+        "gracias por ver el vídeo", "no olvides suscribirte",
+        "suscríbete al canal",
+        "subtítulos realizados por la comunidad de amara.org"
     ]
     private static let hallucinationPrefixes = [
         "transcripted by", "transcribed by", "captions by",
-        "captioned by", "subtitles by", "translated by"
+        "captioned by", "subtitles by", "translated by",
+        // Swedish credit lines ("Textning av …", "Undertexter av/från …",
+        // "Översättning: …" are subtitle credits, never call speech).
+        "textning av", "undertexter av", "undertexter från",
+        "översättning av", "översatt av",
+        // German / French / Spanish credit lines
+        "untertitel von", "untertitelung des",
+        "sous-titres par", "sous-titrage par", "sous-titres réalisés",
+        "subtítulos por", "subtítulos de", "subtitulado por"
     ]
 
     private static func normalized(_ text: String) -> String {

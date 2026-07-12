@@ -91,16 +91,15 @@ Add a fixture under `runTranscriptCleanerSelfTest` that exercises the
 loop-detector against a stitched-per-language transcript and confirms
 the existing thresholds hold (or tune them).
 
-### 5. Settings UI: rich language picker
+### 5. Settings UI: rich language picker ✅ done
 
-The mode popup is binary (single / sv+en). With N languages on disk,
-a multi-select picker keyed off `InstalledModels.languages` is more
-honest. The popup's write path is already a one-liner — change it to a
-multi-select and write `cs.languages` accordingly.
-
-Adjacent: surface the per-language prompt fields (today only `prompts["sv"]`
-/ `prompts["en"]` are in the default map; the UI can't yet edit a `prompts`
-entry for a third language).
+Settings ▸ Transcription now shows one checkbox per language (installed
+languages ∪ explicit `cs.languages`; missing-model entries flagged),
+writing the selection to `cs.languages`. The last language can't be
+unchecked (an empty list means "everything installed", which would
+paradoxically re-enable all). Advanced discloses one starter-sentence
+field per active language, editing `codeSwitch.prompts[lang]` — a third
+language's prompt no longer needs config.json.
 
 ### 6. Doctor — flag KB-Whisper-only English ✅ done
 

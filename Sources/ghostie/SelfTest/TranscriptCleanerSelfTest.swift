@@ -65,6 +65,28 @@ func runTranscriptCleanerSelfTest() -> Bool {
                 "Next steps are clear.", "Thanks, talk soon."]
     }
 
+    // Non-English training-data leaks (code-switching decodes emit the
+    // leak phrases of THEIR language; the English-only list missed them).
+    check("swedish training leaks dropped",
+          ["Tack för att du tittade!", "Textning av BritneySpears88",
+           "Undertexter från Amara.org-gemenskapen",
+           "Vi bestämde oss för att skjuta upp lanseringen."]) { out in
+        out == ["Vi bestämde oss för att skjuta upp lanseringen."]
+    }
+    check("german/french/spanish training leaks dropped",
+          ["Vielen Dank fürs Zuschauen!", "Untertitel von Stephanie Geiges",
+           "Sous-titres réalisés para la communauté d'Amara.org",
+           "Gracias por ver el video.", "Le budget est approuvé."]) { out in
+        out == ["Le budget est approuvé."]
+    }
+    // Real Swedish speech must never be over-cleaned by the new entries.
+    check("swedish clean speech untouched",
+          ["Tack för idag, vi hörs imorgon.", "Kan du skicka rapporten?",
+           "Översättningen av avtalet är klar."]) { out in
+        out == ["Tack för idag, vi hörs imorgon.", "Kan du skicka rapporten?",
+                "Översättningen av avtalet är klar."]
+    }
+
     // Per-language stitched batches (code-switching) hand the cleaner ~50%
     // less context per pass than a full track. Pin that the thresholds still
     // hold on short batches: the consecutive-loop rule (≥3) fires regardless

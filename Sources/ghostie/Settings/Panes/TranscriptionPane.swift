@@ -22,7 +22,7 @@ final class TranscriptionPane: NSView {
     /// reads language/goodForLID without re-loading the catalog per row.
     private var entriesByKey: [String: CatalogEntry] = [:]
     private let modelsCard = GroupCard(title: "Models")
-    private let languagesValue = NSTextField(labelWithString: "")
+    private let languagesCard = GroupCard(title: "Languages")
     /// The row selected for the `−` button.
     private var selectedKey: String?
     /// Built-in presets whose download is in flight — shown in the list while
@@ -92,19 +92,13 @@ final class TranscriptionPane: NSView {
         stack.addArrangedSubview(header)
         header.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
 
-        // Languages — read-only summary of what Ghostie can recognize, derived
-        // from the models installed on disk (the disk is the whitelist; there's
-        // no fixed sv↔en toggle anymore). Add a model below to support a new
-        // language; Ghostie detects each speaker's language and routes it.
-        let langCard = GroupCard(title: "Languages")
-        languagesValue.font = .systemFont(ofSize: 12, weight: .medium)
-        languagesValue.textColor = Theme.text
-        langCard.addRow(RowBuilder.row(
-            label: "Languages Ghostie recognizes",
-            sub: "Driven by the models you've installed. Add a model below to support a new language — Ghostie detects which language each speaker uses and routes it to the matching model.",
-            control: languagesValue), last: true)
-        stack.addArrangedSubview(langCard)
-        langCard.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        // Languages — one checkbox per language the installed models can
+        // decode (plus any explicitly-configured language whose model is
+        // missing, flagged). The disk still drives what's *possible*; the
+        // checkboxes edit `codeSwitch.languages`, the explicit whitelist.
+        stack.addArrangedSubview(languagesCard)
+        languagesCard.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        rebuildLanguageRows()
 
         // Models — one row per catalog entry (built-ins + custom) plus an
         // "Add a model" button. Rebuilt whenever the catalog changes.
@@ -177,6 +171,35 @@ final class TranscriptionPane: NSView {
                 ? "Empty — Ghostie will let Whisper figure punctuation out on its own."
                 : cfg.initialPrompt,
             control: editBtn))
+        // One editable starter sentence per active code-switching language
+        // (followup #5: only sv/en were reachable before; a third language's
+        // prompts entry had no UI). Writes codeSwitch.prompts[lang]; an
+        // emptied field removes the key.
+        let installed = Models.installed(preferredKBVariant: cfg.codeSwitch.kbWhisperVariant)
+        for lang in cfg.codeSwitch.effectiveLanguages(installed: installed) {
+            let name = Locale.current.localizedString(forLanguageCode: lang) ?? lang
+            let field = NSTextField(string: cfg.codeSwitch.prompts[lang] ?? "")
+            field.placeholderString = "Optional — terms and style for \(name)"
+            field.font = .systemFont(ofSize: 12)
+            field.lineBreakMode = .byTruncatingTail
+            field.cell?.sendsActionOnEndEditing = true
+            field.widthAnchor.constraint(equalToConstant: 260).isActive = true
+            let target = ToggleTarget { [weak self, weak field] in
+                guard let self, let field else { return }
+                let v = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+                self.change { c in
+                    if v.isEmpty { c.codeSwitch.prompts.removeValue(forKey: lang) }
+                    else { c.codeSwitch.prompts[lang] = v }
+                }
+            }
+            field.target = target
+            field.action = #selector(ToggleTarget.fire)
+            objc_setAssociatedObject(field, &ToggleTarget.key, target, .OBJC_ASSOCIATION_RETAIN)
+            card.addRow(RowBuilder.row(
+                label: "Starter sentence (\(name))",
+                sub: "Biases punctuation and vocabulary when decoding \(name) segments.",
+                control: field))
+        }
         let editTarget2 = ActionTarget { [weak self] in self?.openConfig() }
         let editBtn2 = StyledButton(title: "Edit in config.json",
                                     target: editTarget2, action: #selector(ActionTarget.fire))
@@ -356,12 +379,62 @@ final class TranscriptionPane: NSView {
         return e.goodForLID ? base + " Also drives language detection." : base
     }
 
-    private func refreshLanguagesSummary() {
+    /// One checkbox row per language: everything the installed models decode,
+    /// plus any explicit `codeSwitch.languages` entry whose model is missing
+    /// (kept visible with a warning so the user sees why it can't decode).
+    /// Followup #5: the old binary mode popup couldn't express N languages.
+    private func rebuildLanguageRows() {
+        languagesCard.clearRows()
         let installed = Models.installed(preferredKBVariant: cfg.codeSwitch.kbWhisperVariant)
-        let langs = cfg.codeSwitch.effectiveLanguages(installed: installed)
-        languagesValue.stringValue = langs.isEmpty
-            ? "None yet — download a model below"
-            : langs.joined(separator: ", ")
+        let onDisk = installed.languages
+        let all = Set(onDisk).union(cfg.codeSwitch.languages).sorted()
+        let active = Set(cfg.codeSwitch.effectiveLanguages(installed: installed))
+        guard !all.isEmpty else {
+            languagesCard.addRow(RowBuilder.row(
+                label: "No languages yet",
+                sub: "Download a model below — Ghostie recognizes whatever languages the installed models decode, and routes each speaker to the matching model.",
+                control: NSView()), last: true)
+            return
+        }
+        for (i, lang) in all.enumerated() {
+            let missing = !onDisk.contains(lang)
+            let name = Locale.current.localizedString(forLanguageCode: lang) ?? lang
+            let box = NSButton(checkboxWithTitle: "", target: nil, action: nil)
+            box.state = active.contains(lang) || (missing && cfg.codeSwitch.languages.contains(lang))
+                ? .on : .off
+            let target = ToggleTarget { [weak self, weak box] in
+                guard let self, let box else { return }
+                self.toggleLanguage(lang, on: box.state == .on)
+            }
+            box.target = target
+            box.action = #selector(ToggleTarget.fire)
+            objc_setAssociatedObject(box, &ToggleTarget.key, target, .OBJC_ASSOCIATION_RETAIN)
+            languagesCard.addRow(RowBuilder.row(
+                label: "\(name) (\(lang))",
+                sub: missing
+                    ? "Configured, but its model isn't installed — add one below or uncheck."
+                    : "Ghostie detects when a speaker uses \(name) and routes it to the matching model.",
+                control: box), last: i == all.count - 1)
+        }
+    }
+
+    /// Write the new selection to `codeSwitch.languages` — an explicit
+    /// whitelist, exactly what the old popup's one-liner wrote. Never allowed
+    /// to go empty (an empty list means "everything installed", so unchecking
+    /// the last language would paradoxically re-enable them all).
+    private func toggleLanguage(_ lang: String, on: Bool) {
+        let installed = Models.installed(preferredKBVariant: cfg.codeSwitch.kbWhisperVariant)
+        var selection = Set(cfg.codeSwitch.languages.isEmpty
+            ? cfg.codeSwitch.effectiveLanguages(installed: installed)
+            : cfg.codeSwitch.languages)
+        if on { selection.insert(lang) } else { selection.remove(lang) }
+        guard !selection.isEmpty else {
+            rebuildLanguageRows()   // restore the checkbox; refuse the edit
+            return
+        }
+        change { c in c.codeSwitch.languages = selection.sorted() }
+        refreshAdvanced()   // per-language prompt fields track the selection
+        refreshAllRows()    // model-row tickmarks + language rows
     }
 
     func refreshRow(_ key: String) {
@@ -391,7 +464,7 @@ final class TranscriptionPane: NSView {
 
     func refreshAllRows() {
         for key in rows.keys { refreshRow(key) }
-        refreshLanguagesSummary()
+        rebuildLanguageRows()
     }
 
     func setRowDownloading(_ key: String, percent: Double, status: String) {

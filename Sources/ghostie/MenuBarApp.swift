@@ -11,9 +11,15 @@ final class MenuBarApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let menu = NSMenu()
     private var statusMenuItem: NSMenuItem!
     private var axWarningItem: NSMenuItem!
+    private var backlogItem: NSMenuItem!
+    private var lastEventItem: NSMenuItem!
     private var toggleItem: NSMenuItem!
     private var lastNoteItem: NSMenuItem!
     private var updateItem: NSMenuItem!
+    /// UNUserNotificationCenter grant. When denied, every async signal
+    /// ("Call summarized", "Update available") would silently vanish — the
+    /// disabled "Last:" menu line below is the always-visible fallback.
+    private var notificationsAllowed = true
     private var tick: Timer?
     private var settings: SettingsWindow?
     private let updater = Updater()
@@ -28,9 +34,15 @@ final class MenuBarApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory) // menu bar agent, no Dock icon
+        CrashBreadcrumb.install()
 
         UNUserNotificationCenter.current()
-            .requestAuthorization(options: [.alert, .sound]) { _, _ in }
+            .requestAuthorization(options: [.alert, .sound]) { [weak self] granted, _ in
+                DispatchQueue.main.async { self?.notificationsAllowed = granted }
+                if !granted {
+                    Log.warn("Notifications are denied — call/update events will only appear in the menu's 'Last:' line. Grant in System Settings ▸ Notifications ▸ Ghostie.")
+                }
+            }
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.button?.image = Self.menuBarIcon
@@ -48,15 +60,26 @@ final class MenuBarApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self?.refreshLastNote()
             }
         }
-        engine.onBacklogChange = { [weak self] _ in
-            // Backlog count is surfaced in Settings → Notes → Advanced; the
-            // menu no longer carries a counter, but we still keep the
-            // last-note state in sync after a drain.
-            DispatchQueue.main.async { self?.refreshLastNote() }
+        engine.onBacklogChange = { [weak self] pending in
+            // Full backlog detail lives in Settings → Notes → Advanced, but a
+            // user whose calls keep failing (never logged into `claude`, say)
+            // used to see a normal-looking ghost and nothing else — surface a
+            // lightweight one-line indicator in the menu.
+            DispatchQueue.main.async {
+                self?.updateBacklogItem(pending: pending)
+                self?.refreshLastNote()
+            }
         }
 
         engine.startListening()
         render(engine.state)
+
+        // First-ever launch: one native primer so a new user knows what to
+        // expect (permission prompts on the first call, the model download)
+        // before anything silently happens. Marker-gated; never repeats.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            self?.showOnboardingIfNeeded()
+        }
 
         // First-launch / missing-model nudge: the speech model is no longer
         // bundled in the .dmg (~140 MB saved), so a fresh install needs to
@@ -100,6 +123,19 @@ final class MenuBarApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         axWarningItem.isHidden = true
         menu.addItem(axWarningItem)
 
+        // Backlog indicator: hidden at zero; one line + one click to drain.
+        backlogItem = NSMenuItem(title: "", action: #selector(processBacklogNow),
+                                 keyEquivalent: "")
+        backlogItem.target = self
+        backlogItem.isHidden = true
+        menu.addItem(backlogItem)
+
+        // Always-visible record of the last event, notification grant or not.
+        lastEventItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        lastEventItem.isEnabled = false
+        lastEventItem.isHidden = true
+        menu.addItem(lastEventItem)
+
         menu.addItem(.separator())
 
         // Trimmed menu: only the actions that make sense from the menu bar
@@ -130,6 +166,20 @@ final class MenuBarApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// keeps `AXIsProcessTrusted()` (a TCC round-trip) off any timer.
     func menuWillOpen(_ menu: NSMenu) {
         axWarningItem.isHidden = AXIsProcessTrusted()
+        // Cheap (one directory listing when empty); keeps the indicator
+        // honest even if a drain happened outside onBacklogChange.
+        updateBacklogItem(pending: Backlog.pendingCount)
+    }
+
+    private func updateBacklogItem(pending: Int) {
+        backlogItem.isHidden = pending == 0
+        if pending > 0 {
+            backlogItem.title = "⏳ \(pending) call\(pending == 1 ? "" : "s") queued — Process Now"
+        }
+    }
+
+    @objc private func processBacklogNow() {
+        engine.drainBacklog()
     }
 
     /// Transparent 1×1 placeholder. Assigning this as a menu item's image
@@ -430,7 +480,51 @@ final class MenuBarApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             .first
     }
 
+    // MARK: First-run primer
+
+    private static let onboardedMarker = "\(NSHomeDirectory())/.ghostie/.onboarded"
+
+    private func showOnboardingIfNeeded() {
+        let fm = FileManager.default
+        guard !fm.fileExists(atPath: Self.onboardedMarker) else { return }
+        try? fm.createDirectory(atPath: "\(NSHomeDirectory())/.ghostie",
+                                withIntermediateDirectories: true)
+        fm.createFile(atPath: Self.onboardedMarker, contents: Data())
+
+        let alert = NSAlert()
+        alert.messageText = "Welcome to Ghostie"
+        alert.informativeText = """
+        Ghostie sits in your menu bar and listens for Microsoft Teams calls — \
+        no bot ever joins the meeting. Calls are recorded and transcribed \
+        entirely on this Mac, then summarized into a markdown note.
+
+        Two one-time things to know:
+
+        • On your first call, macOS will ask for Microphone and Screen \
+        Recording access — grant both, and it sticks.
+
+        • Ghostie needs a speech model (~140 MB, fetched from Hugging Face). \
+        Settings can start that download now.
+        """
+        alert.addButton(withTitle: "Open Settings")
+        alert.addButton(withTitle: "OK")
+        NSApp.activate(ignoringOtherApps: true)
+        if alert.runModal() == .alertFirstButtonReturn { openSettings() }
+    }
+
+    private static let eventClock: DateFormatter = {
+        let f = DateFormatter(); f.dateFormat = "HH:mm"; return f
+    }()
+
     private func notify(_ title: String, _ body: String) {
+        // The menu line updates regardless of the notification grant, so a
+        // user who denied notifications still has somewhere to see events.
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.lastEventItem.title = "Last: \(title) · \(Self.eventClock.string(from: Date()))"
+            self.lastEventItem.isHidden = false
+        }
+        guard notificationsAllowed else { return }
         let content = UNMutableNotificationContent()
         content.title = title
         content.body = body
