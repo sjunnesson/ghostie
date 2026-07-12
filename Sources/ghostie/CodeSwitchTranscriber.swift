@@ -81,9 +81,12 @@ struct CodeSwitchTranscriber {
         // Read each track's PCM once here and thread it through detect → snap →
         // verify → decode, rather than re-reading (and re-parsing) the WAV at
         // every stage. ~60 MB for a 30-min track, previously decoded ~4× per
-        // track; now once.
-        let mePcm = (try? AudioStitcher.readPCM(me)) ?? Data()
-        let partPcm = (try? AudioStitcher.readPCM(participants)) ?? Data()
+        // track; now once. An unreadable/corrupt WAV throws — which backlogs
+        // the call for a clean retry — instead of degrading to empty PCM,
+        // which used to make every segment detect as `unknown` and route the
+        // whole track to the dominant language with no signal.
+        let mePcm = try AudioStitcher.readPCM(me)
+        let partPcm = try AudioStitcher.readPCM(participants)
 
         let meDet = try seg.detect(meSegs, pcm: mePcm)
         let partDet = try seg.detect(partSegs, pcm: partPcm)
@@ -285,8 +288,13 @@ struct CodeSwitchTranscriber {
             for s in segs {
                 if let orig = stitched.table.toOriginal(s.startMs) {
                     out.append(Transcriber.Segment(startMs: orig, text: s.text))
+                } else {
+                    // Segments inside the silence pads map to nil. Usually
+                    // whisper hallucinating into the gap — but if it decoded
+                    // real speech there, silence would hide the loss, so
+                    // leave an audit trail.
+                    Log.warn("Code-switching: dropping segment decoded inside a \(tag)-\(lang) stitch pad (@\(s.startMs)ms): \"\(s.text.prefix(80))\"")
                 }
-                // segments inside the silence pads map to nil → dropped
             }
         }
         return dedupeBoundaries(out.sorted { $0.startMs < $1.startMs })

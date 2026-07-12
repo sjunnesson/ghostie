@@ -350,18 +350,47 @@ final class AudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
 
     // MARK: SCStreamOutput
 
+    // Consecutive conversion failures per track. Each counter is confined to
+    // its track's SCK sample-handler queue (audioQueue / micQueue), so no
+    // lock is needed. A single failed buffer is routine (odd format mid
+    // device change); a long unbroken run means the track is silently
+    // recording nothing — warn early, and treat a sustained run as the same
+    // kind of fatality as an unwritable WAV so the engine finalizes the call
+    // instead of producing a normal-looking note with a silent track.
+    private var systemConvertFailures = 0
+    private var micConvertFailures = 0
+    /// ~1 s of continuously failing buffers at SCK's ~21 ms cadence.
+    private let convertFailureWarnThreshold = 50
+    /// ~10 s — the track is dead; fire onFatalError.
+    private let convertFailureFatalThreshold = 500
+
+    private func trackConversion(ok: Bool, failures: inout Int, track: String) {
+        guard !ok else { failures = 0; return }
+        failures += 1
+        if failures == convertFailureWarnThreshold {
+            Log.warn("'\(track)' track: audio conversion failing continuously — the track is currently recording silence.")
+        } else if failures == convertFailureFatalThreshold {
+            Log.error("'\(track)' track: audio conversion failed for ~10 s straight — treating the capture as dead.")
+            fireFatalError()
+        }
+    }
+
     func stream(_ stream: SCStream,
                 didOutputSampleBuffer sampleBuffer: CMSampleBuffer,
                 of type: SCStreamOutputType) {
         guard CMSampleBufferDataIsReady(sampleBuffer) else { return }
         switch type {
         case .audio:
-            if let s = systemConverter.samples(from: sampleBuffer) {
+            let s = systemConverter.samples(from: sampleBuffer)
+            trackConversion(ok: s != nil, failures: &systemConvertFailures, track: "participants")
+            if let s {
                 let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
                 ingestSystem(s, pts: pts.isNumeric ? pts.seconds : nil)
             }
         case .microphone:
-            if let s = micConverter.samples(from: sampleBuffer) {
+            let s = micConverter.samples(from: sampleBuffer)
+            trackConversion(ok: s != nil, failures: &micConvertFailures, track: "me")
+            if let s {
                 let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
                 ingestMic(s, pts: pts.isNumeric ? pts.seconds : nil)
             }
