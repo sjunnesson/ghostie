@@ -330,6 +330,12 @@ func cmdDoctor(_ config: Config) {
     }
     row(teams, "Microsoft Teams running", teams ? "" : "(only needed during a call)")
     row(CallDetector.defaultInputDevice() != nil, "default input device detected")
+    if let free = freeDiskBytes(at: config.workDir) {
+        row(free >= lowDiskThresholdBytes, "free disk space",
+            free >= lowDiskThresholdBytes
+                ? mbString(free)
+                : "\(mbString(free)) — below \(mbString(lowDiskThresholdBytes)); recordings and backlog writes may fail")
+    }
     let pending = Backlog.pendingCount
     row(pending == 0, "backlog",
         pending == 0 ? "empty" : "\(pending) pending — auto-retried; `ghostie process-backlog` to force")

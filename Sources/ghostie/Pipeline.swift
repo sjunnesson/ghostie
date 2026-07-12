@@ -156,6 +156,7 @@ struct Pipeline {
             }
         }
         if completed > 0 { Log.ok("Backlog: completed \(completed) recording(s).") }
+        Backlog.pruneGivenUp()
         return completed
     }
 

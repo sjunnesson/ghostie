@@ -234,6 +234,10 @@ final class Engine: @unchecked Sendable {
             }
             self.isTentative = tentative
             self.recordingStartedAt = Date()
+            if let free = freeDiskBytes(at: self.config.workDir),
+               free < lowDiskThresholdBytes {
+                Log.warn("Low disk space (\(mbString(free)) free) — recording will proceed but may be truncated or lost. Free up space.")
+            }
             let rec = AudioRecorder(config: self.config)
             self.recorder = rec
             // Stream death mid-call (display sleep, permission revoked, SCK

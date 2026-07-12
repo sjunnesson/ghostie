@@ -16,6 +16,16 @@ import Foundation
 enum Backlog {
     static let root = "\(NSHomeDirectory())/.ghostie/backlog"
     static let givenUpDirName = "given-up"
+    static let quarantineDirName = "quarantine"
+    /// Entries whose meta.json is missing/undecodable are moved here — visibly,
+    /// with a log line — instead of being silently skipped forever. Only dirs
+    /// untouched for this long are quarantined, so an enqueue that is mid-write
+    /// on another thread can never be swept out from under itself.
+    static let quarantineAfterSeconds: TimeInterval = 120
+    /// `given-up/` keeps failed entries (often with full audio) for manual
+    /// retry. Unbounded, that grows forever — cap the total and prune the
+    /// oldest beyond it, loudly.
+    static let givenUpCapBytes: Int64 = 5_000_000_000
 
     struct Meta: Codable {
         var startedAt: Double          // epoch seconds
@@ -44,7 +54,32 @@ enum Backlog {
     private static func writeMeta(_ meta: Meta, to dir: URL) {
         let enc = JSONEncoder(); enc.outputFormatting = [.prettyPrinted, .sortedKeys]
         if let data = try? enc.encode(meta) {
-            try? data.write(to: dir.appendingPathComponent("meta.json"))
+            // Atomic: a crash or full disk mid-write must not leave a
+            // truncated meta.json — an undecodable entry drops out of the
+            // queue (quarantined, at best) instead of being retried.
+            try? data.write(to: dir.appendingPathComponent("meta.json"),
+                            options: .atomic)
+        }
+    }
+
+    /// Move `dir` under `root/<subdir>/`, de-duping the destination name on
+    /// collision. Shared by `giveUp` and the quarantine path.
+    private static func preserve(_ dir: URL, under subdir: String) -> URL? {
+        let fm = FileManager.default
+        let parent = URL(fileURLWithPath: root).appendingPathComponent(subdir)
+        try? fm.createDirectory(at: parent, withIntermediateDirectories: true)
+        var dst = parent.appendingPathComponent(dir.lastPathComponent)
+        var n = 2
+        while fm.fileExists(atPath: dst.path) {
+            dst = parent.appendingPathComponent("\(dir.lastPathComponent)-\(n)")
+            n += 1
+        }
+        do {
+            try fm.moveItem(at: dir, to: dst)
+            return dst
+        } catch {
+            Log.error("Backlog: could not preserve \(dir.lastPathComponent) under \(subdir)/: \(error.localizedDescription)")
+            return nil
         }
     }
 
@@ -118,25 +153,44 @@ enum Backlog {
     /// preserved directory, or nil if the move failed — the entry then stays
     /// queued and the next drain retries the move.
     static func giveUp(_ entry: Entry) -> URL? {
+        preserve(entry.dir, under: givenUpDirName)
+    }
+
+    /// Bound `given-up/` to `givenUpCapBytes` total: prune the OLDEST entries
+    /// (they've already failed `Pipeline.maxAttempts` retries and have sat
+    /// unclaimed the longest) until the newest fit under the cap. Deletion is
+    /// logged per entry — this is the only place backlog data is ever
+    /// destroyed. Called from `Pipeline.drain`.
+    static func pruneGivenUp(capBytes: Int64 = givenUpCapBytes) {
         let fm = FileManager.default
         let parent = URL(fileURLWithPath: root).appendingPathComponent(givenUpDirName)
-        try? fm.createDirectory(at: parent, withIntermediateDirectories: true)
-        var dst = parent.appendingPathComponent(entry.dir.lastPathComponent)
-        var n = 2
-        while fm.fileExists(atPath: dst.path) {
-            dst = parent.appendingPathComponent("\(entry.dir.lastPathComponent)-\(n)")
-            n += 1
+        guard let dirs = try? fm.contentsOfDirectory(
+            at: parent, includingPropertiesForKeys: [.isDirectoryKey]) else { return }
+        func dirSize(_ d: URL) -> Int64 {
+            (try? fm.contentsOfDirectory(at: d, includingPropertiesForKeys: [.fileSizeKey]))?
+                .compactMap { Int64((try? $0.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0) }
+                .reduce(0, +) ?? 0
         }
-        do {
-            try fm.moveItem(at: entry.dir, to: dst)
-            return dst
-        } catch {
-            Log.error("Backlog: could not preserve \(entry.dir.lastPathComponent): \(error.localizedDescription)")
-            return nil
+        // Entry dirs are stamped yyyy-MM-dd_HH-mm-ss, so name order is age order.
+        let sized = dirs
+            .filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true }
+            .sorted { $0.lastPathComponent > $1.lastPathComponent }   // newest first
+            .map { (dir: $0, bytes: dirSize($0)) }
+        var kept: Int64 = 0
+        for e in sized {
+            kept += e.bytes
+            if kept > capBytes {
+                Log.warn("Backlog: pruning given-up entry \(e.dir.lastPathComponent) (\(mbString(e.bytes))) — given-up/ exceeded \(mbString(capBytes)).")
+                try? fm.removeItem(at: e.dir)
+            }
         }
     }
 
-    /// Pending entries, oldest first.
+    /// Pending entries, oldest first. A directory whose meta.json is missing
+    /// or undecodable is NOT silently skipped: once it has sat untouched for
+    /// `quarantineAfterSeconds` (so a mid-write enqueue is never swept), it is
+    /// moved to `quarantine/` with a loud log so the user can inspect it —
+    /// invisible-forever entries were the old failure mode.
     static func entries() -> [Entry] {
         guard let dirs = try? FileManager.default.contentsOfDirectory(
             at: URL(fileURLWithPath: root),
@@ -144,31 +198,47 @@ enum Backlog {
         var result: [Entry] = []
         for d in dirs {
             var isDir: ObjCBool = false
-            guard d.lastPathComponent != givenUpDirName,   // preserved, never retried
+            guard d.lastPathComponent != givenUpDirName,     // preserved, never retried
+                  d.lastPathComponent != quarantineDirName,  // undecodable, kept visible
                   FileManager.default.fileExists(atPath: d.path, isDirectory: &isDir),
-                  isDir.boolValue,
-                  let data = try? Data(contentsOf: d.appendingPathComponent("meta.json")),
-                  let meta = try? JSONDecoder().decode(Meta.self, from: data)
+                  isDir.boolValue
             else { continue }
+            guard let data = try? Data(contentsOf: d.appendingPathComponent("meta.json")),
+                  let meta = try? JSONDecoder().decode(Meta.self, from: data)
+            else {
+                quarantineIfStale(d)
+                continue
+            }
             result.append(Entry(dir: d, meta: meta))
         }
         return result.sorted { $0.meta.startedAt < $1.meta.startedAt }
+    }
+
+    private static func quarantineIfStale(_ dir: URL) {
+        let age = -((try? dir.resourceValues(forKeys: [.contentModificationDateKey]))?
+            .contentModificationDate?.timeIntervalSinceNow ?? 0)
+        guard age > quarantineAfterSeconds else { return }
+        if let dst = preserve(dir, under: quarantineDirName) {
+            Log.warn("Backlog: entry \(dir.lastPathComponent) has no readable meta.json — moved to \(dst.path) for inspection. Re-queue with `ghostie process \"\(dst.path)\"` if the audio/transcript is intact.")
+        }
     }
 
     static var pendingCount: Int { entries().count }
 
     /// Cheap emptiness probe for the periodic retry timer: a single directory
     /// listing, no meta.json reads or JSON parsing. Every entry lives in its
-    /// own subdirectory, so "no subdirectories besides `given-up/`" is exactly
-    /// "nothing pending" — given-up entries are preserved forever and must not
-    /// keep the probe reporting non-empty. (A stray non-entry subdirectory at
-    /// worst costs one full `entries()` pass, which then ignores it as before.)
+    /// own subdirectory, so "no subdirectories besides `given-up/` and
+    /// `quarantine/`" is exactly "nothing pending" — both preserved folders
+    /// are kept indefinitely and must not keep the probe reporting non-empty.
+    /// (A stray non-entry subdirectory at worst costs one full `entries()`
+    /// pass, which then ignores it as before.)
     static var isEmpty: Bool {
         guard let items = try? FileManager.default.contentsOfDirectory(
             at: URL(fileURLWithPath: root),
             includingPropertiesForKeys: [.isDirectoryKey]) else { return true }
         return !items.contains {
             $0.lastPathComponent != givenUpDirName
+                && $0.lastPathComponent != quarantineDirName
                 && (try? $0.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true
         }
     }

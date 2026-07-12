@@ -21,7 +21,22 @@ func runProcess(_ path: String, _ args: [String],
     return (p.terminationStatus, String(data: data, encoding: .utf8) ?? "")
 }
 
-/// "512 MB" / "885 KB" — progress-line byte formatting.
+/// "1.1 GB" / "512 MB" / "885 KB" — progress-line byte formatting.
 func mbString(_ b: Int64) -> String {
-    b >= 1_000_000 ? "\(b / 1_000_000) MB" : "\(max(0, b) / 1000) KB"
+    if b >= 10_000_000_000 { return "\(b / 1_000_000_000) GB" }
+    if b >= 1_000_000_000 { return String(format: "%.1f GB", Double(b) / 1_000_000_000) }
+    return b >= 1_000_000 ? "\(b / 1_000_000) MB" : "\(max(0, b) / 1000) KB"
 }
+
+/// Free bytes on the volume holding `path` (importance-weighted capacity, so
+/// purgeable space counts), or nil when the volume can't be queried.
+func freeDiskBytes(at path: String) -> Int64? {
+    let url = URL(fileURLWithPath: path)
+    guard let v = try? url.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]),
+          let free = v.volumeAvailableCapacityForImportantUsage else { return nil }
+    return free
+}
+
+/// Below this, recording + backlog writes are at real risk of silent
+/// truncation (most writes are `try?`). Doctor fails and the recorder warns.
+let lowDiskThresholdBytes: Int64 = 1_000_000_000
