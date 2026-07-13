@@ -37,11 +37,16 @@ final class DetectionCoordinator {
     private static let changeDebounceSeconds: TimeInterval = 0.3
     private var running = false
     /// Lowercased main-app bundle IDs from `config.triggerBundleIds`. The
-    /// audio-side filter passes these through `matchesTeamsBundle` which
+    /// audio-side filter passes these through `matchesTriggerBundle` which
     /// extends each to also catch `bundle.<helper>` (so Teams helpers
     /// participate in audio attribution) without accidentally cross-matching
     /// (`com.microsoft.teams` does not absorb `com.microsoft.teams2`).
-    private let teamsBundleMatchers: [String]
+    private let triggerBundleMatchers: [String]
+    /// Lowercased browser bundle IDs eligible for the Teams-tab probe.
+    /// Empty when `detectBrowserTeams` is off — every browser branch in
+    /// `buildEvidenceLocked` then short-circuits.
+    private let browserMatchers: [String]
+    private let tabs: BrowserTabProvider
 
     var onCallStart: ((UUID) -> Void)?
     var onCallStop: ((UUID) -> Void)?
@@ -66,19 +71,28 @@ final class DetectionCoordinator {
          camera: CameraActivityProvider = CoreMediaIOCameraActivityProvider(),
          device: DefaultInputDeviceProvider = CoreAudioDefaultDeviceProvider(),
          presence: AppPresenceProvider? = nil,
+         tabs: BrowserTabProvider = AXBrowserTabProvider(),
          clock: Clock = SystemClock()) {
         let mainIds = config.triggerBundleIds.map { $0.lowercased() }
+        // Browser-Teams is opt-in: with it off the browser matcher list is
+        // empty and browsers never get CoreAudio listeners, presence
+        // tracking, or AX tab probes.
+        let browserIds = config.detectBrowserTeams
+            ? config.browserBundleIds.map { $0.lowercased() } : []
         self.config = config
-        self.audio = audio ?? CoreAudioActivityProvider(matchers: mainIds)
+        self.audio = audio ?? CoreAudioActivityProvider(matchers: mainIds + browserIds)
         self.ax = ax
         self.camera = camera
         self.device = device
+        self.tabs = tabs
         self.clock = clock
         var smConfig = CallStateMachine.Config()
         smConfig.endGraceSeconds = config.endGraceSeconds
         self.stateMachine = CallStateMachine(config: smConfig, clock: clock)
-        self.teamsBundleMatchers = mainIds
-        self.presence = presence ?? WorkspaceAppPresenceProvider(triggerBundleIds: mainIds)
+        self.triggerBundleMatchers = mainIds
+        self.browserMatchers = browserIds
+        self.presence = presence
+            ?? WorkspaceAppPresenceProvider(triggerBundleIds: mainIds + browserIds)
 
         if config.triggerBundlePrefixes != Config().triggerBundlePrefixes {
             Log.warn("config.triggerBundlePrefixes is deprecated and IGNORED. Detection now uses triggerBundleIds (exact match plus 'matcher.<helper>'). Migrate your config.")
@@ -86,17 +100,17 @@ final class DetectionCoordinator {
 
         stateMachine.onCallStart = { [weak self] sid in
             guard let self else { return }
-            Log.ok("Teams call detected (session \(sid.uuidString.prefix(8))) — starting capture.")
+            Log.ok("Call detected (session \(sid.uuidString.prefix(8))) — starting capture.")
             self.onCallStart?(sid)
         }
         stateMachine.onCallStop = { [weak self] sid in
             guard let self else { return }
-            Log.ok("Teams call ended (session \(sid.uuidString.prefix(8))) — finalizing.")
+            Log.ok("Call ended (session \(sid.uuidString.prefix(8))) — finalizing.")
             self.onCallStop?(sid)
         }
         stateMachine.onTentativeStart = { [weak self] sid in
             guard let self else { return }
-            Log.info("Possible Teams call (session \(sid.uuidString.prefix(8))) — tentative capture started.")
+            Log.info("Possible call (session \(sid.uuidString.prefix(8))) — tentative capture started.")
             self.onTentativeStart?(sid)
         }
         stateMachine.onTentativeDiscard = { [weak self] sid in
@@ -127,7 +141,7 @@ final class DetectionCoordinator {
                     // quiescence window runs from notification arrival, not
                     // from the debounced evaluate ~300 ms later.
                     self.lastDeviceSwapAt = self.clock.now
-                    Log.info("detector: default input device changed; entering \(Int(Self.deviceSwapQuiescenceSeconds))s swap quiescence.")
+                    Log.info("detector: audio device topology changed; entering \(Int(Self.deviceSwapQuiescenceSeconds))s swap quiescence.")
                     self.scheduleEvaluate()
                 }
             }
@@ -195,7 +209,12 @@ final class DetectionCoordinator {
     /// reads `lastDeviceSwapAt` without locking and is used by `evaluate()`
     /// and `snapshot()` (which both arrange to be on the queue first).
     private func buildEvidenceLocked() -> CallEvidence {
-        let mainPids = presence.teamsApps().map(\.pid).sorted()
+        let allApps = presence.triggerApps().sorted { $0.pid < $1.pid }
+        // Browsers only ever qualify through the tab probe; native trigger
+        // apps (Teams, Zoom) qualify by bundle alone.
+        let nativeApps = allApps.filter {
+            !browserMatchers.contains($0.bundleId.lowercased())
+        }
         let audioProcs = audio.snapshot()
         // AX gate: the meeting-window walk is synchronous IPC into the Teams
         // Electron process, and the state machine consults AX purely as a
@@ -210,17 +229,41 @@ final class DetectionCoordinator {
         // first observes primary already re-queries AX. Reading
         // `stateMachine.stage` here is safe — the machine is only mutated on
         // `queue` (evaluate/forceStop) and this method requires `queue` too.
-        let primaryAudio = audioProcs.contains { p in
+        let primaryNativeAudio = audioProcs.contains { p in
             guard let b = p.bundleId else { return false }
             return p.isRunningInput
-                && Self.matchesTeamsBundle(b, matchers: teamsBundleMatchers)
+                && Self.matchesTriggerBundle(b, matchers: triggerBundleMatchers)
         }
+        // Browser-Teams (opt-in): the tab probe runs under the same cost
+        // gate as the meeting-window walk — only when a browser is actually
+        // using the mic (or a session is already past idle) do we pay the
+        // AX title read. A browser PID is then eligible as primary only
+        // while one of its windows shows a Teams meeting tab.
+        var browserTabPids: [pid_t] = []
+        if !browserMatchers.isEmpty {
+            let browserApps = allApps.filter {
+                browserMatchers.contains($0.bundleId.lowercased())
+            }
+            let browserMicInUse = audioProcs.contains { p in
+                guard let b = p.bundleId else { return false }
+                return p.isRunningInput
+                    && Self.matchesTriggerBundle(b, matchers: browserMatchers)
+            }
+            if !browserApps.isEmpty,
+               browserMicInUse || stateMachine.stage != .idle {
+                browserTabPids = tabs.pidsWithMeetingTab(browsers: browserApps)
+            }
+        }
+        let primaryAudio = primaryNativeAudio || !browserTabPids.isEmpty
         let meetingWindow: MeetingWindowMatch =
             (stateMachine.stage == .idle && !primaryAudio)
             ? .unavailable(reason: "not queried (idle, no primary signal)")
-            : Self.resolveMeetingWindow(ax: ax, pids: mainPids)
-        let cameraPids: [pid_t] = (camera.anyCameraRunning() && !mainPids.isEmpty)
-            ? mainPids : []
+            : Self.resolveMeetingWindow(ax: ax, apps: nativeApps)
+        // Camera gating covers native trigger apps and any browser that is
+        // in a meeting tab (camera stays a tie-breaker either way).
+        let cameraEligiblePids = nativeApps.map(\.pid) + browserTabPids
+        let cameraPids: [pid_t] = (camera.anyCameraRunning() && !cameraEligiblePids.isEmpty)
+            ? cameraEligiblePids.sorted() : []
         let now = clock.now
         let inQuiescence: Bool = {
             guard let t = lastDeviceSwapAt else { return false }
@@ -229,7 +272,9 @@ final class DetectionCoordinator {
         return Self.buildEvidence(
             audio: audioProcs,
             now: now,
-            matchers: teamsBundleMatchers,
+            matchers: triggerBundleMatchers,
+            browserMatchers: browserMatchers,
+            browserTabPids: browserTabPids,
             defaultDeviceId: device.currentDeviceId(),
             meetingWindow: meetingWindow,
             cameraPids: cameraPids,
@@ -237,22 +282,24 @@ final class DetectionCoordinator {
         )
     }
 
-    /// Walk each Teams main PID and return the first matched meeting window.
-    /// `.unavailable` propagates only when **every** queried PID was
-    /// unavailable; if even one PID was successfully introspected and just
-    /// did not match, that's `.notMatched`, not unavailable. (A transient
-    /// launching or quitting Teams instance must not poison a clean read.)
+    /// Walk each trigger-app main PID and return the first matched meeting
+    /// window (heuristics are selected per app by bundle id — Teams and Zoom
+    /// have different title shapes). `.unavailable` propagates only when
+    /// **every** queried PID was unavailable; if even one PID was
+    /// successfully introspected and just did not match, that's
+    /// `.notMatched`, not unavailable. (A transient launching or quitting
+    /// instance must not poison a clean read.)
     // Internal (not private) for the selftest.
     static func resolveMeetingWindow(ax: MeetingWindowProvider,
-                                     pids: [pid_t]) -> MeetingWindowMatch {
-        if pids.isEmpty {
+                                     apps: [RunningAppInfo]) -> MeetingWindowMatch {
+        if apps.isEmpty {
             return ax.permissionGranted ? .notMatched
                 : .unavailable(reason: "Accessibility permission not granted")
         }
         var sawIntrospectable = false
         var lastUnavailableReason: String?
-        for pid in pids {
-            switch ax.teamsHasMeetingWindow(mainAppPid: pid) {
+        for app in apps {
+            switch ax.hasMeetingWindow(mainAppPid: app.pid, bundleId: app.bundleId) {
             case .matched(let r, let v):
                 return .matched(reason: r, heuristicsVersion: v)
             case .notMatched:
@@ -262,7 +309,7 @@ final class DetectionCoordinator {
             }
         }
         if sawIntrospectable { return .notMatched }
-        return .unavailable(reason: lastUnavailableReason ?? "no introspectable Teams app")
+        return .unavailable(reason: lastUnavailableReason ?? "no introspectable trigger app")
     }
 
     // Note: deliberately no public `stage` / `sessionId` / `transitions`
@@ -319,7 +366,7 @@ final class DetectionCoordinator {
     /// Exact match or `matcher.<helper>`. Prevents `com.microsoft.teams` from
     /// accidentally matching `com.microsoft.teams2` (which the pure-prefix
     /// form would). Used both by the audio-side filter here and by `doctor`.
-    static func matchesTeamsBundle(_ bundleId: String, matchers: [String]) -> Bool {
+    static func matchesTriggerBundle(_ bundleId: String, matchers: [String]) -> Bool {
         let b = bundleId.lowercased()
         return matchers.contains(where: { b == $0 || b.hasPrefix($0 + ".") })
     }
@@ -327,23 +374,29 @@ final class DetectionCoordinator {
     static func buildEvidence(audio: [AudioProcessInfo],
                               now: VirtualTime,
                               matchers: [String],
+                              browserMatchers: [String] = [],
+                              browserTabPids: [pid_t] = [],
                               defaultDeviceId: AudioDeviceID?,
                               meetingWindow: MeetingWindowMatch,
                               cameraPids: [pid_t],
                               deviceSwapWithinLast3s: Bool) -> CallEvidence {
-        let teamsProcs = audio.filter { p in
+        let triggerProcs = audio.filter { p in
             guard let b = p.bundleId?.lowercased() else { return false }
-            return matchesTeamsBundle(b, matchers: matchers)
+            if matchesTriggerBundle(b, matchers: matchers) { return true }
+            // A browser process only counts while its app currently shows a
+            // Teams meeting tab — plain web-mic use never qualifies.
+            return matchesTriggerBundle(b, matchers: browserMatchers)
+                && browserTabPids.contains(p.pid)
         }
-        let inputPids = teamsProcs.filter(\.isRunningInput).map(\.pid)
-        let outputPids = teamsProcs.filter(\.isRunningOutput).map(\.pid)
-        let allTeamsPids = Array(Set(teamsProcs.map(\.pid))).sorted()
+        let inputPids = triggerProcs.filter(\.isRunningInput).map(\.pid)
+        let outputPids = triggerProcs.filter(\.isRunningOutput).map(\.pid)
+        let allTriggerPids = Array(Set(triggerProcs.map(\.pid))).sorted()
         return CallEvidence(
             timestamp: now,
-            teamsMainPids: allTeamsPids,
-            teamsInputPids: inputPids.sorted(),
-            teamsOutputPids: outputPids.sorted(),
-            teamsCameraPids: cameraPids.sorted(),
+            triggerMainPids: allTriggerPids,
+            triggerInputPids: inputPids.sorted(),
+            triggerOutputPids: outputPids.sorted(),
+            triggerCameraPids: cameraPids.sorted(),
             meetingWindow: meetingWindow,
             defaultInputDeviceId: defaultDeviceId,
             deviceSwapWithinLast3s: deviceSwapWithinLast3s

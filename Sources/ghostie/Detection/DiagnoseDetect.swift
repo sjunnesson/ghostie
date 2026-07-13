@@ -86,10 +86,10 @@ enum DiagnoseDetect {
             meeting = ["status": "unavailable", "reason": reason]
         }
         return [
-            "teams_main_pids": ev.teamsMainPids,
-            "teams_input_pids": ev.teamsInputPids,
-            "teams_output_pids": ev.teamsOutputPids,
-            "teams_camera_pids": ev.teamsCameraPids,
+            "trigger_main_pids": ev.triggerMainPids,
+            "trigger_input_pids": ev.triggerInputPids,
+            "trigger_output_pids": ev.triggerOutputPids,
+            "trigger_camera_pids": ev.triggerCameraPids,
             "meeting_window": meeting,
             "default_input_device_id": (ev.defaultInputDeviceId.map { Int($0) as Any }) ?? NSNull(),
             "device_swap_within_last_3s": ev.deviceSwapWithinLast3s,

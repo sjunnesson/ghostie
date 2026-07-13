@@ -16,10 +16,11 @@ import ApplicationServices
 ///     `.unavailable` and the rest of the pipeline still works.
 final class AXMeetingWindowProvider: MeetingWindowProvider {
 
-    private let heuristics: MeetingWindowHeuristics
+    /// Test override; nil (production) selects per-app rules by bundle id.
+    private let heuristicsOverride: MeetingWindowHeuristics?
 
-    init(heuristics: MeetingWindowHeuristics = .default) {
-        self.heuristics = heuristics
+    init(heuristics: MeetingWindowHeuristics? = nil) {
+        self.heuristicsOverride = heuristics
     }
 
     var permissionGranted: Bool { AXIsProcessTrusted() }
@@ -31,7 +32,8 @@ final class AXMeetingWindowProvider: MeetingWindowProvider {
         return AXIsProcessTrustedWithOptions(options as CFDictionary)
     }
 
-    func teamsHasMeetingWindow(mainAppPid: pid_t) -> MeetingWindowMatch {
+    func hasMeetingWindow(mainAppPid: pid_t, bundleId: String) -> MeetingWindowMatch {
+        let heuristics = heuristicsOverride ?? MeetingWindowHeuristics.forBundleId(bundleId)
         guard permissionGranted else {
             return .unavailable(reason: "Accessibility permission not granted")
         }

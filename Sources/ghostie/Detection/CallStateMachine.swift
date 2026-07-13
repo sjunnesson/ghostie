@@ -163,8 +163,8 @@ final class CallStateMachine {
     func forceStop(reason: String = "external stop") {
         let now = clock.now
         let ev = lastEvidence ?? CallEvidence(
-            timestamp: now, teamsMainPids: [], teamsInputPids: [],
-            teamsOutputPids: [], teamsCameraPids: [], meetingWindow: .notMatched,
+            timestamp: now, triggerMainPids: [], triggerInputPids: [],
+            triggerOutputPids: [], triggerCameraPids: [], meetingWindow: .notMatched,
             defaultInputDeviceId: nil, deviceSwapWithinLast3s: false)
         if stage != .idle {
             enter(.idle, at: now, evidence: ev, reason: reason)

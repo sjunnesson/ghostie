@@ -53,32 +53,32 @@ enum MeetingWindowMatch: Equatable {
 /// `CallStateMachine.evaluate(evidence:)`.
 struct CallEvidence: Equatable {
     let timestamp: VirtualTime
-    let teamsMainPids: [pid_t]
-    let teamsInputPids: [pid_t]
-    let teamsOutputPids: [pid_t]
-    let teamsCameraPids: [pid_t]
+    let triggerMainPids: [pid_t]
+    let triggerInputPids: [pid_t]
+    let triggerOutputPids: [pid_t]
+    let triggerCameraPids: [pid_t]
     let meetingWindow: MeetingWindowMatch
     let defaultInputDeviceId: AudioDeviceID?
     let deviceSwapWithinLast3s: Bool
 
     /// Primary signal: any Teams PID currently doing input I/O.
-    var primarySignal: Bool { !teamsInputPids.isEmpty }
+    var primarySignal: Bool { !triggerInputPids.isEmpty }
 
     /// Independent corroborators. The state machine requires the primary
     /// signal plus at least one of these to promote to `confirmed`.
     ///
     /// Camera is intentionally a **tie-breaker**, not a stand-alone signal:
     /// CoreMediaIO does not expose per-PID camera attribution publicly, so
-    /// `teamsCameraPids` is approximated as "any camera in use AND Teams main
+    /// `triggerCameraPids` is approximated as "any camera in use AND Teams main
     /// app present". Treating that as a stand-alone corroborator opens a
     /// false-confirm path where Teams briefly holds the mic (a settings
     /// "test your mic" panel, a notification chime) while Zoom holds the
     /// camera. Camera only counts when something stronger already does.
     var corroborators: Set<String> {
         var s: Set<String> = []
-        if !teamsOutputPids.isEmpty { s.insert("output") }
+        if !triggerOutputPids.isEmpty { s.insert("output") }
         if meetingWindow.isMatched { s.insert("ax") }
-        if !teamsCameraPids.isEmpty && !s.isEmpty { s.insert("camera") }
+        if !triggerCameraPids.isEmpty && !s.isEmpty { s.insert("camera") }
         return s
     }
 
@@ -86,9 +86,9 @@ struct CallEvidence: Equatable {
 
     /// One-line summary used in transition logs and the `diagnose-detect` CLI.
     var summary: String {
-        let inp = teamsInputPids.map(String.init).joined(separator: ",")
-        let out = teamsOutputPids.map(String.init).joined(separator: ",")
-        let cam = teamsCameraPids.map(String.init).joined(separator: ",")
+        let inp = triggerInputPids.map(String.init).joined(separator: ",")
+        let out = triggerOutputPids.map(String.init).joined(separator: ",")
+        let cam = triggerCameraPids.map(String.init).joined(separator: ",")
         let ax: String = {
             switch meetingWindow {
             case .matched(let r, let v): return "ax(matched v\(v):\(r))"

@@ -12,7 +12,7 @@ func runDetectorStateMachineSelfTest() -> Bool {
     }
 
     // Convenience: build an evidence snapshot. The state machine only cares
-    // about primarySignal (teamsInputPids non-empty) and corroborators
+    // about primarySignal (triggerInputPids non-empty) and corroborators
     // (output / camera / ax) — all other fields are passed through for logs.
     func ev(at t: VirtualTime,
             input: Bool, output: Bool = false,
@@ -25,8 +25,8 @@ func runDetectorStateMachineSelfTest() -> Bool {
             ? .matched(reason: "title:Meeting", heuristicsVersion: 1)
             : .notMatched
         return CallEvidence(
-            timestamp: t, teamsMainPids: pids, teamsInputPids: pids,
-            teamsOutputPids: outs, teamsCameraPids: cams,
+            timestamp: t, triggerMainPids: pids, triggerInputPids: pids,
+            triggerOutputPids: outs, triggerCameraPids: cams,
             meetingWindow: m, defaultInputDeviceId: 42,
             deviceSwapWithinLast3s: swap)
     }
@@ -250,8 +250,8 @@ func runDetectorStateMachineSelfTest() -> Bool {
         drive(sm, clock, for: 4) { ev(at: $0, input: true, output: true) }
         check("clean-end: setup confirmed", sm.stage == .confirmed)
         drive(sm, clock, for: 31) { _ in
-            CallEvidence(timestamp: 0, teamsMainPids: [], teamsInputPids: [],
-                         teamsOutputPids: [], teamsCameraPids: [],
+            CallEvidence(timestamp: 0, triggerMainPids: [], triggerInputPids: [],
+                         triggerOutputPids: [], triggerCameraPids: [],
                          meetingWindow: .notMatched, defaultInputDeviceId: nil,
                          deviceSwapWithinLast3s: false)
         }
@@ -310,9 +310,9 @@ func runDetectorStateMachineSelfTest() -> Bool {
         let (sm, clock, starts, _) = newMachine()
         let unavailable = MeetingWindowMatch.unavailable(reason: "permission denied")
         drive(sm, clock, for: 3.5) { t in
-            CallEvidence(timestamp: t, teamsMainPids: [1234],
-                         teamsInputPids: [1234], teamsOutputPids: [1234],
-                         teamsCameraPids: [], meetingWindow: unavailable,
+            CallEvidence(timestamp: t, triggerMainPids: [1234],
+                         triggerInputPids: [1234], triggerOutputPids: [1234],
+                         triggerCameraPids: [], meetingWindow: unavailable,
                          defaultInputDeviceId: 42, deviceSwapWithinLast3s: false)
         }
         check("ax-unavailable: output corroborator still promotes",
@@ -327,9 +327,9 @@ func runDetectorStateMachineSelfTest() -> Bool {
         check("ax-revoke: confirmed before revocation", sm.stage == .confirmed)
         let unavailable = MeetingWindowMatch.unavailable(reason: "revoked")
         drive(sm, clock, for: 10) { t in
-            CallEvidence(timestamp: t, teamsMainPids: [1234],
-                         teamsInputPids: [1234], teamsOutputPids: [1234],
-                         teamsCameraPids: [], meetingWindow: unavailable,
+            CallEvidence(timestamp: t, triggerMainPids: [1234],
+                         triggerInputPids: [1234], triggerOutputPids: [1234],
+                         triggerCameraPids: [], meetingWindow: unavailable,
                          defaultInputDeviceId: 42, deviceSwapWithinLast3s: false)
         }
         check("ax-revoke: continues, no stop emitted",
@@ -453,6 +453,35 @@ func runDetectorStateMachineSelfTest() -> Bool {
             check("heuristics v1: \(name)", got == expect,
                   "expected \(expect), got \(got)")
         }
+
+        // Per-app rule selection + the Zoom set. Zoom titles must match only
+        // under the Zoom rules, and the selector must route by bundle id.
+        let zoom = MeetingWindowHeuristics.zoomV1
+        let zoomFixtures: [(name: String, attrs: A, expect: Bool)] = [
+            ("in-meeting window matches",
+             A(title: "Zoom Meeting", roleDescription: "standard window", subrole: "AXStandardWindow"),
+             true),
+            ("webinar window matches",
+             A(title: "Zoom Webinar", roleDescription: "standard window", subrole: "AXStandardWindow"),
+             true),
+            ("main Zoom home window does not match",
+             A(title: "Zoom Workplace", roleDescription: "standard window", subrole: "AXStandardWindow"),
+             false),
+            ("settings window does not match",
+             A(title: "Settings", roleDescription: "standard window", subrole: "AXStandardWindow"),
+             false),
+        ]
+        for (name, attrs, expect) in zoomFixtures {
+            let got = zoom.evaluate(attrs) != nil
+            check("heuristics zoomV1: \(name)", got == expect,
+                  "expected \(expect), got \(got)")
+        }
+        check("heuristics: Teams rules ignore Zoom's meeting title",
+              v1.evaluate(A(title: "Zoom Meeting", roleDescription: "standard window",
+                            subrole: "AXStandardWindow")) == nil)
+        check("heuristics selector: zoom bundle → zoom rules, teams bundle → teams rules",
+              MeetingWindowHeuristics.forBundleId("us.zoom.xos").rules.count == zoom.rules.count
+              && MeetingWindowHeuristics.forBundleId("com.microsoft.teams2").rules.count == v1.rules.count)
     }
 
     // 17b. Pure coordinator transforms: bundle matcher, evidence builder,
@@ -460,16 +489,16 @@ func runDetectorStateMachineSelfTest() -> Bool {
     do {
         let m = ["com.microsoft.teams", "com.microsoft.teams2"]
         check("matcher: exact id matches",
-              DetectionCoordinator.matchesTeamsBundle("com.microsoft.teams", matchers: m))
+              DetectionCoordinator.matchesTriggerBundle("com.microsoft.teams", matchers: m))
         check("matcher: classic prefix does not swallow new Teams",
-              DetectionCoordinator.matchesTeamsBundle("com.microsoft.teams2", matchers: ["com.microsoft.teams2"])
-              && !DetectionCoordinator.matchesTeamsBundle("com.microsoft.teams2", matchers: ["com.microsoft.teams"]))
+              DetectionCoordinator.matchesTriggerBundle("com.microsoft.teams2", matchers: ["com.microsoft.teams2"])
+              && !DetectionCoordinator.matchesTriggerBundle("com.microsoft.teams2", matchers: ["com.microsoft.teams"]))
         check("matcher: helper matches via dot-prefix",
-              DetectionCoordinator.matchesTeamsBundle("com.microsoft.teams2.helper.plugin", matchers: m))
+              DetectionCoordinator.matchesTriggerBundle("com.microsoft.teams2.helper.plugin", matchers: m))
         check("matcher: unrelated bundle rejected",
-              !DetectionCoordinator.matchesTeamsBundle("com.apple.safari", matchers: m))
+              !DetectionCoordinator.matchesTriggerBundle("com.apple.safari", matchers: m))
         check("matcher: case-insensitive",
-              DetectionCoordinator.matchesTeamsBundle("Com.Microsoft.Teams2.Helper", matchers: m))
+              DetectionCoordinator.matchesTriggerBundle("Com.Microsoft.Teams2.Helper", matchers: m))
 
         let procs = [
             AudioProcessInfo(pid: 10, bundleId: "com.microsoft.teams2", isRunningInput: true, isRunningOutput: false),
@@ -481,9 +510,9 @@ func runDetectorStateMachineSelfTest() -> Bool {
             audio: procs, now: 0, matchers: m, defaultDeviceId: 42,
             meetingWindow: .notMatched, cameraPids: [], deviceSwapWithinLast3s: false)
         check("buildEvidence: input/output PIDs filtered to Teams and sorted",
-              e.teamsInputPids == [10] && e.teamsOutputPids == [11]
-              && e.teamsMainPids == [10, 11],
-              "in=\(e.teamsInputPids) out=\(e.teamsOutputPids) all=\(e.teamsMainPids)")
+              e.triggerInputPids == [10] && e.triggerOutputPids == [11]
+              && e.triggerMainPids == [10, 11],
+              "in=\(e.triggerInputPids) out=\(e.triggerOutputPids) all=\(e.triggerMainPids)")
 
         func isUnavailable(_ m: MeetingWindowMatch) -> Bool {
             if case .unavailable = m { return true } else { return false }
@@ -491,20 +520,20 @@ func runDetectorStateMachineSelfTest() -> Bool {
         let ax = FakeDetectionWorld.AX()
         ax.granted = false
         check("resolveMeetingWindow: no PIDs + denied → unavailable",
-              isUnavailable(DetectionCoordinator.resolveMeetingWindow(ax: ax, pids: [])))
+              isUnavailable(DetectionCoordinator.resolveMeetingWindow(ax: ax, apps: [])))
         ax.granted = true
         check("resolveMeetingWindow: no PIDs + granted → notMatched",
-              DetectionCoordinator.resolveMeetingWindow(ax: ax, pids: []) == .notMatched)
+              DetectionCoordinator.resolveMeetingWindow(ax: ax, apps: []) == .notMatched)
         ax.perPid = [1: .unavailable(reason: "launching"), 2: .notMatched]
         check("resolveMeetingWindow: one clean read beats a transient unavailable",
-              DetectionCoordinator.resolveMeetingWindow(ax: ax, pids: [1, 2]) == .notMatched)
+              DetectionCoordinator.resolveMeetingWindow(ax: ax, apps: [RunningAppInfo(pid: 1, bundleId: "com.microsoft.teams2"), RunningAppInfo(pid: 2, bundleId: "com.microsoft.teams2")]) == .notMatched)
         ax.perPid = [1: .unavailable(reason: "launching"),
                      2: .matched(reason: "title", heuristicsVersion: 1)]
         check("resolveMeetingWindow: matched wins",
-              DetectionCoordinator.resolveMeetingWindow(ax: ax, pids: [1, 2]).isMatched)
+              DetectionCoordinator.resolveMeetingWindow(ax: ax, apps: [RunningAppInfo(pid: 1, bundleId: "com.microsoft.teams2"), RunningAppInfo(pid: 2, bundleId: "com.microsoft.teams2")]).isMatched)
         ax.perPid = [1: .unavailable(reason: "a"), 2: .unavailable(reason: "b")]
         check("resolveMeetingWindow: all unavailable propagates unavailable",
-              isUnavailable(DetectionCoordinator.resolveMeetingWindow(ax: ax, pids: [1, 2])))
+              isUnavailable(DetectionCoordinator.resolveMeetingWindow(ax: ax, apps: [RunningAppInfo(pid: 1, bundleId: "com.microsoft.teams2"), RunningAppInfo(pid: 2, bundleId: "com.microsoft.teams2")])))
     }
 
     // 17c. Full lifecycle through a REAL coordinator wired to
@@ -589,6 +618,100 @@ func runDetectorStateMachineSelfTest() -> Bool {
               "discard=\(c.get("discard")) start=\(c.get("start")) stop=\(c.get("stop"))")
 
         coord.stop()
+    }
+
+    // 17d. Browser-Teams detection (opt-in). A browser's mic use counts as
+    //      primary ONLY while its window shows a Teams meeting tab; with the
+    //      flag off, browsers are invisible to the detector entirely.
+    do {
+        check("browser tab title: meeting tab matches",
+              AXBrowserTabProvider.titleLooksLikeMeetingTab("Meeting in Weekly Sync | Microsoft Teams — Google Chrome"))
+        check("browser tab title: call tab matches",
+              AXBrowserTabProvider.titleLooksLikeMeetingTab("Call with David | Microsoft Teams"))
+        check("browser tab title: background chat tab does not match",
+              !AXBrowserTabProvider.titleLooksLikeMeetingTab("Chat | Microsoft Teams — Google Chrome"))
+        check("browser tab title: unrelated meeting page does not match",
+              !AXBrowserTabProvider.titleLooksLikeMeetingTab("Meeting notes - Google Docs"))
+
+        // buildEvidence: a browser proc with input only counts when its pid
+        // is in browserTabPids.
+        let browserProcs = [
+            AudioProcessInfo(pid: 300, bundleId: "com.google.chrome.helper",
+                             isRunningInput: true, isRunningOutput: true),
+        ]
+        let without = DetectionCoordinator.buildEvidence(
+            audio: browserProcs, now: 0, matchers: ["com.microsoft.teams2"],
+            browserMatchers: ["com.google.chrome"], browserTabPids: [],
+            defaultDeviceId: 42, meetingWindow: .notMatched,
+            cameraPids: [], deviceSwapWithinLast3s: false)
+        let with = DetectionCoordinator.buildEvidence(
+            audio: browserProcs, now: 0, matchers: ["com.microsoft.teams2"],
+            browserMatchers: ["com.google.chrome"], browserTabPids: [300],
+            defaultDeviceId: 42, meetingWindow: .notMatched,
+            cameraPids: [], deviceSwapWithinLast3s: false)
+        check("buildEvidence: browser mic without meeting tab is not primary",
+              !without.primarySignal && without.triggerInputPids.isEmpty)
+        check("buildEvidence: browser mic + meeting tab is primary with output corroborator",
+              with.primarySignal && with.triggerInputPids == [300]
+              && with.corroborators.contains("output"))
+
+        // Full coordinator lifecycle: Chrome in a Teams meeting tab confirms;
+        // closing the tab (probe returns nothing) ends the call.
+        final class Counters: @unchecked Sendable {
+            private let lock = NSLock()
+            private var counts: [String: Int] = [:]
+            func bump(_ k: String) { lock.withLock { counts[k, default: 0] += 1 } }
+            func get(_ k: String) -> Int { lock.withLock { counts[k] ?? 0 } }
+        }
+        let world = FakeDetectionWorld()
+        var cfg = Config()
+        cfg.detectBrowserTeams = true
+        let coord = world.makeCoordinator(config: cfg)
+        let c = Counters()
+        coord.onCallStart = { _ in c.bump("start") }
+        coord.onCallStop = { _ in c.bump("stop") }
+        func settle() { world.audio.notify(); Thread.sleep(forTimeInterval: 0.45) }
+
+        world.presence.apps = [RunningAppInfo(pid: 300, bundleId: "com.google.chrome")]
+        world.audio.procs = [AudioProcessInfo(pid: 300, bundleId: "com.google.chrome.helper",
+                                              isRunningInput: true, isRunningOutput: true)]
+        coord.start()
+        Thread.sleep(forTimeInterval: 0.2)
+        check("browser coordinator: mic use with NO meeting tab stays idle",
+              coord.snapshot().stage == .idle, "stage=\(coord.snapshot().stage)")
+
+        world.tabs.pids = [300]
+        settle()
+        world.clock.advance(by: 3.5)
+        settle()
+        check("browser coordinator: meeting tab + mic + output confirms",
+              coord.snapshot().stage == .confirmed && c.get("start") == 1,
+              "stage=\(coord.snapshot().stage) start=\(c.get("start"))")
+
+        world.tabs.pids = []
+        settle()
+        world.clock.advance(by: 31)
+        settle()
+        check("browser coordinator: tab closed → grace → stop",
+              coord.snapshot().stage == .idle && c.get("stop") == 1,
+              "stage=\(coord.snapshot().stage) stop=\(c.get("stop"))")
+        coord.stop()
+
+        // Flag off: identical world, browser never becomes a candidate.
+        let world2 = FakeDetectionWorld()
+        let coord2 = world2.makeCoordinator()   // detectBrowserTeams defaults false
+        world2.presence.apps = [RunningAppInfo(pid: 300, bundleId: "com.google.chrome")]
+        world2.audio.procs = [AudioProcessInfo(pid: 300, bundleId: "com.google.chrome.helper",
+                                               isRunningInput: true, isRunningOutput: true)]
+        world2.tabs.pids = [300]
+        coord2.start()
+        Thread.sleep(forTimeInterval: 0.2)
+        world2.audio.notify()
+        Thread.sleep(forTimeInterval: 0.45)
+        check("browser coordinator: flag off → browser is invisible",
+              coord2.snapshot().stage == .idle,
+              "stage=\(coord2.snapshot().stage)")
+        coord2.stop()
     }
 
     // 18. diagnose-detect --json emits line-delimited JSON that round-trips

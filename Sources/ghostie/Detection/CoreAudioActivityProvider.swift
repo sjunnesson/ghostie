@@ -16,7 +16,7 @@ import AppKit
 /// Cost model: the process-LIST listener stays unscoped (it must fire when a
 /// new Teams helper launches), but per-process IsRunningInput/Output listeners
 /// are installed **only** on processes whose bundle ID matches the injected
-/// Teams matchers (`DetectionCoordinator.matchesTeamsBundle` semantics: exact
+/// Teams matchers (`DetectionCoordinator.matchesTriggerBundle` semantics: exact
 /// or `matcher.<helper>`). Spotify starting playback therefore fires nothing.
 ///
 /// `snapshot()` is a cheap read of an incrementally-maintained cache:
@@ -38,7 +38,7 @@ final class CoreAudioActivityProvider: AudioActivityProvider {
     private let stateLock = NSLock()
     private let fanout = ChangeFanout()
     /// Lowercased Teams main-app bundle IDs (same list the coordinator feeds
-    /// `matchesTeamsBundle`, so helpers count too).
+    /// `matchesTriggerBundle`, so helpers count too).
     private let matchers: [String]
     private var perProcessTeardowns: [AudioObjectID: () -> Void] = [:]
     /// The incrementally-maintained snapshot: one entry per *matching* audio
@@ -157,7 +157,7 @@ final class CoreAudioActivityProvider: AudioActivityProvider {
     private func examine(_ obj: AudioObjectID, hasListeners: Bool) {
         if let info = Self.buildInfo(processObject: obj),
            let bundle = info.bundleId,
-           DetectionCoordinator.matchesTeamsBundle(bundle, matchers: matchers) {
+           DetectionCoordinator.matchesTriggerBundle(bundle, matchers: matchers) {
             stateLock.lock()
             cache[obj] = info
             nonMatching.remove(obj)

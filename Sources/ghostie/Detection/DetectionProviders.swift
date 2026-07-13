@@ -45,17 +45,29 @@ protocol DefaultInputDeviceProvider: AnyObject {
 /// Which Teams (or browser, if browser mode is on) apps are currently
 /// running. Push-based via NSWorkspace launch/terminate notifications. The
 /// observe callback fires on app launch/terminate; the coordinator re-reads
-/// `teamsApps()` rather than consuming a payload, so the closure takes none.
+/// `triggerApps()` rather than consuming a payload, so the closure takes none.
 protocol AppPresenceProvider: AnyObject {
-    func teamsApps() -> [RunningAppInfo]
+    func triggerApps() -> [RunningAppInfo]
     func observe(_ handler: @escaping () -> Void) -> DetectionToken
+}
+
+/// Which of the given browser main-app PIDs currently show a Teams meeting
+/// tab (AX window-title probe). Pull-based, queried only when browser
+/// detection is enabled AND there's a reason to look (browser input I/O or
+/// an already-active session) — same cost philosophy as the meeting-window
+/// gate. Returning a PID makes that browser's mic use eligible as a primary
+/// signal; ordinary web-mic use in a tab that isn't a Teams meeting never
+/// qualifies.
+protocol BrowserTabProvider: AnyObject {
+    func pidsWithMeetingTab(browsers: [RunningAppInfo]) -> [pid_t]
 }
 
 /// AX-based meeting-window probe scoped to a single main-app PID. The
 /// coordinator queries this pull-style on every evaluate; permission state is
-/// re-checked on the same path.
+/// re-checked on the same path. `bundleId` selects the per-app heuristics
+/// rule set (Teams vs Zoom title shapes).
 protocol MeetingWindowProvider: AnyObject {
-    func teamsHasMeetingWindow(mainAppPid: pid_t) -> MeetingWindowMatch
+    func hasMeetingWindow(mainAppPid: pid_t, bundleId: String) -> MeetingWindowMatch
 
     var permissionGranted: Bool { get }
     /// Trigger the standard system AX prompt the first time the detector

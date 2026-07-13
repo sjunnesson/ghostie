@@ -72,12 +72,26 @@ final class FakeDetectionWorld {
             get { lock.withLock { _apps } }
             set { lock.withLock { _apps = newValue } }
         }
-        func teamsApps() -> [RunningAppInfo] { apps }
+        func triggerApps() -> [RunningAppInfo] { apps }
         func observe(_ handler: @escaping () -> Void) -> DetectionToken {
             lock.withLock { handlers.append(handler) }
             return DetectionToken {}
         }
         func notify() { lock.withLock { handlers }.forEach { $0() } }
+    }
+
+    final class Tabs: BrowserTabProvider {
+        private let lock = NSLock()
+        private var _pids: [pid_t] = []
+        /// Browser PIDs currently "showing a Teams meeting tab".
+        var pids: [pid_t] {
+            get { lock.withLock { _pids } }
+            set { lock.withLock { _pids = newValue } }
+        }
+        func pidsWithMeetingTab(browsers: [RunningAppInfo]) -> [pid_t] {
+            let eligible = Set(browsers.map(\.pid))
+            return pids.filter { eligible.contains($0) }.sorted()
+        }
     }
 
     final class AX: MeetingWindowProvider {
@@ -98,7 +112,7 @@ final class FakeDetectionWorld {
             get { lock.withLock { _granted } }
             set { lock.withLock { _granted = newValue } }
         }
-        func teamsHasMeetingWindow(mainAppPid: pid_t) -> MeetingWindowMatch {
+        func hasMeetingWindow(mainAppPid: pid_t, bundleId: String) -> MeetingWindowMatch {
             perPid[mainAppPid] ?? match
         }
         var permissionGranted: Bool { granted }
@@ -111,12 +125,13 @@ final class FakeDetectionWorld {
     let device = Device()
     let presence = Presence()
     let ax = AX()
+    let tabs = Tabs()
     let clock = VirtualClock()
 
     /// A real coordinator wired entirely to the fakes.
     func makeCoordinator(config: Config = Config()) -> DetectionCoordinator {
         DetectionCoordinator(config: config, audio: audio, ax: ax,
                              camera: camera, device: device,
-                             presence: presence, clock: clock)
+                             presence: presence, tabs: tabs, clock: clock)
     }
 }

@@ -4,6 +4,8 @@
   "saveTranscript": true,
 
   "triggerBundleIds": ["com.microsoft.teams", "com.microsoft.teams2"],
+  "detectBrowserTeams": false,
+  "browserBundleIds": ["com.apple.safari", "com.google.chrome", "com.microsoft.edgemac", "company.thebrowser.browser"],
   "endGraceSeconds": 30.0,
   "minCallSeconds": 20.0,
 

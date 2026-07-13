@@ -318,7 +318,9 @@ Edit `~/.ghostie/config.json` (created on first run). Notable keys:
 | `keepAudio` | `false` | Keep raw WAVs after processing |
 | `endGraceSeconds` | `30` | Primary-signal-lost grace before a call is "ended"; covers mute, brief blips, Teams crash-relaunch |
 | `minCallSeconds` | `20` | Calls shorter than this are dropped from the in-memory ring without hitting disk |
-| `triggerBundleIds` | `["com.microsoft.teams", "com.microsoft.teams2"]` | Exact Teams main-app bundle IDs the detector trusts |
+| `triggerBundleIds` | `["com.microsoft.teams", "com.microsoft.teams2"]` | Exact trigger-app bundle IDs the detector trusts (add `us.zoom.xos` for Zoom desktop) |
+| `detectBrowserTeams` | `false` | Opt-in: detect Teams meetings in a browser tab (AX title probe) |
+| `browserBundleIds` | Safari/Chrome/Edge/Arc | Browsers the tab probe may inspect |
 | `triggerBundlePrefixes` | `["com.microsoft.teams"]` | Deprecated; use `triggerBundleIds`. Readable for one release, then removed |
 | `whisperModel` | `…/ggml-base.en.bin` | Bigger model = better accuracy, slower |
 | `language` | `en` | `auto` for automatic detection |
@@ -368,15 +370,27 @@ ready. See [Summarization](#summarization).
 
 ## Limitations
 
-- **Teams only by design.** The detector is scoped to the Microsoft Teams
-  desktop app. Zoom, Google Meet, and Slack huddles do not trigger a
-  recording, even when the mic is in use. The provider architecture in
-  `Sources/ghostie/Detection/` is built to make adding them later
-  straightforward, but each needs its own evidence shape.
-- **Browser-Teams is not yet detected.** Calls held in `teams.microsoft.com`
-  inside Safari, Chrome, Edge, or Arc fall through. Opt-in browser detection
-  via a TLS-peer probe plus AX title matching is on the roadmap. Until it
-  lands, install the desktop client for anything you want auto-captured.
+- **Teams by default; Zoom desktop is one config line.** Out of the box the
+  detector is scoped to the Microsoft Teams desktop app. The detection layer
+  itself is trigger-app-agnostic (per-PID audio attribution + per-app AX
+  window heuristics), so the native **Zoom** client works by adding its
+  bundle id to the trigger list in `config.json`:
+
+  ```json
+  "triggerBundleIds": ["com.microsoft.teams", "com.microsoft.teams2", "us.zoom.xos"]
+  ```
+
+  Caveats: notes and filenames still say "Teams-Call", and the summarizer
+  prompt describes a Teams call — cosmetic, but be aware. Google Meet and
+  Slack huddles (browser-based) are not detected; see the next point.
+- **Browser-Teams is opt-in and experimental.** Set
+  `"detectBrowserTeams": true` in `config.json` and calls held in
+  `teams.microsoft.com` inside Safari, Chrome, Edge, or Arc are detected via
+  an AX window-title probe: the browser's mic use only counts while one of
+  its windows shows a Teams *meeting* tab (a background chat tab never
+  qualifies), so ordinary web-mic use can't trigger a recording. Browser
+  attribution is inherently weaker than the desktop app's per-PID signal —
+  install the desktop client for anything you rely on.
 - **AX heuristics drift over Teams releases.** Microsoft can change the
   meeting window's title or role description in any release. The
   versioned `MeetingWindowHeuristics` constant gives us something to bump

@@ -2,7 +2,7 @@ import Foundation
 import AppKit
 
 /// Push-based `AppPresenceProvider` over NSWorkspace launch/terminate
-/// notifications. Maintains an internal cache so `teamsApps()` is a synchronous
+/// notifications. Maintains an internal cache so `triggerApps()` is a synchronous
 /// read with no enumeration cost on the hot path.
 ///
 /// Exact bundle-ID match: helper PIDs are excluded from this provider's
@@ -37,7 +37,7 @@ final class WorkspaceAppPresenceProvider: AppPresenceProvider {
         for o in observerTokens { center.removeObserver(o) }
     }
 
-    func teamsApps() -> [RunningAppInfo] {
+    func triggerApps() -> [RunningAppInfo] {
         stateLock.lock(); defer { stateLock.unlock() }
         return cache.values
             .filter { triggerBundleIds.contains($0.bundleId.lowercased()) }

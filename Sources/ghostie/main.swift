@@ -14,6 +14,7 @@ final class HeadlessRunner {
     init(config: Config) { engine = Engine(config: config) }
 
     func run() {
+        CrashBreadcrumb.install()
         let t = Transcriber(config: engine.config)
         Log.info("Transcription: \(t.isAvailable ? "local whisper.cpp ✓" : "NOT set up — run scripts/setup.sh")")
         Log.info("Summaries: \(Summarizer(config: engine.config).isConfigured ? "claude -p ✓" : "disabled (Claude Code CLI not found — run `claude` once to log in)")")
@@ -326,7 +327,7 @@ func cmdDoctor(_ config: Config) {
     let matchers = config.triggerBundleIds.map { $0.lowercased() }
     let teams = NSWorkspace.shared.runningApplications.contains {
         guard let b = $0.bundleIdentifier else { return false }
-        return DetectionCoordinator.matchesTeamsBundle(b, matchers: matchers)
+        return DetectionCoordinator.matchesTriggerBundle(b, matchers: matchers)
     }
     row(teams, "Microsoft Teams running", teams ? "" : "(only needed during a call)")
     row(CallDetector.defaultInputDevice() != nil, "default input device detected")

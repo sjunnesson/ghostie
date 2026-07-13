@@ -35,6 +35,21 @@ struct Config: Codable {
     /// versa).
     var triggerBundleIds: [String] = ["com.microsoft.teams", "com.microsoft.teams2"]
 
+    /// Opt-in, experimental: also detect Teams meetings held in a browser tab
+    /// (teams.microsoft.com in Safari/Chrome/Edge/Arc). A browser's mic use
+    /// only counts as a call signal while one of its windows shows a Teams
+    /// meeting tab (AX title probe), so ordinary web-mic use never triggers a
+    /// recording. Off by default: browser attribution is inherently weaker
+    /// than the desktop app's per-PID signal — install the desktop client
+    /// for anything you rely on.
+    var detectBrowserTeams: Bool = false
+
+    /// Browsers the tab probe may inspect when `detectBrowserTeams` is on.
+    var browserBundleIds: [String] = [
+        "com.apple.safari", "com.google.chrome",
+        "com.microsoft.edgemac", "company.thebrowser.browser",
+    ]
+
     /// Teams must continuously not be holding the mic for this long before a
     /// call is considered finished (rides over mute toggles, AirPods reconnects,
     /// brief Teams crashes). Matches the state-machine grace window in
@@ -159,7 +174,7 @@ struct Config: Codable {
 
     enum CodingKeys: String, CodingKey {
         case notesFolder, keepAudio, saveTranscript, triggerBundlePrefixes
-        case triggerBundleIds
+        case triggerBundleIds, detectBrowserTeams, browserBundleIds
         case endGraceSeconds, minCallSeconds
         case whisperBinary, whisperServerBinary, whisperModel, language
         case initialPrompt, vadModel
@@ -183,6 +198,8 @@ struct Config: Codable {
         saveTranscript = g(.saveTranscript, d.saveTranscript)
         triggerBundlePrefixes = g(.triggerBundlePrefixes, d.triggerBundlePrefixes)
         triggerBundleIds = g(.triggerBundleIds, d.triggerBundleIds)
+        detectBrowserTeams = g(.detectBrowserTeams, d.detectBrowserTeams)
+        browserBundleIds = g(.browserBundleIds, d.browserBundleIds)
         endGraceSeconds = g(.endGraceSeconds, d.endGraceSeconds)
         minCallSeconds = g(.minCallSeconds, d.minCallSeconds)
         whisperBinary = g(.whisperBinary, d.whisperBinary)
