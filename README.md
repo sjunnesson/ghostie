@@ -216,39 +216,70 @@ layer behind the *minutes* project):
 and asserts clean speech is left untouched, **and** runs the code-switching
 smoother regression suite (below).
 
-## Code-switching (Swedish ↔ English)
+## Languages (code-switching)
 
 Whisper locks one language from the first ~30 s and applies it to the whole
-file. Calls that mix Swedish and English (Nordic 1:1s, side conversations,
-code-switched terms) get the minority language mistranslated or hallucinated.
+file. Calls that mix languages (Nordic 1:1s, side conversations, code-switched
+terms) get the minority language mistranslated or hallucinated.
 
-Enable **code-switching** and Ghostie instead segments each track with VAD,
+Add a **second language** and Ghostie instead segments each track with VAD,
 detects the language of every segment (encoder only — no decode), smooths the
 detections into language-consistent runs, and decodes each run with the *right*
-model: **KB-Whisper-large** for Swedish, **whisper-large-v3** for English.
-Tracks are smoothed independently, then cross-track refined — when the other
-speaker just switched to Swedish, your next ambiguous segment is nudged toward
-Swedish too (past-only, so it respects who spoke when).
+model: **KB-Whisper-large** for Swedish, **whisper-large-v3** for English, or
+whatever you've paired with any other language. Tracks are smoothed
+independently, then cross-track refined — when the other speaker just switched
+to Swedish, your next ambiguous segment is nudged toward Swedish too (past-only,
+so it respects who spoke when).
 
-Get the models (~2 GB) either way:
+**Settings ▸ Transcription** is the whole interface: one list of languages, each
+showing the model that serves it and whether that model is downloaded. `+` picks
+a language and its model in one step and starts the download; `−` (or a row's
+`⋯`) removes a language and offers to reclaim the disk. There is no on/off
+switch — one language means the single-pass path, two or more means
+code-switching, and the list says which you're in.
 
-- **From Settings** (no terminal — best for the `.dmg`): *Settings ▸
-  Code-switching ▸ Download models*. Shows progress, skips anything already
-  present, and points the config at what it fetched.
-- **From the CLI**: `ghostie fetch-models standard` (same downloader), or the
-  build script `./scripts/setup.sh --codeswitch --kb-variant standard`
-  (`standard | strict`).
+Every language has a working default, so you never have to go find a model:
+Swedish uses **KB-Whisper-large**, and everything else falls back to
+**whisper-large-v3**, which decodes all 99 Whisper languages. In practice that
+means adding German, Spanish, French or anything else usually costs **no
+download at all** — the large-v3 already on disk for language detection decodes
+them. A lighter **large-v3-turbo** (~550 MB) is offered alongside it. Point a
+language at a specialist model from Hugging Face whenever one exists and you
+want it; a specialist always outranks the generalist for its own language.
 
+Language detection needs a *balanced multilingual* model (large-v3). KB-Whisper's
+language head is Swedish-biased and `base.en` can't detect non-English at all, so
+if none of your models can tell languages apart, the list says so and offers to
+fetch one. Without it, routing degrades silently.
+
+From the CLI instead: `ghostie fetch-models standard` (same downloader), or
+`./scripts/setup.sh --codeswitch --kb-variant standard` (`standard | strict`).
 `standard` (the default Stage-2 model, best for notes) and `strict` (verbatim,
 keeps filler) have prebuilt whisper.cpp GGMLs upstream. `subtitle` is published
 HF-format only — pick `standard`/`strict`, or convert the `subtitle` revision
-yourself and point `codeSwitch.modelPerLanguage.sv` at the file.
+yourself and point that language's `model` at the file.
 
-Then turn it on in **Settings ▸ Code-switching** (or set
-`codeSwitch.enabled: true` in `config.json`). It applies on the next call with
-no restart, exactly like every other setting. When disabled, nothing changes —
-the single-model path is used. Everything still runs **100% locally**; the
-models just live in `~/.ghostie/models/` and are larger.
+Changes apply on the next call with no restart, exactly like every other
+setting. Everything still runs **100% locally**; the models just live in
+`~/.ghostie/models/` and are larger.
+
+Languages live in `config.json` as one record each, so a language's model and
+its decoder prompt sit together:
+
+```jsonc
+"codeSwitch": {
+  "languages": [
+    { "code": "sv", "prompt": "Affärssamtal på svenska. Termer: …" },
+    { "code": "en", "model": "ggml-large-v3-q5_0.bin" }
+  ],
+  "dominantLanguage": "en"
+}
+```
+
+`model` is optional — omit it and Ghostie uses the best installed model for that
+language. An empty `languages` list means "whatever is installed on disk", which
+is what a fresh install has. Configs from older versions (a bare `["sv","en"]`
+list plus `modelPerLanguage` / `prompts` maps) migrate automatically on load.
 
 `ghostie selftest` exercises the smoother (single-language collapse, mixed
 3-run split, cross-track flip vs. isolated fall-back) with synthetic

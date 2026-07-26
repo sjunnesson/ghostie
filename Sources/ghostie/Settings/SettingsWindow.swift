@@ -291,7 +291,8 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
     private func refreshLiveBits() {
         panes.listening?.refreshPermissions()
         panes.listening?.refreshLiveStatus(engine?.state ?? .paused)
-        panes.transcription?.refreshAllRows()
+        panes.transcription?.rebuild()
+        panes.advanced?.models.refreshAllRows()
         sidebar?.refreshStatus(engine?.state ?? .paused, perms: PermissionsState.current)
     }
 
@@ -384,10 +385,12 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
             if let p = panes.transcription { return p }
             let p = TranscriptionPane(
                 cfg: cfg,
-                rowAction: { [weak self] key in self?.handleModelRowAction(key) },
                 openConfig: { [weak self] in self?.openJSON() },
-                addModel: { [weak self] in self?.presentAddModelSheet() },
-                removeModel: { [weak self] key in self?.removeModel(key) },
+                addLanguage: { [weak self] in self?.presentAddLanguageSheet() },
+                removeLanguage: { [weak self] code in self?.removeLanguage(code) },
+                changeModel: { [weak self] code in self?.presentChangeModelSheet(for: code) },
+                setPrimary: { [weak self] code in self?.setPrimaryLanguage(code) },
+                downloadModel: { [weak self] key in self?.handleModelRowAction(key) },
                 changes: { [weak self] block in self?.mutateCfg(block) }
             )
             panes.transcription = p
@@ -413,6 +416,10 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         case .advanced:
             if let p = panes.advanced { return p }
             let p = AdvancedPane(
+                kbVariant: cfg.codeSwitch.kbWhisperVariant,
+                modelRowAction: { [weak self] key in self?.handleModelRowAction(key) },
+                addModel: { [weak self] in self?.presentAddModelSheet() },
+                removeModel: { [weak self] key in self?.removeModel(key) },
                 openConfig: { [weak self] in self?.openJSON() },
                 revealData: { [weak self] in self?.revealDataFolder() },
                 runDiagnose: { [weak self] in self?.runCLI("diagnose-detect") },
@@ -593,10 +600,10 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         guard let model = modelForKey(key) else { return }
         // Hash-free check (SHA256 of a ~1.1 GB file is ~3 s on the main
         // thread). A hash mismatch is only ever discovered by the explicit
-        // Verify/Re-verify actions below, so overlay the pane's remembered
-        // verdict — it's the state the row is actually displaying.
+        // Verify/Re-verify actions below, so overlay the storage list's
+        // remembered verdict — it's the state that row is actually displaying.
         var state = ModelDownloader.health(for: [model], verifyHash: false)[0].state
-        if case .ok = state, let verdict = panes.transcription?.verifiedState(key) {
+        if case .ok = state, let verdict = panes.advanced?.models.verifiedState(key) {
             state = verdict
         }
         switch state {
@@ -604,7 +611,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
             if inflightModelKey == key {
                 downloader.cancel()
                 inflightModelKey = nil
-                panes.transcription?.downloadDidSettle(key)
+                downloadDidSettle(key)
             } else {
                 startDownload(model, key: key)
             }
@@ -615,13 +622,35 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         }
     }
 
+    // MARK: Download progress fan-out
+    //
+    // A model download can be started from either pane and is shown in both:
+    // on the language row that model serves, and in the Developer storage
+    // list. One place decides, both places render.
+
+    private func setRowDownloading(_ key: String, percent: Double, status: String) {
+        panes.transcription?.setDownloading(modelFilename: key, percent: percent, status: status)
+        panes.advanced?.models.setRowDownloading(key, percent: percent, status: status)
+    }
+
+    private func setRowBusy(_ key: String, status: String) {
+        panes.transcription?.setBusy(modelFilename: key, status: status)
+        panes.advanced?.models.setRowBusy(key, status: status)
+    }
+
+    private func downloadDidSettle(_ key: String) {
+        panes.advanced?.models.downloadDidSettle(key)
+        panes.transcription?.rebuild()
+    }
+
     private func startDownload(_ model: Model, key: String) {
         guard inflightModelKey == nil else { return }
         inflightModelKey = key
-        panes.transcription?.setRowDownloading(key, percent: 0, status: "Starting…")
+        panes.advanced?.models.markPending(key)
+        setRowDownloading(key, percent: 0, status: "Starting…")
         downloader.start(models: [model], status: { [weak self] s in
             let pct = Self.parsePercent(s) ?? 0
-            self?.panes.transcription?.setRowDownloading(key, percent: pct, status: s)
+            self?.setRowDownloading(key, percent: pct, status: s)
         }, finish: { [weak self] err in
             guard let self else { return }
             self.inflightModelKey = nil
@@ -632,147 +661,217 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
                 a.informativeText = err.localizedDescription
                 a.runModal()
             }
-            self.panes.transcription?.downloadDidSettle(key)
+            self.downloadDidSettle(key)
         })
     }
 
-    /// Remove a model from the list: confirm, cancel any in-flight download,
-    /// delete the file + sidecar, drop a custom catalog entry (built-ins stay
-    /// as re-addable presets), and rebuild. The language self-heals out of the
-    /// effective whitelist once its model is gone.
+    /// Delete a model file from the Developer storage list. This is the *disk*
+    /// verb; the language verb is `removeLanguage`, which offers the same
+    /// deletion as part of one flow. Deleting a model a language still needs
+    /// leaves that language visibly "Not downloaded" rather than silently
+    /// dropping it, so the warning is where the user can act on it.
     private func removeModel(_ key: String) {
         guard let model = modelForKey(key) else { return }
         let entry = ModelCatalog.load().first { $0.filename == key }
+        let users = LanguageSetup.resolve(config: cfg).rows.filter { $0.modelFilename == key }
         let a = NSAlert()
-        a.messageText = "Remove this model?"
-        a.informativeText = "Deletes \(key) from ~/.ghostie/models."
-            + ((entry?.builtin ?? false) ? " You can re-add it later from the + menu." : "")
-        a.addButton(withTitle: "Remove")
+        a.messageText = "Delete this model?"
+        var info = "Deletes \(key) from ~/.ghostie/models."
+        if !users.isEmpty {
+            info += " \(users.map(\.name).joined(separator: " and ")) "
+                + (users.count == 1 ? "needs it" : "need it") + " — you'd have to download it again."
+        }
+        if entry?.builtin ?? false { info += " You can re-add it later from the + menu." }
+        a.informativeText = info
+        a.addButton(withTitle: "Delete")
         a.addButton(withTitle: "Cancel")
         guard a.runModal() == .alertFirstButtonReturn else { return }
         if inflightModelKey == key { downloader.cancel(); inflightModelKey = nil }
+        deleteModelFiles(model)
+        if entry?.builtin == false { ModelCatalog.remove(filename: key) }
+        downloadDidSettle(key)
+    }
+
+    private func deleteModelFiles(_ model: Model) {
         try? FileManager.default.removeItem(atPath: model.destPath)
         try? FileManager.default.removeItem(atPath: model.sidecarPath)
-        if entry?.builtin == false { ModelCatalog.remove(filename: key) }
-        panes.transcription?.downloadDidSettle(key)
     }
 
     private func startAdopt(_ model: Model, key: String) {
         guard inflightModelKey == nil else { return }
-        panes.transcription?.setRowBusy(key, status: "Verifying (HEAD + SHA256)…")
+        setRowBusy(key, status: "Verifying (HEAD + SHA256)…")
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let state = ModelDownloader.adopt(model)
             DispatchQueue.main.async {
-                self?.panes.transcription?.recordVerifiedState(state, forKey: key)
+                self?.panes.advanced?.models.recordVerifiedState(state, forKey: key)
+                self?.panes.transcription?.rebuild()
             }
         }
     }
 
     private func startReverify(_ model: Model, key: String) {
         guard inflightModelKey == nil else { return }
-        panes.transcription?.setRowBusy(key, status: "Re-hashing…")
+        setRowBusy(key, status: "Re-hashing…")
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let state = ModelDownloader.health(for: [model])[0].state
             DispatchQueue.main.async {
-                self?.panes.transcription?.recordVerifiedState(state, forKey: key)
+                self?.panes.advanced?.models.recordVerifiedState(state, forKey: key)
+                self?.panes.transcription?.rebuild()
             }
         }
     }
 
-    /// "Add a model" form: paste a Hugging Face repo, pick the language. Ghostie
-    /// finds the GGML file in the repo (HF API), writes the pairing to
-    /// `~/.ghostie/models.json` via `ModelCatalog`, and downloads it — the rest
-    /// of the pipeline (detection → per-language decode) picks it up with no
-    /// further config because the disk is the language whitelist.
-    private func presentAddModelSheet() {
-        func field(_ placeholder: String, width: CGFloat) -> NSTextField {
-            let f = NSTextField(string: "")
-            f.placeholderString = placeholder
-            f.translatesAutoresizingMaskIntoConstraints = false
-            f.widthAnchor.constraint(equalToConstant: width).isActive = true
-            return f
-        }
-        func lbl(_ s: String) -> NSTextField {
-            let t = NSTextField(labelWithString: s)
-            t.alignment = .right
-            return t
-        }
-        let repoField = field("KBLab/kb-whisper-large", width: 340)
-        let langField = field("ar", width: 120)
-        let grid = NSGridView(views: [
-            [lbl("Hugging Face repo"), repoField],
-            [lbl("Language"),          langField]
-        ])
-        grid.rowSpacing = 8
-        grid.columnSpacing = 10
-        grid.translatesAutoresizingMaskIntoConstraints = false
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: 480, height: 78))
-        container.addSubview(grid)
-        NSLayoutConstraint.activate([
-            grid.topAnchor.constraint(equalTo: container.topAnchor),
-            grid.bottomAnchor.constraint(equalTo: container.bottomAnchor),
-            grid.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            grid.trailingAnchor.constraint(equalTo: container.trailingAnchor)
-        ])
+    // MARK: Language flows
+    //
+    // Adding a language is ONE action: pick the language, pick its model, and
+    // the download starts. Pre-v3 it was two — add a model in one card, then
+    // remember to tick a checkbox in another — with the "and also grow the
+    // whitelist" reconciliation copy-pasted at each entry point.
 
-        let a = NSAlert()
-        a.messageText = "Add a model"
-        a.informativeText = "Paste a Hugging Face repo (org/name) — Ghostie finds the model file and downloads it. The language is the code Ghostie should use this model for (e.g. ar, de, fr); it detects each speaker's language and routes it to the matching model."
-        a.addButton(withTitle: "Add & Download")
-        a.addButton(withTitle: "Cancel")
-        a.accessoryView = container
-        a.window.initialFirstResponder = repoField
-        guard a.runModal() == .alertFirstButtonReturn else { return }
+    /// Write a new language list and redraw. The single place that touches
+    /// `codeSwitch.languages`, so the materialize-then-edit rule can't be
+    /// forgotten at a call site.
+    private func applyLanguages(_ langs: [LanguageSetting]) {
+        mutateCfg { c in c.codeSwitch.languages = langs }
+        panes.transcription?.applyConfig(cfg)
+    }
 
-        let raw = repoField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        let lang = langField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        func fail(_ msg: String) {
-            let e = NSAlert()
-            e.alertStyle = .warning
-            e.messageText = "Couldn't add the model"
-            e.informativeText = msg
-            e.runModal()
+    private func setPrimaryLanguage(_ code: String) {
+        mutateCfg { c in c.codeSwitch.dominantLanguage = code }
+        panes.transcription?.applyConfig(cfg)
+    }
+
+    /// "Add a language": a language picker (not a free-text ISO field — typing
+    /// `ger` used to produce a language the LID can never emit) plus a model
+    /// picker for that language, in one sheet.
+    private func presentAddLanguageSheet() {
+        let taken = Set(LanguageSetup.resolve(config: cfg).rows.map(\.code))
+        guard let choice = LanguagePickerSheet.run(excluding: taken,
+                                                   kbVariant: cfg.codeSwitch.kbWhisperVariant,
+                                                   title: "Add a language",
+                                                   confirm: "Add") else { return }
+        commit(choice)
+    }
+
+    /// "Change model…" — the same sheet with the language fixed.
+    private func presentChangeModelSheet(for code: String) {
+        guard let choice = LanguagePickerSheet.run(excluding: [],
+                                                   fixedLanguage: code,
+                                                   kbVariant: cfg.codeSwitch.kbWhisperVariant,
+                                                   title: "Model for \(WhisperLanguages.displayName(code))",
+                                                   confirm: "Use this model") else { return }
+        commit(choice)
+    }
+
+    /// Land a picker result: resolve a Hugging Face repo if that's what was
+    /// chosen, register the catalog entry, write the language record, and start
+    /// the download if the model isn't already here.
+    private func commit(_ choice: LanguagePickerSheet.Choice) {
+        func finish(model: String?, downloadKey: String?) {
+            let langs = LanguageSetup.adding(choice.code, model: model,
+                                             to: LanguageSetup.materialized(config: cfg))
+            applyLanguages(langs)
+            if let downloadKey,
+               let m = modelForKey(downloadKey),
+               case .missing = ModelDownloader.health(for: [m], verifyHash: false)[0].state {
+                startDownload(m, key: downloadKey)
+            }
         }
-        guard !raw.isEmpty else {
-            fail("Enter a Hugging Face repo, like KBLab/kb-whisper-large.")
+
+        switch choice.model {
+        case .auto:
+            // No pin: whichever installed model is best for this language, and
+            // the catalog's recommendation if none is installed yet.
+            let recommended = ModelCatalog.recommended(for: choice.code, in: ModelCatalog.load(),
+                                                       kbVariant: cfg.codeSwitch.kbWhisperVariant)
+            finish(model: nil, downloadKey: recommended?.filename)
+        case .catalog(let filename):
+            finish(model: filename, downloadKey: filename)
+        case .huggingFace(let raw):
+            // Resolving the file hits the HF API — off the main thread, then
+            // register + download (or report a clear error) back on main.
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                let resolved = HuggingFace.resolve(raw)
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    guard let r = resolved, !r.filename.isEmpty else {
+                        let e = NSAlert()
+                        e.alertStyle = .warning
+                        e.messageText = "Couldn't add that model"
+                        e.informativeText = "Nothing that looks like a model file in “\(raw)”. Check the repo name, or paste the direct file URL from Hugging Face."
+                        e.runModal()
+                        return
+                    }
+                    // Friendly label: the repo's last path component, else the filename.
+                    let label = (!raw.lowercased().hasPrefix("http") && raw.contains("/"))
+                        ? (raw.split(separator: "/").last.map(String.init) ?? r.filename)
+                        : (r.filename as NSString).deletingPathExtension
+                    ModelCatalog.add(CatalogEntry(filename: r.filename, url: r.url, label: label,
+                                                  language: choice.code,
+                                                  goodForLID: choice.isMultilingual,
+                                                  multilingual: choice.isMultilingual,
+                                                  approxBytes: 0, builtin: false))
+                    self.panes.advanced?.models.rebuild()
+                    finish(model: r.filename, downloadKey: r.filename)
+                }
+            }
+        }
+    }
+
+    /// Remove a language — and offer to reclaim its disk in the same step.
+    /// Pre-v3 these were two unrelated verbs in two cards: unticking a language
+    /// freed no disk, and deleting a model left the language behind as an
+    /// orphaned warning row the user then had to clean up separately.
+    private func removeLanguage(_ code: String) {
+        let setup = LanguageSetup.resolve(config: cfg)
+        guard let row = setup.rows.first(where: { $0.code == code }) else { return }
+        guard let remaining = LanguageSetup.removing(code, from: LanguageSetup.materialized(config: cfg)) else {
+            let a = NSAlert()
+            a.messageText = "Ghostie needs at least one language"
+            a.informativeText = "Add another language first, then remove \(row.name)."
+            a.runModal()
             return
         }
 
-        // Resolving the file may hit the HF API — do it off the main thread, then
-        // add + download (or report a clear error) back on main.
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let resolved = HuggingFace.resolve(raw)
-            DispatchQueue.main.async {
-                guard let self else { return }
-                guard let r = resolved, !r.filename.isEmpty else {
-                    fail("Couldn't find a model file in “\(raw)”. Check the repo name, or paste the direct file URL from Hugging Face.")
-                    return
-                }
-                // Friendly label: the repo's last path component, else the filename.
-                let label = (!raw.lowercased().hasPrefix("http") && raw.contains("/"))
-                    ? (raw.split(separator: "/").last.map(String.init) ?? r.filename)
-                    : (r.filename as NSString).deletingPathExtension
-                let entry = CatalogEntry(filename: r.filename, url: r.url, label: label,
-                                         language: lang, goodForLID: false,
-                                         approxBytes: 0, builtin: false)
-                ModelCatalog.add(entry)
-                // If the user has an explicit language whitelist (e.g. migrated
-                // from the old sv↔en toggle, which persisted ["sv","en"]), grow it
-                // so the new language activates — otherwise effectiveLanguages
-                // would silently drop it. Disk-driven users (empty list) need no
-                // change; the disk is the whitelist.
-                if !lang.isEmpty {
-                    self.mutateCfg { c in
-                        if !c.codeSwitch.languages.isEmpty, !c.codeSwitch.languages.contains(lang) {
-                            c.codeSwitch.languages.append(lang)
-                        }
-                    }
-                }
-                self.panes.transcription?.applyConfig(self.cfg)
-                // Kick off the download (health is .missing → startDownload).
-                self.handleModelRowAction(r.filename)
+        // Only offer to delete the file if nothing else is using it.
+        let sharedWith = setup.rows.filter { $0.code != code && $0.modelFilename == row.modelFilename }
+        let deletable = row.state == .onDisk && sharedWith.isEmpty && row.modelFilename != nil
+        let box = NSButton(checkboxWithTitle:
+            "Also delete \(row.modelLabel ?? "the model") from this Mac", target: nil, action: nil)
+        box.state = .off
+
+        let a = NSAlert()
+        a.messageText = "Stop transcribing \(row.name)?"
+        a.informativeText = deletable
+            ? "Ghostie will no longer detect or transcribe \(row.name). The model file stays unless you tick the box."
+            : "Ghostie will no longer detect or transcribe \(row.name)."
+        if deletable { a.accessoryView = box }
+        a.addButton(withTitle: "Remove")
+        a.addButton(withTitle: "Cancel")
+        guard a.runModal() == .alertFirstButtonReturn else { return }
+
+        applyLanguages(remaining)
+        if deletable, box.state == .on, let key = row.modelFilename, let m = modelForKey(key) {
+            if inflightModelKey == key { downloader.cancel(); inflightModelKey = nil }
+            deleteModelFiles(m)
+            if ModelCatalog.load().first(where: { $0.filename == key })?.builtin == false {
+                ModelCatalog.remove(filename: key)
             }
+            downloadDidSettle(key)
         }
+    }
+
+    /// "Add from Hugging Face…" in the Developer storage list. Routes through
+    /// the same picker as the language flow, so a model added here is paired
+    /// with a real language and shows up as a language row — rather than
+    /// landing in the catalog tagged with a hand-typed code nobody validated.
+    private func presentAddModelSheet() {
+        guard let choice = LanguagePickerSheet.run(excluding: [],
+                                                   kbVariant: cfg.codeSwitch.kbWhisperVariant,
+                                                   title: "Add a model",
+                                                   confirm: "Add & Download",
+                                                   startOnHuggingFace: true) else { return }
+        commit(choice)
     }
 
     static func parsePercent(_ s: String) -> Double? {

@@ -17,9 +17,11 @@
   "cleanTranscript": true,
 
   "codeSwitch": {
-    "languages": ["sv", "en"],
+    "languages": [
+      { "code": "sv", "prompt": "Affärssamtal på svenska. Termer: Ingka, Xplore, IKEA, IFB." },
+      { "code": "en", "prompt": "Business call in English. Terms: Ingka, Xplore, IKEA, IFB, MCP, ACP." }
+    ],
     "dominantLanguage": "en",
-    "modelPerLanguage": { "sv": "kb-whisper-large", "en": "whisper-large-v3" },
     "kbWhisperVariant": "standard",
     "smoothingWindowMe": 4,
     "smoothingWindowParticipants": 4,
@@ -36,11 +38,7 @@
     "intraSegmentMarginThreshold": 0.15,
     "minDwellMs": 1500,
     "crossTrackPriorStrength": 0.75,
-    "priorLookbackMs": 8000,
-    "prompts": {
-      "sv": "Affärssamtal på svenska. Termer: Ingka, Xplore, IKEA, IFB.",
-      "en": "Business call in English. Terms: Ingka, Xplore, IKEA, IFB, MCP, ACP."
-    }
+    "priorLookbackMs": 8000
   },
 
   "summaryProvider": "claude",

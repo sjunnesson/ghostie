@@ -26,6 +26,17 @@ struct Model {
     /// filters on this instead of a hardcoded model-name compare.
     var goodForLID: Bool = false
 
+    /// Whether this model can decode **any** Whisper language, not just
+    /// `language`. True for the large-v3 family; false for a specialist like
+    /// KB-Whisper (Swedish) or base.en (English only).
+    ///
+    /// This is what lets Ghostie offer a working default for German, Spanish,
+    /// or anything else without shipping a separate model per language — the
+    /// multilingual model people already have covers them. It deliberately does
+    /// *not* widen the disk-driven whitelist (see `InstalledModels`): having
+    /// large-v3 installed must not mean "Ghostie now listens for 99 languages".
+    var multilingual: Bool = false
+
     /// Resolved absolute path under `~/.ghostie/models/`.
     var destPath: String { "\(Config.modelsDir)/\(filename)" }
 
@@ -51,7 +62,22 @@ enum Models {
         label: "Whisper large-v3 (Q5) · ~1.1 GB",
         approxBytes: 1_081_140_203,
         language: "en",
-        goodForLID: true    // balanced multilingual — the LID/VAD driver of choice
+        goodForLID: true,   // balanced multilingual — the LID/VAD driver of choice
+        multilingual: true  // …and the default decoder for any language with no specialist
+    )
+
+    /// The lighter multilingual option: same 99 languages, roughly half the
+    /// size and several times faster, at some accuracy cost. Offered alongside
+    /// large-v3 for every language so a second or third language doesn't have
+    /// to mean another gigabyte.
+    static let largeV3Turbo = Model(
+        filename: "ggml-large-v3-turbo-q5_0.bin",
+        url: URL(string: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin")!,
+        label: "Whisper large-v3-turbo (Q5) · ~550 MB",
+        approxBytes: 574_041_195,
+        language: "en",
+        goodForLID: true,
+        multilingual: true
     )
 
     static let sileroVAD = Model(
@@ -83,29 +109,54 @@ enum Models {
     /// The set of models Ghostie actually needs given the current config.
     /// Drives "Download missing models", the doctor row list, and the headless
     /// `fetch-models` subcommand.
+    ///
+    /// v3: derived from the **configured languages**, one model each, rather
+    /// than a hardcoded sv+en pair. Pre-v3 any 2-language setup reported
+    /// KB-Whisper + large-v3 as required, so a user running German+English got
+    /// Settings popped open on launch auto-downloading 1.1 GB of Swedish.
+    ///
+    /// The balanced multilingual model that drives *language detection* is
+    /// deliberately NOT required here: it's surfaced as a warning in Settings
+    /// (see `LanguageSetup.Warning.noDetectionModel`) so it can't turn into a
+    /// launch-time nag for a setup that otherwise transcribes fine.
     static func required(for config: Config) -> [Model] {
-        var out: [Model] = []
-        // "Wants code-switching" is an *explicit* ≥2-language whitelist (the
-        // intent Settings writes) OR ≥2 language models already on disk. The
-        // default empty `languages` therefore bootstraps the single-language
-        // baseline (base-english), not the ~2GB code-switch pair — a fresh
-        // install no longer auto-downloads KB+large-v3 it was never asked for.
-        // A user who already has both models installed (effective ≥2) still
-        // sees the pair as required rather than a spurious base-english.
+        required(for: config, catalog: ModelCatalog.load(),
+                 installed: installed(preferredKBVariant: config.codeSwitch.kbWhisperVariant))
+    }
+
+    /// Catalog-injectable core of `required`, for unit tests.
+    static func required(for config: Config, catalog: [CatalogEntry],
+                         installed: InstalledModels) -> [Model] {
         let cs = config.codeSwitch
-        let installed = installed(preferredKBVariant: cs.kbWhisperVariant)
-        let wantsCodeSwitch = cs.languages.count >= 2
-            || cs.effectiveLanguages(installed: installed).count >= 2
-        if wantsCodeSwitch {
-            if let kb = kbWhisperLarge(variant: cs.kbWhisperVariant) {
-                out.append(kb)
-            }
-            out.append(largeV3)
-            out.append(sileroVAD)
-        } else {
-            out.append(baseEnglish)
-            out.append(sileroVAD)   // optional but recommended; doctor flags it as such
+        // Configured languages are the user's stated intent; with none
+        // configured the disk is the whitelist, exactly as at runtime.
+        let codes = cs.languages.isEmpty ? installed.languages : cs.languages.map(\.code)
+
+        var out: [Model] = []
+        var seen = Set<String>()
+        func add(_ m: Model?) {
+            guard let m, seen.insert(m.filename).inserted else { return }
+            out.append(m)
         }
+        for code in codes {
+            // An explicit model reference wins (it's what the pipeline will
+            // load); otherwise the catalog's best entry for that language.
+            let explicit = CodeSwitchConfig.resolveModelReference(
+                cs.setting(for: code)?.model ?? "", kbVariant: cs.kbWhisperVariant)
+            if !explicit.isEmpty,
+               let entry = catalog.first(where: { $0.model()?.destPath == explicit }) {
+                add(entry.model())
+            } else {
+                add(ModelCatalog.recommended(for: code, in: catalog,
+                                             kbVariant: cs.kbWhisperVariant)?.model())
+            }
+        }
+        // Nothing configured and nothing installed: a fresh install still needs
+        // *a* speech model, and base.en is the small one we bootstrap with.
+        if out.isEmpty { add(baseEnglish) }
+        // VAD is optional for one language (doctor flags it as recommended) and
+        // load-bearing for code-switching — required either way, it's ~900 KB.
+        add(sileroVAD)
         return out
     }
 
@@ -200,26 +251,34 @@ enum Models {
         }
     }
 
+    /// Order two same-language catalog entries: configured KB variant first,
+    /// then a balanced multilingual (`goodForLID`) model, then by descending
+    /// size. Single-`Int64` rank with disjoint bands (cheap to type-check).
+    ///
+    /// Shared with `ModelCatalog.entries(for:)` so the model Settings *offers*
+    /// for a language is the one `installed` would *pick* once it's on disk.
+    static func siblingRank(_ e: CatalogEntry, preferredKBVariant variant: String) -> Int64 {
+        let variantBand: Int64 = (e.kbVariant == variant) ? 0 : 4_000_000_000_000
+        let lidBand: Int64 = e.goodForLID ? 0 : 2_000_000_000_000
+        return variantBand + lidBand - e.approxBytes
+    }
+
     /// Catalog-injectable core of `installed`, for unit tests. `present` is the
     /// on-disk existence test.
     static func installed(from entries: [CatalogEntry],
                           preferredKBVariant variant: String,
                           present: (String) -> Bool) -> InstalledModels {
-        // Within a language, order siblings: configured KB variant first, then a
-        // balanced multilingual (goodForLID) model, then by descending size.
-        // Single-`Int64` rank with disjoint bands (cheap to type-check).
-        func rank(_ e: CatalogEntry) -> Int64 {
-            let variantBand: Int64 = (e.kbVariant == variant) ? 0 : 4_000_000_000_000
-            let lidBand: Int64 = e.goodForLID ? 0 : 2_000_000_000_000
-            return variantBand + lidBand - e.approxBytes
+        let ordered = entries.sorted {
+            siblingRank($0, preferredKBVariant: variant) < siblingRank($1, preferredKBVariant: variant)
         }
-        let ordered = entries.sorted { rank($0) < rank($1) }
         var perLanguage: [String: String] = [:]
-        for e in ordered where !e.language.isEmpty && perLanguage[e.language] == nil {
-            guard let m = e.model() else { continue }
-            if present(m.destPath) { perLanguage[e.language] = m.destPath }
+        var multilingual: [String] = []
+        for e in ordered where !e.language.isEmpty {
+            guard let m = e.model(), present(m.destPath) else { continue }
+            if perLanguage[e.language] == nil { perLanguage[e.language] = m.destPath }
+            if e.multilingual { multilingual.append(m.destPath) }
         }
-        return InstalledModels(perLanguage: perLanguage)
+        return InstalledModels(perLanguage: perLanguage, multilingualPaths: multilingual)
     }
 }
 
@@ -228,14 +287,37 @@ enum Models {
 /// whitelist directly from `languages`; removing a model removes the language
 /// with no config edit needed.
 struct InstalledModels {
-    /// language code → absolute GGML path. Empty == no whisper model on disk.
+    /// language code → absolute GGML path, for models that *specialize* in that
+    /// language. Empty == no whisper model on disk.
     let perLanguage: [String: String]
 
-    /// Languages this install can decode. Sorted for stable doctor / log output.
+    /// Installed multilingual models (best first) — the fallback decoder for a
+    /// language nothing specializes in. Kept separate from `perLanguage` on
+    /// purpose: these must not widen `languages`.
+    let multilingualPaths: [String]
+
+    init(perLanguage: [String: String], multilingualPaths: [String] = []) {
+        self.perLanguage = perLanguage
+        self.multilingualPaths = multilingualPaths
+    }
+
+    /// The **disk-driven whitelist**: languages this install is set up for when
+    /// the user hasn't configured any. Deliberately only the specialists —
+    /// a multilingual model can decode ~99 languages, but installing one must
+    /// not mean Ghostie starts listening for all of them. Sorted for stable
+    /// doctor / log output.
     var languages: [String] { perLanguage.keys.sorted() }
 
-    /// GGML path for `lang`, or nil if no model for that language is on disk.
+    /// GGML path for a model that *specializes* in `lang`, or nil.
     func modelPath(for lang: String) -> String? { perLanguage[lang] }
+
+    /// GGML path that can actually decode `lang`: its specialist if there is
+    /// one, else the best installed multilingual model. This is what answers
+    /// "can Ghostie handle German?" once the user has explicitly asked for
+    /// German — usually yes, with the large-v3 they already have.
+    func decodePath(for lang: String) -> String? {
+        perLanguage[lang] ?? multilingualPaths.first
+    }
 }
 
 /// What we last knew about a successfully-downloaded model. Lives next to the

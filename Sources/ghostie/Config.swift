@@ -432,26 +432,25 @@ struct Config: Codable {
 /// decodes unchanged — Swift's synthesized Decodable falls back to the default
 /// when a key is absent, the same pattern the rest of Config relies on.
 struct CodeSwitchConfig: Codable {
-    /// Labels the smoother is allowed to emit. Nordic look-alikes (`no`, `da`)
-    /// detected on short Swedish audio are mapped to `sv` (see Smoother).
-    /// Empty (the default) means "use whatever is installed on disk" — see
-    /// `effectiveLanguages(installed:)`, so the disk drives the whitelist and
-    /// a fresh install doesn't claim to need the code-switch model pair. A
-    /// non-empty list is both an explicit override layer (configured ∩
-    /// installed) and the "I want code-switching" intent signal Settings
-    /// writes (see `Models.required`).
-    var languages: [String] = []
+    /// The languages Ghostie is configured to understand, in priority order,
+    /// each carrying its own model and prompt (see `LanguageSetting`).
+    ///
+    /// **Empty (the default) means "not configured — use whatever is installed
+    /// on disk"**, so a fresh install doesn't claim to need a model pair nobody
+    /// asked for and removing a model self-heals the whitelist. Settings
+    /// materializes the full list the moment the user adds or removes a
+    /// language, so from then on what the list says and what the pane shows are
+    /// the same thing.
+    ///
+    /// v3: this replaces the three parallel maps that used to encode one
+    /// concept — `languages: [String]`, `modelPerLanguage` and `prompts`. A
+    /// pre-v3 `["sv","en"]` decodes straight into records (see
+    /// `LanguageSetting.init(from:)`) and the two old maps are folded in below.
+    var languages: [LanguageSetting] = []
 
     /// Tiebreaker when neither the local detection nor the cross-track prior
     /// is decisive.
     var dominantLanguage: String = "en"
-
-    /// Logical model per language. Resolved to a GGML path by `modelPath(for:)`.
-    /// Point both at the same value for a disk-constrained single-model setup.
-    var modelPerLanguage: [String: String] = [
-        "sv": "kb-whisper-large",
-        "en": "whisper-large-v3"
-    ]
 
     /// KB-Whisper Stage-2 variant used for Swedish: standard | subtitle | strict.
     var kbWhisperVariant: String = "standard"
@@ -538,39 +537,53 @@ struct CodeSwitchConfig: Codable {
     /// once a genuinely independent LID (VoxLingua107) backs the verifier.
     var verifyMarginDb: Double = 0
 
-    /// Decoder prompt per language. The N-language replacement for the old
-    /// `promptSv` / `promptEn` pair: each model gets a prompt in its own
-    /// language with the domain terms it should bias toward. Old configs
-    /// carrying `promptSv` / `promptEn` migrate cleanly on load (see
-    /// `init(from:)`); they are no longer written back on save.
-    var prompts: [String: String] = [
-        "sv": "Affärssamtal på svenska. Termer: Ingka, Xplore, IKEA, IFB.",
-        "en": "Business call in English. Terms: Ingka, Xplore, IKEA, IFB, MCP, ACP."
-    ]
+    // MARK: Legacy per-language maps (decoded, never encoded)
+    //
+    // Pre-v3 these were first-class config. They now exist only as a *fallback
+    // layer* for an install whose `languages` list is still empty (i.e. the
+    // user never configured anything but did hand-edit a prompt). The moment
+    // Settings writes a `LanguageSetting`, that record carries the value and
+    // these stop mattering; `save()` never writes them back.
+
+    /// Pre-v3 `prompts` (and pre-v2 `promptSv`/`promptEn`), folded in on decode.
+    private(set) var legacyPrompts: [String: String] = [:]
+    /// Pre-v3 `modelPerLanguage`, folded in on decode.
+    private(set) var legacyModelNames: [String: String] = [:]
 
     // Same missing-key resilience as Config: a partial `codeSwitch` object
     // (e.g. just `{"enabled": true}`) decodes, with the rest taking defaults.
     init() {}
 
     enum CodingKeys: String, CodingKey {
-        case languages, dominantLanguage, modelPerLanguage, kbWhisperVariant
+        case languages, dominantLanguage, kbWhisperVariant
         case smoothingWindowMe, smoothingWindowParticipants, minSwitchSegments
         case minSwitchMs, maxFillGapMs, runPaddingMs, silencePadMs, minDetectMs
         case maxDetectMs
         case lidWindowMs, lidHopMs, intraSegmentRefineMs
         case intraSegmentMarginThreshold, minDwellMs
-        case crossTrackPriorStrength, priorLookbackMs, prompts
+        case crossTrackPriorStrength, priorLookbackMs
         case snapSearchMs, snapMinMs, snapEnergyDb
         case verifyMarginDb
         // Removed in v2: `enabled` (now derived from installed-model count;
-        // see Pipeline.swift). Old configs with the key load cleanly — Swift's
-        // JSON decoder ignores unknown keys.
+        // see Pipeline.swift). Removed in v3: `prompts`, `modelPerLanguage`
+        // (folded into `languages` records). Old configs carrying any of them
+        // load cleanly — see `LegacyKeys` below.
     }
 
-    /// Pre-v2 prompt keys folded into `prompts` on decode, never encoded back.
-    private enum LegacyPromptKeys: String, CodingKey {
-        case promptSv, promptEn
+    /// Keys Ghostie still *reads* for back-compat but never writes again.
+    private enum LegacyKeys: String, CodingKey {
+        case promptSv, promptEn, prompts, modelPerLanguage
     }
+
+    /// The pre-v3 `modelPerLanguage` *defaults*. Every existing config.json has
+    /// these two entries whether or not the user chose them — they were shipped
+    /// defaults that got persisted on first save. Migrating them as explicit
+    /// pins would show "pinned" on two rows nobody pinned, and would freeze
+    /// those languages onto one model forever. They resolve to exactly what the
+    /// auto-pick produces anyway, so a value matching them migrates to nil; a
+    /// genuine hand-edit still carries over.
+    private static let preV3DefaultModels = ["sv": "kb-whisper-large",
+                                             "en": "whisper-large-v3"]
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -580,9 +593,7 @@ struct CodeSwitchConfig: Codable {
             catch {}
             return fallback
         }
-        languages = g(.languages, d.languages)
         dominantLanguage = g(.dominantLanguage, d.dominantLanguage)
-        modelPerLanguage = g(.modelPerLanguage, d.modelPerLanguage)
         kbWhisperVariant = g(.kbWhisperVariant, d.kbWhisperVariant)
         smoothingWindowMe = g(.smoothingWindowMe, d.smoothingWindowMe)
         smoothingWindowParticipants = g(.smoothingWindowParticipants, d.smoothingWindowParticipants)
@@ -605,36 +616,76 @@ struct CodeSwitchConfig: Codable {
         snapEnergyDb = g(.snapEnergyDb, d.snapEnergyDb)
         verifyMarginDb = g(.verifyMarginDb, d.verifyMarginDb)
 
-        // Prompts: start from the built-in defaults, overlay the legacy
-        // promptSv / promptEn pair, then overlay the new `prompts` map last so
-        // it wins. Overlaying (rather than replacing) means customizing one
-        // language — `{"prompts":{"sv":"…"}}` — keeps the default domain
-        // prompt for every other language instead of blanking it.
-        prompts = d.prompts
-        if let legacy = try? decoder.container(keyedBy: LegacyPromptKeys.self) {
+        // ---- v3 language records + migration -----------------------------
+        //
+        // `languages` decodes from BOTH shapes without a version field: the v3
+        // array of objects, and the pre-v3 array of bare codes (see
+        // `LanguageSetting.init(from:)`). The two old side-maps are then
+        // overlaid onto whichever records exist, so a user who had
+        // `{"languages":["sv","en"],"modelPerLanguage":{"sv":"kb-whisper-large"},
+        //   "prompts":{"sv":"…"}}` comes out with two complete records and
+        // loses nothing.
+        if let legacy = try? decoder.container(keyedBy: LegacyKeys.self) {
             if let sv = (try? legacy.decodeIfPresent(String.self, forKey: .promptSv)) ?? nil {
-                prompts["sv"] = sv
+                legacyPrompts["sv"] = sv
             }
             if let en = (try? legacy.decodeIfPresent(String.self, forKey: .promptEn)) ?? nil {
-                prompts["en"] = en
+                legacyPrompts["en"] = en
+            }
+            // The v3-removed `prompts` map wins over the v2-removed pair.
+            if let p = (try? legacy.decodeIfPresent([String: String].self, forKey: .prompts)) ?? nil {
+                legacyPrompts.merge(p) { _, new in new }
+            }
+            if let m = (try? legacy.decodeIfPresent([String: String].self, forKey: .modelPerLanguage)) ?? nil {
+                legacyModelNames = m
             }
         }
-        if let p = (try? c.decodeIfPresent([String: String].self, forKey: .prompts)) ?? nil {
-            prompts.merge(p) { _, new in new }
+        let decoded = ((try? c.decodeIfPresent([LanguageSetting].self, forKey: .languages)) ?? nil) ?? []
+        languages = decoded.compactMap { rec in
+            guard !rec.code.isEmpty else { return nil }   // hand-edited junk row
+            var r = rec
+            if r.prompt == nil, let p = legacyPrompts[r.code] { r.prompt = p }
+            if r.model == nil, let m = legacyModelNames[r.code],
+               !m.trimmingCharacters(in: .whitespaces).isEmpty,
+               m != Self.preV3DefaultModels[r.code] { r.model = m }
+            return r
         }
     }
 
-    /// Resolve the logical model name for `lang` to a GGML file path. Defers
-    /// to `Models` for the well-known names (single source of truth with
-    /// `ModelDownloader`); falls back to legacy resolution for bare GGML
-    /// filenames or absolute overrides.
+    // MARK: Per-language lookups
+    //
+    // Every one of these reads the `languages` records first and falls back to
+    // the legacy maps only for an install that has never been configured. They
+    // are the single seam between "what the user asked for" and "what the
+    // pipeline does" — the segmenter, smoother, verifier and decoder all route
+    // through them, so they must not diverge.
+
+    /// The configured record for `lang`, if the user has one. First match wins
+    /// (a hand-edited duplicate code can't produce two answers).
+    func setting(for lang: String) -> LanguageSetting? {
+        languages.first { $0.code == lang }
+    }
+
+    /// Resolve the model reference for `lang` to a GGML file path. The
+    /// reference is normally a catalog filename; an absolute path and the
+    /// pre-v3 logical names (`kb-whisper-large`, `whisper-large-v3`) still
+    /// resolve so hand-edited and migrated configs keep working. "" when the
+    /// language has no explicit model — the caller then falls back to the
+    /// best installed model for that language.
     func modelPath(for lang: String) -> String {
-        let raw = (modelPerLanguage[lang] ?? "").trimmingCharacters(in: .whitespaces)
+        let raw = (setting(for: lang)?.model ?? legacyModelNames[lang] ?? "")
+        return Self.resolveModelReference(raw, kbVariant: kbWhisperVariant)
+    }
+
+    /// Pure reference → path resolution, split out so it's testable and so the
+    /// Settings model picker resolves exactly what the pipeline will.
+    static func resolveModelReference(_ reference: String, kbVariant: String) -> String {
+        let raw = reference.trimmingCharacters(in: .whitespaces)
         if raw.isEmpty { return "" }
         if raw.hasPrefix("/") { return raw }
         switch raw {
         case "kb-whisper-large":
-            return Models.kbWhisperLarge(variant: kbWhisperVariant)?.destPath ?? ""
+            return Models.kbWhisperLarge(variant: kbVariant)?.destPath ?? ""
         case "whisper-large-v3":
             return Models.largeV3.destPath
         default:
@@ -643,30 +694,42 @@ struct CodeSwitchConfig: Codable {
         }
     }
 
-    /// The model-fine-tuned prompt for `lang`. Returns "" when the language
-    /// has no entry — pipeline treats that as "no `--prompt` arg" so an
-    /// unconfigured language doesn't get nudged toward the wrong domain.
-    /// (Pre-v2 this silently fell back to `promptEn` for every non-`sv` label,
-    /// which gave a 3-language config the English prompt for its German runs.)
+    /// The model-fine-tuned prompt for `lang`: the record's prompt, else a
+    /// legacy hand-edit, else the built-in default for that language, else ""
+    /// — which the pipeline treats as "no `--prompt` arg" so an unconfigured
+    /// language doesn't get nudged toward the wrong domain. (Pre-v2 this
+    /// silently fell back to `promptEn` for every non-`sv` label, which gave a
+    /// 3-language config the English prompt for its German runs.)
     func prompt(for lang: String) -> String {
-        prompts[lang] ?? ""
+        if let explicit = setting(for: lang)?.prompt { return explicit }
+        if let legacy = legacyPrompts[lang] { return legacy }
+        return LanguageDefaults.prompt(for: lang)
     }
 
     /// Languages this run will actually label audio with, given what is on
     /// disk. If `languages` is configured (non-empty), keep it but drop
-    /// entries with no installed model — a user can't transcribe a language
-    /// whose model they haven't downloaded. If `languages` is empty,
-    /// the configured whitelist is "whatever is installed", so the pipeline
-    /// turns languages on/off purely by `~/.ghostie/models/` content.
+    /// entries that resolve to no model — a user can't transcribe a language
+    /// whose model they haven't downloaded. If `languages` is empty, the
+    /// install has never been configured, so the whitelist is "whatever is
+    /// installed" and the pipeline turns languages on/off purely by
+    /// `~/.ghostie/models/` content.
     ///
     /// Returned languages are de-duplicated (a hand-edited `["sv","sv"]` must
     /// not reach the smoother, where it would trap `Dictionary(uniqueKeys…)`)
     /// and, when configured, in `languages` order, preserving the user's
     /// stated priority; when empty, in `installed.languages` (sorted) order.
-    func effectiveLanguages(installed: InstalledModels) -> [String] {
+    func effectiveLanguages(installed: InstalledModels,
+                            present: (String) -> Bool = { FileManager.default.fileExists(atPath: $0) })
+        -> [String] {
         let base = languages.isEmpty
             ? installed.languages
-            : languages.filter { installed.modelPath(for: $0) != nil }
+            // Resolve through `effectiveModelPath`, not `installed` alone, so a
+            // language served only by an explicit out-of-catalog model path
+            // stays in the whitelist instead of being dropped here and then
+            // resolved by the decoder — the two used to disagree.
+            : languages.map(\.code).filter {
+                effectiveModelPath(for: $0, installed: installed, present: present) != nil
+              }
         var seen = Set<String>()
         return base.filter { seen.insert($0).inserted }
     }
@@ -677,20 +740,30 @@ struct CodeSwitchConfig: Codable {
     /// audio) and skew the smoother's prior toward a language with zero mass;
     /// fall back to the first effective language so the tiebreak/prior always
     /// points at something the pipeline can actually decode.
-    func effectiveDominant(installed: InstalledModels) -> String {
-        let langs = effectiveLanguages(installed: installed)
+    func effectiveDominant(installed: InstalledModels,
+                           present: (String) -> Bool = { FileManager.default.fileExists(atPath: $0) })
+        -> String {
+        let langs = effectiveLanguages(installed: installed, present: present)
         return langs.contains(dominantLanguage) ? dominantLanguage : (langs.first ?? dominantLanguage)
     }
 
-    /// GGML path for `lang`, layering the explicit `modelPerLanguage` override
-    /// (if it resolves on disk) over the installed-models map. Returns nil
-    /// when neither source can serve a model for that language — the caller
-    /// surfaces that as "missing model, run setup.sh --codeswitch".
-    func effectiveModelPath(for lang: String, installed: InstalledModels) -> String? {
-        let override = modelPath(for: lang)
-        if !override.isEmpty, FileManager.default.fileExists(atPath: override) {
-            return override
-        }
-        return installed.modelPath(for: lang)
+    /// GGML path for `lang`: the record's explicit model when it resolves on
+    /// disk, otherwise the best installed model that can decode that language —
+    /// its specialist if one is installed, else an installed multilingual model
+    /// (see `InstalledModels.decodePath`). That fallback is why adding German
+    /// usually costs no download at all: the large-v3 already on disk for
+    /// detection decodes it. Returns nil when nothing can serve it — Settings
+    /// surfaces that as "no model", the CLI as "missing model, run setup.sh
+    /// --codeswitch".
+    ///
+    /// `present` is the on-disk existence test, injectable so the pure
+    /// `LanguageSetup` resolver (and its self-tests) can answer the same
+    /// question without touching the filesystem.
+    func effectiveModelPath(for lang: String, installed: InstalledModels,
+                            present: (String) -> Bool = { FileManager.default.fileExists(atPath: $0) })
+        -> String? {
+        let explicit = modelPath(for: lang)
+        if !explicit.isEmpty, present(explicit) { return explicit }
+        return installed.decodePath(for: lang)
     }
 }

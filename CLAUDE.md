@@ -76,15 +76,30 @@ the same code drives the menu-bar app and the headless daemon.
   `<prefix>.json`.
 - **`TranscriptCleaner.swift`** — the per-track hallucination guard. Deliberately
   conservative (a single legitimate "Okay." survives). Covered by `selftest`.
-- **Code-switching (N-language, e.g. sv↔en)** — active whenever ≥2 per-language
-  whisper models are installed on disk; **the disk is the whitelist**, not a
-  Settings toggle (there is no `codeSwitch.enabled` flag). `codeSwitch.languages`
-  empty (the default) means "use whatever `Models.installed()` reports";
-  a non-empty list is an explicit override **and** the "I want code-switching"
-  intent signal Settings writes (so `Models.required` knows whether to fetch the
-  pair). `CodeSwitchConfig.effectiveLanguages(installed:)` / `effectiveDominant`
+- **Code-switching (N-language, e.g. sv↔en)** — active whenever ≥2 languages
+  resolve to an installed model; there is no `codeSwitch.enabled` flag.
+  `codeSwitch.languages` is an array of **`LanguageSetting` records**
+  (`{code, model?, prompt?}` — see `Languages.swift`); empty (a fresh install)
+  means "use whatever `Models.installed()` reports", so the disk is the
+  whitelist until the user configures one. Settings *materializes* the list
+  from disk on the first add/remove, so from then on the config and the pane
+  agree. `CodeSwitchConfig.effectiveLanguages(installed:)` / `effectiveDominant`
   / `effectiveModelPath` resolve config ∩ disk into the single whitelist every
   stage (segmenter, smoother, verifier, decoder) reads — they must not diverge.
+  **`LanguageSetup.resolve(config:catalog:present:)`** is the one computation
+  behind the Settings pane, `doctor`, and the add/remove flows: pure, with
+  `present` as the injected on-disk test, so all of it is checkable in
+  `selftest` without a filesystem. UI code must render it, not re-derive it.
+- **Multilingual fallback** — `CatalogEntry.multilingual` (large-v3 family)
+  means "decodes any Whisper language", so every language gets a default model
+  without a per-language catalog entry, and adding German/Spanish usually costs
+  no download. Keep the two lookups distinct: `InstalledModels.modelPath(for:)`
+  is *specialists only* and feeds `languages`, the **disk-driven whitelist**;
+  `decodePath(for:)` adds the multilingual fallback and feeds
+  `effectiveModelPath`. Widening the former would make one installed large-v3
+  mean "listen for 99 languages" — there's a selftest pinning this.
+  `multilingual` is separate from `goodForLID` (decode coverage vs. the
+  language *head*); they coincide for large-v3, not in principle.
   When active it replaces the single whisper pass; per-track cleaning + the
   timestamp merge in `Pipeline` are unchanged. `LanguageSegmenter.swift` (VAD
   segments + per-segment language detection), `LanguageIdentifier.swift` (the
@@ -150,7 +165,12 @@ the same code drives the menu-bar app and the headless daemon.
   that with `try?` → a single new key would reset every existing user's whole
   config. `Config`/`CodeSwitchConfig` therefore have hand-written
   `init(from:)` using `decodeIfPresent ?? default`; **add new config keys to
-  both the property list and that init**.
+  both the property list and that init**. Retired keys are read but never
+  written: `CodeSwitchConfig.LegacyKeys` (`promptSv`/`promptEn`, `prompts`,
+  `modelPerLanguage`) folds them into `languages` records on decode, and
+  `LanguageSetting` decodes from a bare string so a pre-v3 `["sv","en"]`
+  migrates by being decoded. Every legacy shape has a `selftest` case — keep it
+  that way, because a decoder slip here is a silent whole-config reset.
 - **whisper-cli quirks (codeswitch)**: `--detect-language`/`-dl` ignores
   `--offset-t`/`--duration` (detects from file start) → segments are physically
   sliced before detection; `-nt` collapses the VAD pass to one segment (never

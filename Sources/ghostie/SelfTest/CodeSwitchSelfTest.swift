@@ -275,47 +275,114 @@ func runCodeSwitchSelfTest() -> Bool {
           && tl.mostRecentEndingBefore(6_000, withinMs: 500) == nil
           && tl.mostRecentEndingBefore(8_000, withinMs: 8_000) == "en")
 
-    // CodeSwitchConfig prompt-map migration. The new `prompts: [String:String]`
-    // map replaces `promptSv` / `promptEn`; old user configs (and partials)
-    // must migrate cleanly via `init(from:)`, and the latent
-    // `lang == "sv" ? promptSv : promptEn` fallback (which silently returned
-    // English for every non-Swedish language) must be gone.
+    // CodeSwitchConfig v3 migration: `languages: [String]` + `modelPerLanguage`
+    // + `prompts` (and the pre-v2 `promptSv`/`promptEn` pair) all collapse into
+    // `languages: [LanguageSetting]`. Every legacy shape must load without
+    // losing user data — `Config.loadRaw()`'s `try?` turns any decoder slip
+    // into a silent whole-config reset, so these are the highest-stakes checks
+    // in the suite.
     do {
         let dec = JSONDecoder()
         func decode(_ json: String) -> CodeSwitchConfig {
-            try! dec.decode(CodeSwitchConfig.self,
-                            from: Data(json.utf8))
+            try! dec.decode(CodeSwitchConfig.self, from: Data(json.utf8))
         }
-        let legacy = decode(#"{"enabled":true,"promptSv":"SV-CUSTOM","promptEn":"EN-CUSTOM"}"#)
-        check("legacy promptSv migrates to prompts['sv']",
-              legacy.prompts["sv"] == "SV-CUSTOM")
-        check("legacy promptEn migrates to prompts['en']",
-              legacy.prompts["en"] == "EN-CUSTOM")
-        check("prompt(for:) reads from the new map",
-              legacy.prompt(for: "sv") == "SV-CUSTOM")
-        check("prompt(for:) on unknown language returns \"\" (no silent en fallback)",
-              legacy.prompt(for: "de") == "")
 
-        let withMap = decode(#"{"prompts":{"sv":"NEW","de":"NEW-DE"},"promptSv":"IGNORED"}"#)
-        check("new prompts map wins over legacy fields",
-              withMap.prompts["sv"] == "NEW")
-        check("new prompts map honors N-language entries",
-              withMap.prompts["de"] == "NEW-DE")
-        check("partial prompts map preserves the default for unlisted languages",
-              withMap.prompts["en"]?.contains("Business call") ?? false)
+        // --- pre-v2: promptSv / promptEn, no languages list ----------------
+        let v1 = decode(#"{"enabled":true,"promptSv":"SV-CUSTOM","promptEn":"EN-CUSTOM"}"#)
+        check("v1: promptSv survives as prompt(for: sv)", v1.prompt(for: "sv") == "SV-CUSTOM")
+        check("v1: promptEn survives as prompt(for: en)", v1.prompt(for: "en") == "EN-CUSTOM")
+        check("v1: unknown language returns \"\" (no silent en fallback)",
+              v1.prompt(for: "de") == "")
+        check("v1: no languages list → still disk-driven (empty records)",
+              v1.languages.isEmpty)
 
-        let empty = decode("{}")
-        check("missing prompts → defaults preserved",
-              (empty.prompts["sv"]?.contains("svenska") ?? false)
-              && (empty.prompts["en"]?.contains("Business call") ?? false))
+        // --- v2: prompts map, still no records -----------------------------
+        let v2 = decode(#"{"prompts":{"sv":"NEW","de":"NEW-DE"},"promptSv":"IGNORED"}"#)
+        check("v2: prompts map wins over the pre-v2 pair", v2.prompt(for: "sv") == "NEW")
+        check("v2: prompts map honors N-language entries", v2.prompt(for: "de") == "NEW-DE")
+        check("v2: unlisted language falls back to the built-in default",
+              v2.prompt(for: "en").contains("Business call"))
 
+        let bare = decode("{}")
+        check("defaults: sv/en built-in prompts still apply with no config",
+              bare.prompt(for: "sv").contains("svenska")
+              && bare.prompt(for: "en").contains("Business call"))
+
+        // --- v2 → v3: a bare code list becomes records ---------------------
+        let v2list = decode(#"{"languages":["sv","en"]}"#)
+        check("v2→v3: [\"sv\",\"en\"] decodes into two records in order",
+              v2list.languages.map(\.code) == ["sv", "en"])
+        check("v2→v3: migrated records take the auto-pick model",
+              v2list.languages.allSatisfy { $0.model == nil })
+
+        // --- v2 → v3: the two side-maps fold onto the records --------------
+        let full = decode("""
+        {"languages":["sv","en"],
+         "modelPerLanguage":{"sv":"/my/own/swedish.bin"},
+         "prompts":{"sv":"SV-P","en":"EN-P"}}
+        """)
+        check("v2→v3: a hand-edited modelPerLanguage folds into the record",
+              full.setting(for: "sv")?.model == "/my/own/swedish.bin")
+        check("v2→v3: prompts fold into the records",
+              full.prompt(for: "sv") == "SV-P" && full.prompt(for: "en") == "EN-P")
+        check("v2→v3: a language with no legacy model keeps the auto-pick",
+              full.setting(for: "en")?.model == nil)
+
+        // The shipped pre-v3 defaults are in EVERY existing config.json whether
+        // or not the user chose them. Migrating them as explicit pins would
+        // label two rows "pinned" that nobody pinned, and freeze them onto one
+        // model forever.
+        let shipped = decode("""
+        {"languages":["sv","en"],
+         "modelPerLanguage":{"sv":"kb-whisper-large","en":"whisper-large-v3"}}
+        """)
+        check("v2→v3: shipped default model names migrate to auto-pick, not pins",
+              shipped.languages.allSatisfy { $0.model == nil })
+        check("v2→v3: a legacy logical name still resolves when it IS a real pin",
+              decode(#"{"languages":[{"code":"sv","model":"kb-whisper-large"}]}"#)
+                  .modelPath(for: "sv") == Models.kbWhisperLarge(variant: "standard")?.destPath)
+
+        // --- v3 native -----------------------------------------------------
+        let v3 = decode("""
+        {"languages":[{"code":"de","model":"ggml-de.bin","prompt":"DE-P"},{"code":"en"}]}
+        """)
+        check("v3: object records decode fully",
+              v3.setting(for: "de")?.model == "ggml-de.bin"
+              && v3.prompt(for: "de") == "DE-P")
+        check("v3: a catalog filename resolves under the models dir",
+              v3.modelPath(for: "de") == "\(Config.modelsDir)/ggml-de.bin")
+        check("v3: an explicit empty prompt beats the built-in default",
+              decode(#"{"languages":[{"code":"sv","prompt":""}]}"#).prompt(for: "sv") == "")
+        check("v3: a record with no prompt still gets the built-in default",
+              v3.languages.count == 2 && decode(#"{"languages":["sv"]}"#)
+                  .prompt(for: "sv").contains("svenska"))
+        check("v3: a junk record with no code is dropped, not kept as \"\"",
+              decode(#"{"languages":[{"model":"x.bin"},{"code":"en"}]}"#)
+                  .languages.map(\.code) == ["en"])
+
+        // --- round trip: legacy keys are read once and never written back --
         let enc = JSONEncoder()
         enc.outputFormatting = [.sortedKeys]
-        let blob = String(data: try! enc.encode(legacy), encoding: .utf8) ?? ""
-        check("re-encoded config writes 'prompts', drops legacy keys",
-              blob.contains("\"prompts\"")
-              && !blob.contains("promptSv")
-              && !blob.contains("promptEn"))
+        let blob = String(data: try! enc.encode(full), encoding: .utf8) ?? ""
+        check("re-encode: writes 'languages' records, drops every legacy key",
+              blob.contains("\"languages\"")
+              && blob.contains("\"code\":\"sv\"")
+              && !blob.contains("promptSv") && !blob.contains("promptEn")
+              && !blob.contains("modelPerLanguage") && !blob.contains("\"prompts\""))
+        let reread = try! dec.decode(CodeSwitchConfig.self, from: Data(blob.utf8))
+        check("re-encode: a save/load round trip is lossless",
+              reread.setting(for: "sv")?.model == "/my/own/swedish.bin"
+              && reread.prompt(for: "sv") == "SV-P"
+              && reread.prompt(for: "en") == "EN-P"
+              && reread.languages.map(\.code) == ["sv", "en"],
+              blob)
+
+        // A nil model must not be written as `null` — config.json is a file
+        // people read and hand-edit.
+        let sparse = String(data: try! enc.encode(decode(#"{"languages":["en"]}"#)),
+                            encoding: .utf8) ?? ""
+        check("re-encode: nil model/prompt are omitted, not null",
+              !sparse.contains("null"), sparse)
     }
 
     // effectiveLanguages / effectiveModelPath: the v2 contract that the disk
@@ -352,20 +419,29 @@ func runCodeSwitchSelfTest() -> Bool {
         check("configured 2 + nothing installed → empty",
               c.effectiveLanguages(installed: empty) == [])
 
-        // effectiveModelPath: override resolves on disk → wins.
-        // Override does NOT exist on disk → fall through to installed map.
+        // effectiveModelPath: a record's explicit model resolves on disk → wins.
+        // Explicit model NOT on disk → fall through to the installed map.
         // Neither → nil.
-        c.modelPerLanguage = ["en": "/dev/null"]    // exists; absolute path
-        check("override that exists on disk wins over installed map",
+        c.languages = [LanguageSetting(code: "en", model: "/dev/null")]  // exists
+        check("explicit model that exists on disk wins over installed map",
               c.effectiveModelPath(for: "en", installed: installed1) == "/dev/null")
 
-        c.modelPerLanguage = ["en": "/tmp/this-file-does-not-exist-xyzzy"]
-        check("override that doesn't exist falls through to installed",
+        c.languages = [LanguageSetting(code: "en", model: "/tmp/this-file-does-not-exist-xyzzy")]
+        check("explicit model that doesn't exist falls through to installed",
               c.effectiveModelPath(for: "en", installed: installed1) == "/stub/lv3.bin")
 
-        c.modelPerLanguage = [:]
-        check("no override + nothing installed for lang → nil",
+        c.languages = []
+        check("no explicit model + nothing installed for lang → nil",
               c.effectiveModelPath(for: "fr", installed: installed3) == nil)
+
+        // A language served ONLY by an out-of-catalog absolute path stays in
+        // the whitelist. Pre-v3 effectiveLanguages filtered on the installed
+        // map alone, so it dropped the language here while effectiveModelPath
+        // happily resolved it — the two disagreed.
+        c.languages = [LanguageSetting(code: "fr", model: "/dev/null")]
+        check("explicit out-of-catalog model keeps its language in the whitelist",
+              c.effectiveLanguages(installed: installed3) == ["fr"])
+        c.languages = []
 
         // effectiveDominant clamps a dominant with no installed model into the
         // whitelist, so off-whitelist runs never bucket into a language the
@@ -460,6 +536,296 @@ func runCodeSwitchSelfTest() -> Bool {
         // multilingual model wins even though the specialist is larger).
         check("catalog: single-language pick prefers a goodForLID model over a larger specialist",
               Models.bestSingleLanguageModel(from: [ar, customMulti]) { _ in true } == customMulti.model()!.destPath)
+    }
+
+    // LanguageSetup: the single resolver the Settings pane, `doctor` and the
+    // add/remove flows all read. Pure — `present` is the on-disk test — so the
+    // whole UI's state is checkable here without a filesystem.
+    do {
+        let lv3 = CatalogEntry(from: Models.largeV3, builtin: true)
+        let kb = CatalogEntry(from: Models.kbWhisperLarge(variant: "standard")!,
+                              builtin: true, kbVariant: "standard")
+        let base = CatalogEntry(from: Models.baseEnglish, builtin: true)
+        let vad = CatalogEntry(from: Models.sileroVAD, builtin: true)
+        let de = CatalogEntry(filename: "ggml-de.bin", url: "https://example.test/de.bin",
+                              label: "German specialist", language: "de",
+                              goodForLID: false, approxBytes: 900_000_000)
+        let catalog = [lv3, kb, base, vad, de]
+        func path(_ e: CatalogEntry) -> String { e.model()!.destPath }
+        func onDisk(_ entries: [CatalogEntry]) -> (String) -> Bool {
+            let paths = Set(entries.map(path))
+            return { paths.contains($0) }
+        }
+
+        // Nothing installed, nothing configured.
+        let bare = LanguageSetup.resolve(config: Config(), catalog: catalog,
+                                         present: onDisk([]))
+        check("setup: nothing installed → unconfigured, no rows",
+              bare.rows.isEmpty && bare.mode == .unconfigured && !bare.isConfigured)
+
+        // Disk-driven: two models on disk, no config. Rows come from the disk
+        // and the mode is code-switching.
+        let disk2 = LanguageSetup.resolve(config: Config(), catalog: catalog,
+                                          present: onDisk([lv3, kb, vad]))
+        check("setup: disk-driven install lists what's installed",
+              disk2.rows.map(\.code) == ["en", "sv"] && !disk2.isConfigured,
+              "got \(disk2.rows.map(\.code))")
+        check("setup: two installed languages → code-switch mode",
+              disk2.mode == .codeSwitch(["en", "sv"]))
+        check("setup: large-v3 is named as the detection driver",
+              disk2.detectionModelLabel == Models.largeV3.label
+              && disk2.rows.first { $0.code == "en" }?.drivesDetection == true)
+        check("setup: the KB row is not claiming to drive detection",
+              disk2.rows.first { $0.code == "sv" }?.drivesDetection == false)
+        check("setup: a healthy 2-language install has no warnings",
+              disk2.warnings.isEmpty, "got \(disk2.warnings)")
+
+        // The failure the old UI never mentioned: two languages, but the only
+        // models are a Swedish-biased head and a German specialist, so nothing
+        // can tell them apart.
+        var noLID = Config()
+        noLID.codeSwitch.languages = ["sv", "de"]
+        noLID.whisperModel = "/nonexistent"
+        let degraded = LanguageSetup.resolve(config: noLID, catalog: catalog,
+                                             present: onDisk([kb, de, vad]))
+        check("setup: no balanced multilingual model → noDetectionModel warning",
+              degraded.warnings.contains(.noDetectionModel)
+              && degraded.detectionModelLabel == nil,
+              "got \(degraded.warnings)")
+        check("setup: degraded routing still lists both languages as ready",
+              degraded.rows.allSatisfy { $0.state == .onDisk })
+
+        // VAD is load-bearing for code-switching and silent when absent.
+        let noVAD = LanguageSetup.resolve(config: Config(), catalog: catalog,
+                                          present: onDisk([lv3, kb]))
+        check("setup: code-switching without Silero VAD warns",
+              noVAD.warnings.contains(.vadMissing), "got \(noVAD.warnings)")
+        check("setup: one language + no VAD does not warn (single pass doesn't need it)",
+              !LanguageSetup.resolve(config: Config(), catalog: catalog,
+                                     present: onDisk([base])).warnings.contains(.vadMissing))
+
+        // A configured language whose model isn't downloaded: shown, flagged,
+        // and NOT counted as active — so the mode reflects reality. Needs a
+        // disk with no multilingual model, or large-v3 would cover German
+        // (which is the point of the coverage checks further down).
+        var pending = Config()
+        pending.codeSwitch.languages = ["sv", "de"]
+        let half = LanguageSetup.resolve(config: pending, catalog: catalog,
+                                         present: onDisk([kb, vad]))
+        check("setup: configured-but-missing language is listed, not silently dropped",
+              half.rows.map(\.code) == ["sv", "de"])
+        check("setup: its state is .missing and it warns",
+              half.rows.last?.state == .missing
+              && half.warnings.contains(.modelMissing(code: "de")),
+              "got \(String(describing: half.rows.last?.state)) \(half.warnings)")
+        check("setup: a missing model doesn't count toward code-switch mode",
+              half.mode == .single("sv"), "got \(half.mode)")
+        check("setup: the row still names the model it would download",
+              half.rows.last?.modelFilename == "ggml-de.bin")
+
+        // A language nothing in the catalog can decode. With a multilingual
+        // model in the catalog this state is nearly unreachable — which is the
+        // improvement — so it takes a specialists-only catalog to produce.
+        var unknown = Config()
+        unknown.codeSwitch.languages = ["en", "ja"]
+        let noModel = LanguageSetup.resolve(config: unknown, catalog: [kb, base, vad],
+                                            present: onDisk([base, vad]))
+        check("setup: language nothing can decode → .none + noModelForLanguage",
+              noModel.rows.last?.state == LanguageSetup.ModelState.none
+              && noModel.warnings.contains(.noModelForLanguage(code: "ja")),
+              "got \(String(describing: noModel.rows.last?.state)) \(noModel.warnings)")
+
+        // An explicitly pinned model beats the auto-pick and says so.
+        var pinned = Config()
+        pinned.codeSwitch.languages = [LanguageSetting(code: "en", model: base.filename)]
+        let pinnedSetup = LanguageSetup.resolve(config: pinned, catalog: catalog,
+                                                present: onDisk([lv3, base, vad]))
+        check("setup: an explicit model wins over the better auto-pick",
+              pinnedSetup.rows.first?.modelFilename == base.filename
+              && pinnedSetup.rows.first?.modelIsExplicit == true)
+
+        // dominantLanguage surfaces as exactly one primary row.
+        var dom = Config()
+        dom.codeSwitch.languages = ["sv", "en"]
+        dom.codeSwitch.dominantLanguage = "sv"
+        let domSetup = LanguageSetup.resolve(config: dom, catalog: catalog,
+                                             present: onDisk([lv3, kb, vad]))
+        check("setup: exactly one row is primary, and it's the dominant language",
+              domSetup.rows.filter(\.isPrimary).map(\.code) == ["sv"])
+
+        // materialized / adding / removing — the three edit primitives the
+        // Settings flows share, so "grow the whitelist" can't be forgotten at
+        // a call site the way it was in two places pre-v3.
+        let seeded = LanguageSetup.materialized(config: Config(), catalog: catalog,
+                                                present: onDisk([lv3, kb]))
+        check("materialize: an unconfigured install seeds from disk",
+              seeded.map(\.code) == ["en", "sv"], "got \(seeded.map(\.code))")
+        var already = Config()
+        already.codeSwitch.languages = [LanguageSetting(code: "de", prompt: "KEEP")]
+        check("materialize: a configured install is returned untouched",
+              LanguageSetup.materialized(config: already, catalog: catalog,
+                                         present: onDisk([lv3])).map(\.code) == ["de"])
+
+        let grown = LanguageSetup.adding("de", model: "ggml-de.bin", to: seeded)
+        check("adding: appends a new language with its model",
+              grown.map(\.code) == ["en", "sv", "de"] && grown.last?.model == "ggml-de.bin")
+        let repointed = LanguageSetup.adding("en", model: base.filename, to: grown)
+        check("adding: re-adding an existing language re-points it in place",
+              repointed.map(\.code) == ["en", "sv", "de"]
+              && repointed.first?.model == base.filename)
+        let keepsPrompt = LanguageSetup.adding(
+            "de", model: "other.bin", to: [LanguageSetting(code: "de", prompt: "KEEP")])
+        check("adding: changing the model keeps the language's prompt",
+              keepsPrompt.first?.prompt == "KEEP" && keepsPrompt.first?.model == "other.bin")
+
+        check("removing: drops the language",
+              LanguageSetup.removing("sv", from: grown)?.map(\.code) == ["en", "de"])
+        check("removing: the last language returns nil so the caller can explain",
+              LanguageSetup.removing("en", from: ["en"]) == nil)
+    }
+
+    // Multilingual coverage: one large-v3 is the default decoder for every
+    // language without a specialist, so German/Spanish work with no extra
+    // download. The load-bearing constraint is that this must NOT widen the
+    // disk-driven whitelist — installing large-v3 can't mean "Ghostie now
+    // listens for 99 languages".
+    do {
+        let lv3 = CatalogEntry(from: Models.largeV3, builtin: true)
+        let turbo = CatalogEntry(from: Models.largeV3Turbo, builtin: true)
+        let kb = CatalogEntry(from: Models.kbWhisperLarge(variant: "standard")!,
+                              builtin: true, kbVariant: "standard")
+        let base = CatalogEntry(from: Models.baseEnglish, builtin: true)
+        let vad = CatalogEntry(from: Models.sileroVAD, builtin: true)
+        let catalog = [lv3, turbo, kb, base, vad]
+        func path(_ e: CatalogEntry) -> String { e.model()!.destPath }
+        func onDisk(_ es: [CatalogEntry]) -> (String) -> Bool {
+            let s = Set(es.map(path)); return { s.contains($0) }
+        }
+
+        check("catalog: large-v3 declares multilingual, KB and base.en do not",
+              lv3.multilingual && turbo.multilingual && !kb.multilingual && !base.multilingual)
+        check("catalog: decodes() covers any Whisper language for a multilingual model",
+              lv3.decodes("de") && lv3.decodes("es") && lv3.decodes("en"))
+        check("catalog: a specialist decodes only its own language",
+              kb.decodes("sv") && !kb.decodes("de"))
+        check("catalog: decodes() rejects a code Whisper can't emit",
+              !lv3.decodes("klingon") && !lv3.decodes(""))
+        check("catalog: VAD decodes nothing", !vad.decodes("en") && !vad.decodes("sv"))
+
+        // The recommendation for a language with no specialist.
+        check("recommended: German falls to large-v3 (no per-language model needed)",
+              ModelCatalog.recommended(for: "de", in: catalog, kbVariant: "standard")?.filename
+                  == Models.largeV3.filename)
+        check("recommended: Spanish likewise",
+              ModelCatalog.recommended(for: "es", in: catalog, kbVariant: "standard")?.filename
+                  == Models.largeV3.filename)
+        check("recommended: a specialist still beats the generalist for its language",
+              ModelCatalog.recommended(for: "sv", in: catalog, kbVariant: "standard")?.filename
+                  == Models.kbWhisperLarge(variant: "standard")!.filename)
+        check("entries(for:): German is offered both multilingual models, turbo second",
+              ModelCatalog.entries(for: "de", in: catalog, kbVariant: "standard").map(\.filename)
+                  == [Models.largeV3.filename, Models.largeV3Turbo.filename])
+        check("entries(for:): Swedish lists KB first, then the generalists",
+              ModelCatalog.entries(for: "sv", in: catalog, kbVariant: "standard").first?.filename
+                  == Models.kbWhisperLarge(variant: "standard")!.filename)
+
+        // A user-added specialist must outrank the generalist for its language.
+        let deSpecialist = CatalogEntry(filename: "ggml-de.bin", url: "https://example.test/de.bin",
+                                        label: "German specialist", language: "de",
+                                        approxBytes: 900_000_000)
+        check("entries(for:): a user's German specialist outranks large-v3 for German",
+              ModelCatalog.entries(for: "de", in: catalog + [deSpecialist],
+                                   kbVariant: "standard").first?.filename == "ggml-de.bin")
+
+        // THE constraint: multilingual models must not widen `languages`.
+        let inst = Models.installed(from: catalog, preferredKBVariant: "standard",
+                                    present: onDisk([lv3, kb, vad]))
+        check("installed: the disk-driven whitelist stays the specialists only",
+              inst.languages == ["en", "sv"], "got \(inst.languages)")
+        check("installed: modelPath is nil for a language nothing specializes in",
+              inst.modelPath(for: "de") == nil)
+        check("installed: decodePath falls back to the multilingual model",
+              inst.decodePath(for: "de") == Models.largeV3.destPath)
+        check("installed: decodePath prefers a specialist over the generalist",
+              inst.decodePath(for: "sv") == Models.kbWhisperLarge(variant: "standard")!.destPath)
+        check("installed: no multilingual model on disk → no fallback",
+              Models.installed(from: catalog, preferredKBVariant: "standard",
+                               present: onDisk([kb, base])).decodePath(for: "de") == nil)
+
+        // End to end: configuring German with only large-v3 + KB installed.
+        var withDE = Config()
+        withDE.codeSwitch.languages = ["sv", "en", "de"]
+        check("config: German resolves to the installed large-v3, no download",
+              withDE.codeSwitch.effectiveModelPath(for: "de", installed: inst,
+                                                   present: onDisk([lv3, kb, vad]))
+                  == Models.largeV3.destPath)
+        check("config: all three languages are effective",
+              withDE.codeSwitch.effectiveLanguages(installed: inst,
+                                                   present: onDisk([lv3, kb, vad]))
+                  == ["sv", "en", "de"])
+        let deSetup = LanguageSetup.resolve(config: withDE, catalog: catalog,
+                                            present: onDisk([lv3, kb, vad]))
+        check("setup: German shows Ready on the large-v3 already installed",
+              deSetup.rows.first { $0.code == "de" }?.state == .onDisk
+              && deSetup.rows.first { $0.code == "de" }?.modelFilename == Models.largeV3.filename)
+        check("setup: three languages, no warnings, detection still resolved",
+              deSetup.mode == .codeSwitch(["sv", "en", "de"])
+              && deSetup.warnings.isEmpty
+              && deSetup.detectionModelLabel == Models.largeV3.label,
+              "got \(deSetup.warnings)")
+        check("setup: an UNCONFIGURED install with large-v3 still lists only en+sv",
+              LanguageSetup.resolve(config: Config(), catalog: catalog,
+                                    present: onDisk([lv3, kb, vad])).rows.map(\.code) == ["en", "sv"])
+        check("required: German adds nothing to fetch when large-v3 is present",
+              Models.required(for: withDE, catalog: catalog, installed: inst)
+                  .map(\.filename).sorted()
+                  == [Models.kbWhisperLarge(variant: "standard")!.filename,
+                      Models.largeV3.filename, Models.sileroVAD.filename].sorted())
+    }
+
+    // Models.required: derived from the CONFIGURED languages, not a hardcoded
+    // sv+en pair. Pre-v3 any 2-language setup reported KB-Whisper + large-v3,
+    // so a German+English user got 1.1 GB of Swedish auto-downloaded on launch.
+    do {
+        let lv3 = CatalogEntry(from: Models.largeV3, builtin: true)
+        let kb = CatalogEntry(from: Models.kbWhisperLarge(variant: "standard")!,
+                              builtin: true, kbVariant: "standard")
+        let base = CatalogEntry(from: Models.baseEnglish, builtin: true)
+        let vad = CatalogEntry(from: Models.sileroVAD, builtin: true)
+        let de = CatalogEntry(filename: "ggml-de.bin", url: "https://example.test/de.bin",
+                              label: "German", language: "de", approxBytes: 900_000_000)
+        let catalog = [lv3, kb, base, vad, de]
+        let nothing = InstalledModels(perLanguage: [:])
+
+        func names(_ ms: [Model]) -> [String] { ms.map(\.filename) }
+
+        var deEn = Config()
+        deEn.codeSwitch.languages = ["de", "en"]
+        let req = Models.required(for: deEn, catalog: catalog, installed: nothing)
+        check("required: de+en asks for the German and English models, never KB",
+              names(req).contains("ggml-de.bin")
+              && names(req).contains(Models.largeV3.filename)
+              && !names(req).contains(Models.kbWhisperLarge(variant: "standard")!.filename),
+              "got \(names(req))")
+        check("required: VAD is always included", names(req).contains(Models.sileroVAD.filename))
+        check("required: the LID driver is NOT force-required (it's a Settings warning)",
+              names(req).count == 3, "got \(names(req))")
+
+        check("required: a fresh install bootstraps base.en, not a 2 GB pair",
+              names(Models.required(for: Config(), catalog: catalog, installed: nothing))
+                  == [Models.baseEnglish.filename, Models.sileroVAD.filename])
+
+        check("required: unconfigured but sv installed → the Swedish model, not base.en",
+              names(Models.required(for: Config(), catalog: catalog,
+                                    installed: InstalledModels(perLanguage: ["sv": "/x"])))
+                  == [Models.kbWhisperLarge(variant: "standard")!.filename,
+                      Models.sileroVAD.filename])
+
+        var pinned = Config()
+        pinned.codeSwitch.languages = [LanguageSetting(code: "en", model: base.filename)]
+        check("required: an explicitly pinned model is what gets fetched",
+              names(Models.required(for: pinned, catalog: catalog, installed: nothing))
+                  == [Models.baseEnglish.filename, Models.sileroVAD.filename])
     }
 
     // LanguageIdentifier seam: WhisperLID parse + spread, and the segmenter's

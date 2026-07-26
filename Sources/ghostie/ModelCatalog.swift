@@ -27,9 +27,15 @@ struct CatalogEntry: Codable {
     var language: String = ""
     /// Whether this is a *balanced multilingual* model fit to drive VAD and the
     /// `--detect-language` head (large-v3 = true; KB-Whisper's sv-biased head
-    /// and English-only base.en = false). The "use for language detection"
-    /// checkbox in Settings writes this.
+    /// and English-only base.en = false). The "this model can tell languages
+    /// apart" checkbox in the Add-a-language sheet writes this.
     var goodForLID: Bool = false
+    /// Whether this model can *decode* any Whisper language rather than just
+    /// `language`. Lets one large-v3 be the offered default for German,
+    /// Spanish, and everything else without a per-language catalog entry.
+    /// Distinct from `goodForLID`, which is about the language *head*: a model
+    /// could decode many languages while being useless at identifying them.
+    var multilingual: Bool = false
     /// Size hint for the UI / download skip-check. 0 == unknown (the downloader
     /// then relies on the sidecar, which is correct — never a false skip).
     var approxBytes: Int64 = 0
@@ -47,6 +53,7 @@ struct CatalogEntry: Codable {
          label: String,
          language: String = "",
          goodForLID: Bool = false,
+         multilingual: Bool = false,
          approxBytes: Int64 = 0,
          builtin: Bool = false,
          kbVariant: String? = nil) {
@@ -55,9 +62,19 @@ struct CatalogEntry: Codable {
         self.label = label
         self.language = language
         self.goodForLID = goodForLID
+        self.multilingual = multilingual
         self.approxBytes = approxBytes
         self.builtin = builtin
         self.kbVariant = kbVariant
+    }
+
+    /// Whether this entry can decode `code`: it either specializes in that
+    /// language, or it's a multilingual model and the language is one Whisper
+    /// knows. VAD (empty `language`) decodes nothing.
+    func decodes(_ code: String) -> Bool {
+        guard !language.isEmpty else { return false }
+        if language == code { return true }
+        return multilingual && WhisperLanguages.isSupported(code)
     }
 
     /// Build a seed entry from one of the built-in `Models` statics, so URLs /
@@ -68,6 +85,7 @@ struct CatalogEntry: Codable {
                   label: model.label,
                   language: model.language,
                   goodForLID: model.goodForLID,
+                  multilingual: model.multilingual,
                   approxBytes: model.approxBytes,
                   builtin: builtin,
                   kbVariant: kbVariant)
@@ -82,11 +100,13 @@ struct CatalogEntry: Codable {
                      label: label,
                      approxBytes: approxBytes,
                      language: language,
-                     goodForLID: goodForLID)
+                     goodForLID: goodForLID,
+                     multilingual: multilingual)
     }
 
     enum CodingKeys: String, CodingKey {
-        case filename, url, label, language, goodForLID, approxBytes, builtin, kbVariant
+        case filename, url, label, language, goodForLID, multilingual
+        case approxBytes, builtin, kbVariant
     }
 
     /// Hand-rolled to be resilient to missing keys (same trap that bit
@@ -103,6 +123,7 @@ struct CatalogEntry: Codable {
         label = g(.label, "")
         language = g(.language, "")
         goodForLID = g(.goodForLID, false)
+        multilingual = g(.multilingual, false)
         approxBytes = g(.approxBytes, Int64(0))
         builtin = g(.builtin, false)
         kbVariant = (try? c.decodeIfPresent(String.self, forKey: .kbVariant)) ?? nil
@@ -126,9 +147,14 @@ enum ModelCatalog {
     static var path: String { "\(NSHomeDirectory())/.ghostie/models.json" }
 
     /// The curated built-ins, derived from the `Models` statics. large-v3 first
-    /// (the multilingual LID driver), both KB variants, base.en, then VAD.
+    /// (the multilingual LID driver and the default decoder for any language
+    /// without a specialist), then turbo (the lighter multilingual option),
+    /// both KB variants, base.en, then VAD.
     static func builtinSeeds() -> [CatalogEntry] {
-        var out: [CatalogEntry] = [CatalogEntry(from: Models.largeV3, builtin: true)]
+        var out: [CatalogEntry] = [
+            CatalogEntry(from: Models.largeV3, builtin: true),
+            CatalogEntry(from: Models.largeV3Turbo, builtin: true)
+        ]
         for v in ["standard", "strict"] {
             if let kb = Models.kbWhisperLarge(variant: v) {
                 out.append(CatalogEntry(from: kb, builtin: true, kbVariant: v))
@@ -170,6 +196,34 @@ enum ModelCatalog {
             seen.insert(e.filename)
         }
         return out
+    }
+
+    /// Every catalog entry that can decode `language`, best first — a
+    /// specialist for that language, plus every multilingual model, so German
+    /// and Spanish get a real default instead of "paste a Hugging Face repo".
+    ///
+    /// Ordering puts a **specialist ahead of a generalist** (KB-Whisper wins
+    /// for Swedish even though large-v3 also decodes it), and otherwise reuses
+    /// the ranking `Models.installed` applies to same-language siblings — so
+    /// the model Settings *offers* is the one the pipeline would *choose* once
+    /// it's on disk.
+    static func entries(for language: String, in catalog: [CatalogEntry],
+                        kbVariant: String) -> [CatalogEntry] {
+        // Disjoint bands: `siblingRank` tops out around 6e12, so an 8e12
+        // penalty on generalists can never be outweighed by it.
+        func rank(_ e: CatalogEntry) -> Int64 {
+            let generalistPenalty: Int64 = (e.language == language) ? 0 : 8_000_000_000_000
+            return generalistPenalty + Models.siblingRank(e, preferredKBVariant: kbVariant)
+        }
+        return catalog.filter { $0.decodes(language) }.sorted { rank($0) < rank($1) }
+    }
+
+    /// The model Settings should offer to download for a language nobody has a
+    /// model for yet. nil for a language the catalog knows nothing about — the
+    /// UI then asks for a Hugging Face repo instead of inventing one.
+    static func recommended(for language: String, in catalog: [CatalogEntry],
+                            kbVariant: String) -> CatalogEntry? {
+        entries(for: language, in: catalog, kbVariant: kbVariant).first
     }
 
     @discardableResult

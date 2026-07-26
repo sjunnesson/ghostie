@@ -107,7 +107,7 @@ struct Smoother {
     /// explicit whitelist). Production always goes through the primary init
     /// with the resolved effective whitelist.
     init(config: CodeSwitchConfig, window: Int) {
-        self.init(config: config, languages: config.languages, window: window)
+        self.init(config: config, languages: config.languages.map(\.code), window: window)
     }
 
     /// Log-prob distribution skewed toward `target` with mass `mass` on that

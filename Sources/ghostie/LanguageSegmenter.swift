@@ -412,34 +412,38 @@ struct LanguageSegmenter {
     /// from disk removes it from the candidate list with no config edit.
     /// Static so the `defaultIdentifier` factory (called during init) can
     /// reach it without a fully-constructed `self`.
+    /// `present` is the on-disk existence test, injected so `LanguageSetup`
+    /// (and its self-tests) can ask *the same function* which model will drive
+    /// detection without touching the filesystem — Settings must not
+    /// re-implement this rule, or it will drift from what the call actually does.
     static func resolveDetectionModel(config: Config,
-                                      installed: InstalledModels) -> String {
-        let fm = FileManager.default
+                                      installed: InstalledModels,
+                                      present: (String) -> Bool = { FileManager.default.fileExists(atPath: $0) })
+        -> String {
         let cs = config.codeSwitch
-        let languages = cs.effectiveLanguages(installed: installed)
+        let languages = cs.effectiveLanguages(installed: installed, present: present)
         // A usable detection driver must be a balanced multilingual model:
         // KB-Whisper's language head is sv-biased and base.en can't detect
         // non-English at all, so `Models.isBadLIDDriver` rules both out even
         // when they're the only model installed for their language.
         func lidDriver(for lang: String) -> String? {
-            guard let p = cs.effectiveModelPath(for: lang, installed: installed),
-                  fm.fileExists(atPath: p), !Models.isBadLIDDriver(path: p) else { return nil }
+            guard let p = cs.effectiveModelPath(for: lang, installed: installed, present: present),
+                  present(p), !Models.isBadLIDDriver(path: p) else { return nil }
             return p
         }
         if let dom = lidDriver(for: cs.dominantLanguage) { return dom }
         for l in languages {
             if let p = lidDriver(for: l) { return p }
         }
-        if fm.fileExists(atPath: config.whisperModel),
-           !Models.isBadLIDDriver(path: config.whisperModel) {
+        if present(config.whisperModel), !Models.isBadLIDDriver(path: config.whisperModel) {
             return config.whisperModel
         }
         // Last resort: any installed model, even a biased one. Detection will
         // be poor, but segmentation only needs VAD offsets, so a single-model
         // install can still run rather than failing the whole call.
         for l in languages {
-            if let p = cs.effectiveModelPath(for: l, installed: installed),
-               fm.fileExists(atPath: p) {
+            if let p = cs.effectiveModelPath(for: l, installed: installed, present: present),
+               present(p) {
                 return p
             }
         }

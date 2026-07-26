@@ -3,12 +3,27 @@ import AppKit
 // MARK: - Pane: Advanced
 
 final class AdvancedPane: NSView {
-    init(openConfig: @escaping () -> Void,
+
+    /// The model **storage** list. Lives here rather than in Transcription
+    /// because it is disk management, not language configuration — see
+    /// `ModelListCard`. Retained so downloads started from either pane can
+    /// drive its row progress.
+    let models: ModelListCard
+
+    init(kbVariant: String,
+         modelRowAction: @escaping (String) -> Void,
+         addModel: @escaping () -> Void,
+         removeModel: @escaping (String) -> Void,
+         openConfig: @escaping () -> Void,
          revealData: @escaping () -> Void,
          runDiagnose: @escaping () -> Void,
          runSelftest: @escaping () -> Void,
          runDoctor: @escaping () -> Void,
          resetSettings: @escaping () -> Void) {
+        self.models = ModelListCard(kbVariant: kbVariant,
+                                    rowAction: modelRowAction,
+                                    addModel: addModel,
+                                    removeModel: removeModel)
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
         let stack = NSStackView()
@@ -27,6 +42,9 @@ final class AdvancedPane: NSView {
                                     subtitle: "Where Ghostie keeps its files and how to poke at it from the terminal. Most people won't need anything here.")
         stack.addArrangedSubview(header)
         header.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+
+        stack.addArrangedSubview(models)
+        models.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
 
         let card = GroupCard()
         card.addRow(rowWithButton(label: "Open the config file",

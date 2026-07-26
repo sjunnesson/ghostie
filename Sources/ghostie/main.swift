@@ -286,42 +286,55 @@ func cmdDoctor(_ config: Config) {
         row(s.isConfigured, "Claude Code CLI (`claude -p`)",
             s.isConfigured ? claudePath : "not found — install Claude Code and run `claude` once to log in")
     }
+    // Languages: rendered straight off `LanguageSetup`, the same struct the
+    // Settings pane draws — doctor and the UI can't disagree about what will
+    // happen because they are reading one computation, not two.
     let cs = config.codeSwitch
     let installed = Models.installed(preferredKBVariant: cs.kbWhisperVariant)
-    let effective = cs.effectiveLanguages(installed: installed)
-    let willCodeSwitch = effective.count >= 2
+    let setup = LanguageSetup.resolve(config: config)
     row(true, "languages installed on disk",
         installed.languages.isEmpty
             ? "none — single-language path only"
             : installed.languages.joined(separator: ", "))
+    row(true, "languages configured",
+        setup.isConfigured
+            ? setup.rows.map(\.code).joined(separator: ", ")
+            : "none — the disk is the whitelist")
     // KB-Whisper's language head is Swedish-biased; with no English-capable
     // model on disk, English audio gets decoded (and language-detected) by it.
     if installed.modelPath(for: "en") == nil, installed.languages.contains("sv") {
         row(false, "English-capable model",
             "none installed — English audio will be decoded by KB-Whisper (Swedish-biased); fetch large-v3 or base.en")
     }
-    if willCodeSwitch {
-        row(true, "code-switching", "on — \(effective.joined(separator: "+")), dominant \(cs.dominantLanguage), KB variant \(cs.kbWhisperVariant)")
+    switch setup.mode {
+    case .unconfigured:
+        row(false, "transcription mode", "no usable model — add a language in Settings")
+    case .single(let lang):
+        row(true, "transcription mode",
+            "single-language (\(lang)) — quality preference \(config.transcriptionQuality)")
+    case .codeSwitch(let langs):
+        row(true, "transcription mode",
+            "code-switching — \(langs.joined(separator: "+")), dominant \(cs.effectiveDominant(installed: installed)), KB variant \(cs.kbWhisperVariant)")
         let lid = LanguageSegmenter.defaultIdentifier(config: config, installed: installed)
         row(true, "  language identifier (LID)", lid.description)
-        for lang in effective {
-            let path = cs.effectiveModelPath(for: lang, installed: installed) ?? ""
-            let ok = !path.isEmpty && FileManager.default.fileExists(atPath: path)
-            row(ok, "  model[\(lang)]", ok ? path : "missing — run scripts/setup.sh --codeswitch")
+        row(setup.detectionModelLabel != nil, "  detection driver",
+            setup.detectionModelLabel ?? "none — no balanced multilingual model installed")
+    }
+    for r in setup.rows {
+        let detail = [r.modelLabel, r.drivesDetection ? "drives detection" : nil,
+                      r.isPrimary ? "primary" : nil]
+            .compactMap { $0 }.joined(separator: " · ")
+        switch r.state {
+        case .onDisk:  row(true,  "  \(r.code)", detail)
+        case .missing: row(false, "  \(r.code)", "\(detail) — not downloaded")
+        case .none:    row(false, "  \(r.code)", "no model known for this language")
         }
-        // Surface any configured languages that resolve to no installed model.
-        if !cs.languages.isEmpty {
-            let dropped = cs.languages.filter { cs.effectiveModelPath(for: $0, installed: installed) == nil }
-            if !dropped.isEmpty {
-                row(false, "  configured but not installed", dropped.joined(separator: ", "))
-            }
-        }
-        let vadOK = !config.vadModel.isEmpty
-            && FileManager.default.fileExists(atPath: config.vadModel)
+    }
+    let vadOK = !config.vadModel.isEmpty
+        && FileManager.default.fileExists(atPath: config.vadModel)
+    if case .codeSwitch = setup.mode {
         row(vadOK, "  Silero VAD (required by code-switching)",
             vadOK ? config.vadModel : "missing — scripts/setup.sh --codeswitch fetches it")
-    } else {
-        row(true, "code-switching", "off (single-language path)")
     }
 
     let matchers = config.triggerBundleIds.map { $0.lowercased() }

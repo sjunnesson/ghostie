@@ -3,56 +3,61 @@ import QuartzCore
 
 // MARK: - Pane: Transcription
 
+/// v3: one **language-primary** list replaces the old pair of cards (a
+/// checkbox list of languages *and* a `+ −` list of models) that described the
+/// same thing from two directions and had to be kept in sync by hand.
+///
+/// The pane is render-only. Everything it draws comes from one
+/// `LanguageSetup.resolve(...)` — the same computation `doctor` prints and the
+/// pipeline obeys — so there is no longer a refresh graph
+/// (`rebuildModelRows` → `refreshAllRows` → `rebuildLanguageRows` → …) to keep
+/// consistent by remembering to call things in the right order.
 final class TranscriptionPane: NSView {
 
-    private struct ModelRowState {
-        let row: ModelRowView
-        let key: String
-    }
-
     private var cfg: Config
-    private let rowAction: (String) -> Void
     private let openConfig: () -> Void
-    private let addModel: () -> Void
-    private let removeModel: (String) -> Void
+    private let addLanguage: () -> Void
+    private let removeLanguage: (String) -> Void
+    private let changeModel: (String) -> Void
+    private let setPrimary: (String) -> Void
+    private let downloadModel: (String) -> Void
     private let parentChanges: ((inout Config) -> Void) -> Void
-    private let advContainer = NSStackView()
-    private var rows: [String: ModelRowState] = [:]
-    /// The catalog entry behind each row, keyed by filename — so refresh logic
-    /// reads language/goodForLID without re-loading the catalog per row.
-    private var entriesByKey: [String: CatalogEntry] = [:]
-    private let modelsCard = GroupCard(title: "Models")
+
     private let languagesCard = GroupCard(title: "Languages")
+    private let advContainer = NSStackView()
+    private var qualityCard: GroupCard?
+    private let qualityContainer = NSStackView()
+
+    /// The resolved state currently on screen. Recomputed on every rebuild;
+    /// nothing else caches a slice of it.
+    private var setup: LanguageSetup
+
+    /// Language rows by code, so an in-flight download can update one row
+    /// without a rebuild (a rebuild mid-download would drop the progress bar).
+    private var rows: [String: LanguageRowView] = [:]
     /// The row selected for the `−` button.
-    private var selectedKey: String?
-    /// Built-in presets whose download is in flight — shown in the list while
-    /// downloading even though they're not on disk yet. Pruned when the
-    /// download settles (see `downloadDidSettle`).
-    private var pendingKeys: Set<String> = []
-    /// Full-hash verdicts from the explicit Verify / Re-verify row actions,
-    /// keyed by row. Routine refreshes skip the SHA256 (existence + sidecar
-    /// size only — hashing ~1.1 GB on the main thread froze the pane), so a
-    /// hash mismatch can only be discovered by those actions; remember it
-    /// here so the badge and the action button keep reporting it until a
-    /// re-download settles.
-    private var verifiedStates: [String: ModelDownloader.HealthState] = [:]
+    private var selectedCode: String?
     private weak var footerSeg: NSSegmentedControl?
-    /// Retains the `+` menu's action target while the menu is open.
     private var menuTarget: MenuTarget?
     private var disclosureToken: NSObjectProtocol?
 
     init(cfg: Config,
-         rowAction: @escaping (String) -> Void,
          openConfig: @escaping () -> Void,
-         addModel: @escaping () -> Void,
-         removeModel: @escaping (String) -> Void,
+         addLanguage: @escaping () -> Void,
+         removeLanguage: @escaping (String) -> Void,
+         changeModel: @escaping (String) -> Void,
+         setPrimary: @escaping (String) -> Void,
+         downloadModel: @escaping (String) -> Void,
          changes: @escaping ((inout Config) -> Void) -> Void) {
         self.cfg = cfg
-        self.rowAction = rowAction
         self.openConfig = openConfig
-        self.addModel = addModel
-        self.removeModel = removeModel
+        self.addLanguage = addLanguage
+        self.removeLanguage = removeLanguage
+        self.changeModel = changeModel
+        self.setPrimary = setPrimary
+        self.downloadModel = downloadModel
         self.parentChanges = changes
+        self.setup = LanguageSetup.resolve(config: cfg)
         super.init(frame: .zero)
         build()
         disclosureToken = NotificationCenter.default.addObserver(
@@ -65,9 +70,9 @@ final class TranscriptionPane: NSView {
         if let disclosureToken { NotificationCenter.default.removeObserver(disclosureToken) }
     }
 
-    /// Apply a config mutation locally and to the persisted config in one
-    /// step. The pane caches `cfg` so the model-row refresh and radio
-    /// selection read coherent state without going back to disk.
+    /// Apply a config mutation locally and to the persisted config in one step.
+    /// The pane caches `cfg` so a rebuild reads coherent state without going
+    /// back to disk.
     private func change(_ block: (inout Config) -> Void) {
         block(&cfg)
         parentChanges(block)
@@ -87,48 +92,305 @@ final class TranscriptionPane: NSView {
             stack.trailingAnchor.constraint(equalTo: trailingAnchor),
             stack.bottomAnchor.constraint(equalTo: bottomAnchor)
         ])
-        let header = PageHeaderView(title: "Transcription",
-                                    subtitle: "How Ghostie turns the recording into text and which models it runs locally on your Mac.")
+        let header = PageHeaderView(
+            title: "Transcription",
+            subtitle: "The languages Ghostie should understand, and the model it runs locally for each one.")
         stack.addArrangedSubview(header)
         header.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
 
-        // Languages — one checkbox per language the installed models can
-        // decode (plus any explicitly-configured language whose model is
-        // missing, flagged). The disk still drives what's *possible*; the
-        // checkboxes edit `codeSwitch.languages`, the explicit whitelist.
         stack.addArrangedSubview(languagesCard)
         languagesCard.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
-        rebuildLanguageRows()
 
-        // Models — one row per catalog entry (built-ins + custom) plus an
-        // "Add a model" button. Rebuilt whenever the catalog changes.
-        stack.addArrangedSubview(modelsCard)
-        modelsCard.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
-        rebuildModelRows()
+        // Quality lives in its own container because one of its rows only
+        // applies in single-language mode and has to appear/disappear with it.
+        qualityContainer.orientation = .vertical
+        qualityContainer.alignment = .leading
+        qualityContainer.spacing = 22
+        qualityContainer.translatesAutoresizingMaskIntoConstraints = false
+        stack.addArrangedSubview(qualityContainer)
+        qualityContainer.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
 
-        // Quality.
-        let quality = GroupCard(title: "Quality")
-        let qualityPopup = NSPopUpButton(frame: .zero, pullsDown: false)
-        qualityPopup.addItems(withTitles: ["Best quality", "Balanced (lighter)"])
-        qualityPopup.selectItem(at: cfg.transcriptionQuality == "balanced" ? 1 : 0)
-        let qualityTarget = ToggleTarget { [weak self] in
-            let next = (qualityPopup.indexOfSelectedItem == 1) ? "balanced" : "best"
-            guard let self, self.cfg.transcriptionQuality != next else { return }
-            self.change { c in c.transcriptionQuality = next }
-            // The single-language model is resolved from disk at load, not
-            // persisted, so re-read the effective pick — the tickmark on the
-            // model rows tracks it whenever code-switching isn't active.
-            self.cfg.whisperModel = Config.load().whisperModel
-            self.refreshAllRows()
+        advContainer.orientation = .vertical
+        advContainer.alignment = .leading
+        advContainer.spacing = 22
+        advContainer.translatesAutoresizingMaskIntoConstraints = false
+        stack.addArrangedSubview(advContainer)
+        advContainer.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+
+        rebuild()
+    }
+
+    /// Recompute and redraw everything. The single refresh entry point — there
+    /// is deliberately no partial variant, because the old pane's four partial
+    /// refreshers were where the drift lived.
+    func rebuild() {
+        setup = LanguageSetup.resolve(config: cfg)
+        rebuildLanguages()
+        rebuildQuality()
+        refreshAdvanced()
+    }
+
+    /// Adopt a config edited elsewhere (the add-language sheet) and redraw.
+    func applyConfig(_ newCfg: Config) {
+        cfg = newCfg
+        rebuild()
+    }
+
+    // MARK: Languages card
+
+    private func rebuildLanguages() {
+        languagesCard.clearRows()
+        rows.removeAll()
+
+        if setup.rows.isEmpty {
+            languagesCard.addRow(RowBuilder.row(
+                label: "No languages yet",
+                sub: "Add the languages you speak on calls. Ghostie downloads a model for each one and detects which is being spoken, per speaker."))
+        } else {
+            for r in setup.rows {
+                let row = LanguageRowView(row: r)
+                row.onSelect = { [weak self] in self?.select(r.code) }
+                row.onMenu = { [weak self] view in self?.showRowMenu(for: r, from: view) }
+                row.onAction = { [weak self] in
+                    guard let self else { return }
+                    switch r.state {
+                    case .missing: if let f = r.modelFilename { self.downloadModel(f) }
+                    case .none:    self.changeModel(r.code)
+                    case .onDisk:  break
+                    }
+                }
+                languagesCard.addRow(row)
+                rows[r.code] = row
+            }
         }
-        qualityPopup.target = qualityTarget
-        qualityPopup.action = #selector(ToggleTarget.fire)
-        objc_setAssociatedObject(qualityPopup, &ToggleTarget.key, qualityTarget, .OBJC_ASSOCIATION_RETAIN)
-        qualityPopup.widthAnchor.constraint(equalToConstant: 180).isActive = true
-        quality.addRow(RowBuilder.row(
-            label: "Model for one-language calls",
-            sub: "Balanced uses a smaller model — lighter on CPU, slightly less accurate.",
-            control: qualityPopup))
+
+        // What the pipeline will actually do, stated in words. The
+        // single↔code-switch boundary used to be invisible: adding a second
+        // language silently changed what the Quality popup below meant.
+        languagesCard.addRow(RowBuilder.row(
+            label: modeTitle,
+            sub: modeDetail,
+            leadingSymbol: modeSymbol,
+            leadingTint: Theme.text2,
+            control: StatusBadgeView(kind: modeBadgeKind, label: modeBadgeLabel)))
+
+        for w in setup.warnings where isCardLevel(w) {
+            languagesCard.addRow(warningRow(w))
+        }
+        languagesCard.addRow(buildFooter(), last: true)
+
+        if let sel = selectedCode, rows[sel] == nil { selectedCode = nil }
+        if let sel = selectedCode { rows[sel]?.setHighlighted(true) }
+    }
+
+    /// Per-language problems are drawn on the language's own row; these two are
+    /// about the setup as a whole and get their own line.
+    private func isCardLevel(_ w: LanguageSetup.Warning) -> Bool {
+        switch w {
+        case .noDetectionModel, .vadMissing: return true
+        case .modelMissing, .noModelForLanguage: return false
+        }
+    }
+
+    private func warningRow(_ w: LanguageSetup.Warning) -> NSView {
+        var control: NSView = StatusBadgeView(kind: .warn, label: "Needs attention")
+        // Both card-level warnings are fixable by fetching one specific model,
+        // so offer the fetch right there rather than sending the user to
+        // another pane to work out which file it was.
+        let fix: Model? = {
+            switch w {
+            case .noDetectionModel: return Models.largeV3
+            case .vadMissing:       return Models.sileroVAD
+            default:                return nil
+            }
+        }()
+        if let fix {
+            let target = ActionTarget { [weak self] in self?.downloadModel(fix.filename) }
+            let b = StyledButton(title: "Download", target: target, action: #selector(ActionTarget.fire))
+            b.kind = .primary
+            objc_setAssociatedObject(b, &ActionTarget.key, target, .OBJC_ASSOCIATION_RETAIN)
+            control = b
+        }
+        return RowBuilder.row(label: warningTitle(w), sub: w.message,
+                              leadingSymbol: "exclamationmark.triangle",
+                              leadingTint: Theme.warn,
+                              control: control)
+    }
+
+    private func warningTitle(_ w: LanguageSetup.Warning) -> String {
+        switch w {
+        case .noDetectionModel: return "Ghostie can't tell your languages apart"
+        case .vadMissing:       return "Silence detection is missing"
+        case .modelMissing:     return "Model not downloaded"
+        case .noModelForLanguage: return "No model for this language"
+        }
+    }
+
+    private var modeTitle: String {
+        switch setup.mode {
+        case .unconfigured:      return "Nothing to transcribe with yet"
+        case .single(let l):     return "One language — \(WhisperLanguages.displayName(l))"
+        case .codeSwitch(let l): return "\(l.count) languages, detected per speaker"
+        }
+    }
+
+    private var modeDetail: String {
+        switch setup.mode {
+        case .unconfigured:
+            return "Add a language above and Ghostie will fetch the model it needs."
+        case .single(let l):
+            return "Everything is transcribed as \(WhisperLanguages.displayName(l)). Add a second language and Ghostie starts detecting which one each speaker is using."
+        case .codeSwitch:
+            let driver = setup.detectionModelLabel ?? "—"
+            return "Ghostie splits each track at the pauses, works out which language each stretch is, and sends it to that language's model. Detection runs on \(driver)."
+        }
+    }
+
+    private var modeSymbol: String {
+        switch setup.mode {
+        case .unconfigured:  return "questionmark.circle"
+        case .single:        return "text.bubble"
+        case .codeSwitch:    return "arrow.triangle.branch"
+        }
+    }
+
+    private var modeBadgeKind: StatusBadgeView.Kind {
+        switch setup.mode {
+        case .unconfigured: return .warn
+        case .single:       return .ok
+        case .codeSwitch:   return setup.detectionModelLabel == nil ? .warn : .ok
+        }
+    }
+
+    private var modeBadgeLabel: String {
+        switch setup.mode {
+        case .unconfigured: return "Not ready"
+        case .single:       return "Ready"
+        case .codeSwitch:   return setup.detectionModelLabel == nil ? "Degraded" : "Ready"
+        }
+    }
+
+    /// The `+ −` toolbar beneath the language list.
+    private func buildFooter() -> NSView {
+        let seg = NSSegmentedControl()
+        seg.segmentStyle = .smallSquare
+        seg.trackingMode = .momentary
+        seg.segmentCount = 2
+        seg.setImage(NSImage(systemSymbolName: "plus", accessibilityDescription: "Add a language"), forSegment: 0)
+        seg.setImage(NSImage(systemSymbolName: "minus", accessibilityDescription: "Remove language"), forSegment: 1)
+        seg.setWidth(34, forSegment: 0)
+        seg.setWidth(34, forSegment: 1)
+        // Removing the last language would leave nothing to transcribe with, so
+        // the control is disabled and *says why* on hover — the old checkbox
+        // silently snapped back instead.
+        let canRemove = selectedCode != nil && setup.rows.count > 1
+        seg.setEnabled(canRemove, forSegment: 1)
+        seg.toolTip = setup.rows.count > 1
+            ? "Remove the selected language"
+            : "Ghostie needs at least one language"
+        seg.translatesAutoresizingMaskIntoConstraints = false
+        let target = ActionTarget { [weak self, weak seg] in
+            guard let self, let seg else { return }
+            if seg.selectedSegment == 0 { self.addLanguage() }
+            else if let sel = self.selectedCode { self.removeLanguage(sel) }
+        }
+        seg.target = target
+        seg.action = #selector(ActionTarget.fire)
+        objc_setAssociatedObject(seg, &ActionTarget.key, target, .OBJC_ASSOCIATION_RETAIN)
+        footerSeg = seg
+
+        let hint = NSTextField(labelWithString:
+            setup.isConfigured ? "" : "Following what's installed — adding or removing a language pins this list.")
+        hint.font = .systemFont(ofSize: 11)
+        hint.textColor = Theme.text2
+        hint.translatesAutoresizingMaskIntoConstraints = false
+
+        let container = NSView()
+        container.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(seg)
+        container.addSubview(hint)
+        NSLayoutConstraint.activate([
+            seg.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 10),
+            seg.topAnchor.constraint(equalTo: container.topAnchor, constant: 6),
+            seg.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -6),
+            seg.heightAnchor.constraint(equalToConstant: 22),
+            hint.leadingAnchor.constraint(equalTo: seg.trailingAnchor, constant: 12),
+            hint.centerYAnchor.constraint(equalTo: seg.centerYAnchor),
+            hint.trailingAnchor.constraint(lessThanOrEqualTo: container.trailingAnchor, constant: -14)
+        ])
+        return container
+    }
+
+    private func select(_ code: String) {
+        selectedCode = code
+        for (c, row) in rows { row.setHighlighted(c == code) }
+        footerSeg?.setEnabled(setup.rows.count > 1, forSegment: 1)
+    }
+
+    /// The per-row `⋯` menu — everything you can do to one language, in one
+    /// place, instead of split across two cards.
+    private func showRowMenu(for r: LanguageSetup.Row, from view: NSView) {
+        select(r.code)
+        let menu = NSMenu()
+        let target = MenuTarget { [weak self] item in
+            guard let self else { return }
+            switch item.representedObject as? String {
+            case "model":   self.changeModel(r.code)
+            case "primary": self.setPrimary(r.code)
+            case "verify":  if let f = r.modelFilename { self.downloadModel(f) }
+            case "remove":  self.removeLanguage(r.code)
+            default:        break
+            }
+        }
+        menuTarget = target
+        func item(_ title: String, _ id: String, enabled: Bool = true) {
+            let it = NSMenuItem(title: title, action: #selector(MenuTarget.fire(_:)), keyEquivalent: "")
+            it.representedObject = id
+            it.target = target
+            it.isEnabled = enabled
+            menu.addItem(it)
+        }
+        item("Change model…", "model")
+        item("Use as the fallback language", "primary", enabled: !r.isPrimary)
+        if r.state == .missing { item("Download the model", "verify") }
+        menu.addItem(.separator())
+        item("Remove \(r.name)…", "remove", enabled: setup.rows.count > 1)
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: view.bounds.height + 4), in: view)
+    }
+
+    // MARK: Quality card
+
+    private func rebuildQuality() {
+        qualityContainer.arrangedSubviews.forEach { $0.removeFromSuperview() }
+        let quality = GroupCard(title: "Quality")
+        qualityCard = quality
+
+        // `transcriptionQuality` only picks a model on the single-language
+        // path; with code-switching each language's own model decodes it. The
+        // row used to sit there regardless, quietly doing nothing.
+        if case .codeSwitch = setup.mode {} else {
+            let qualityPopup = NSPopUpButton(frame: .zero, pullsDown: false)
+            qualityPopup.addItems(withTitles: ["Best quality", "Balanced (lighter)"])
+            qualityPopup.selectItem(at: cfg.transcriptionQuality == "balanced" ? 1 : 0)
+            let qualityTarget = ToggleTarget { [weak self] in
+                let next = (qualityPopup.indexOfSelectedItem == 1) ? "balanced" : "best"
+                guard let self, self.cfg.transcriptionQuality != next else { return }
+                self.change { c in c.transcriptionQuality = next }
+                // The single-language model is resolved from disk at load, not
+                // persisted, so re-read the effective pick.
+                self.cfg.whisperModel = Config.load().whisperModel
+                self.rebuild()
+            }
+            qualityPopup.target = qualityTarget
+            qualityPopup.action = #selector(ToggleTarget.fire)
+            objc_setAssociatedObject(qualityPopup, &ToggleTarget.key, qualityTarget, .OBJC_ASSOCIATION_RETAIN)
+            qualityPopup.widthAnchor.constraint(equalToConstant: 180).isActive = true
+            quality.addRow(RowBuilder.row(
+                label: "Model for one-language calls",
+                sub: "Balanced uses a smaller model — lighter on CPU, slightly less accurate.",
+                control: qualityPopup))
+        }
+
         quality.addRow(buildToggleRow(
             label: "Tidy up the transcript",
             sub: "Trims the things Whisper sometimes invents in silent stretches, like \"Thanks for watching.\"",
@@ -138,24 +400,16 @@ final class TranscriptionPane: NSView {
         let vadOnDisk = FileManager.default.fileExists(atPath: Models.sileroVAD.destPath)
         quality.addRow(RowBuilder.row(
             label: "Skip the quiet bits",
-            sub: vadOnDisk ? "Ghostie uses the Silero model below to find pauses and ignore them."
-                           : "Download the Silero VAD model below to turn this on.",
+            sub: vadOnDisk ? "Ghostie uses the Silero model to find pauses and ignore them."
+                           : "Download the Silero VAD model to turn this on.",
             control: StatusBadgeView(kind: vadOnDisk ? .ok : .muted,
                                      label: vadOnDisk ? "Active" : "Inactive")),
                        last: true)
-        stack.addArrangedSubview(quality)
-        quality.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
-
-        advContainer.orientation = .vertical
-        advContainer.alignment = .leading
-        advContainer.spacing = 22
-        advContainer.translatesAutoresizingMaskIntoConstraints = false
-        stack.addArrangedSubview(advContainer)
-        advContainer.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
-        refreshAdvanced()
-
-        refreshAllRows()
+        qualityContainer.addArrangedSubview(quality)
+        quality.widthAnchor.constraint(equalTo: qualityContainer.widthAnchor).isActive = true
     }
+
+    // MARK: Advanced disclosure
 
     private func refreshAdvanced() {
         advContainer.arrangedSubviews.forEach { $0.removeFromSuperview() }
@@ -171,15 +425,13 @@ final class TranscriptionPane: NSView {
                 ? "Empty — Ghostie will let Whisper figure punctuation out on its own."
                 : cfg.initialPrompt,
             control: editBtn))
-        // One editable starter sentence per active code-switching language
-        // (followup #5: only sv/en were reachable before; a third language's
-        // prompts entry had no UI). Writes codeSwitch.prompts[lang]; an
-        // emptied field removes the key.
-        let installed = Models.installed(preferredKBVariant: cfg.codeSwitch.kbWhisperVariant)
-        for lang in cfg.codeSwitch.effectiveLanguages(installed: installed) {
-            let name = Locale.current.localizedString(forLanguageCode: lang) ?? lang
-            let field = NSTextField(string: cfg.codeSwitch.prompts[lang] ?? "")
-            field.placeholderString = "Optional — terms and style for \(name)"
+
+        // One editable starter sentence per language, writing that language's
+        // own record. Enumerating `setup.rows` (not a separate lookup) means
+        // this list can't disagree with the list above it.
+        for r in setup.rows {
+            let field = NSTextField(string: cfg.codeSwitch.prompt(for: r.code))
+            field.placeholderString = "Optional — terms and style for \(r.name)"
             field.font = .systemFont(ofSize: 12)
             field.lineBreakMode = .byTruncatingTail
             field.cell?.sendsActionOnEndEditing = true
@@ -188,18 +440,26 @@ final class TranscriptionPane: NSView {
                 guard let self, let field else { return }
                 let v = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
                 self.change { c in
-                    if v.isEmpty { c.codeSwitch.prompts.removeValue(forKey: lang) }
-                    else { c.codeSwitch.prompts[lang] = v }
+                    var langs = LanguageSetup.materialized(config: c)
+                    guard let i = langs.firstIndex(where: { $0.code == r.code }) else { return }
+                    // "" is a real choice (no prompt at all); the built-in
+                    // default only applies while the field was never touched,
+                    // so an emptied field that matches the default clears back
+                    // to nil rather than pinning an empty string forever.
+                    langs[i].prompt = v.isEmpty && LanguageDefaults.prompt(for: r.code).isEmpty
+                        ? nil : v
+                    c.codeSwitch.languages = langs
                 }
             }
             field.target = target
             field.action = #selector(ToggleTarget.fire)
             objc_setAssociatedObject(field, &ToggleTarget.key, target, .OBJC_ASSOCIATION_RETAIN)
             card.addRow(RowBuilder.row(
-                label: "Starter sentence (\(name))",
-                sub: "Biases punctuation and vocabulary when decoding \(name) segments.",
+                label: "Starter sentence (\(r.name))",
+                sub: "Biases punctuation and vocabulary when decoding \(r.name) segments.",
                 control: field))
         }
+
         let editTarget2 = ActionTarget { [weak self] in self?.openConfig() }
         let editBtn2 = StyledButton(title: "Edit in config.json",
                                     target: editTarget2, action: #selector(ActionTarget.fire))
@@ -218,264 +478,22 @@ final class TranscriptionPane: NSView {
         card.widthAnchor.constraint(equalTo: advContainer.widthAnchor).isActive = true
     }
 
-    /// Refresh the pane's cached config (e.g. after the Add-a-model flow grew
-    /// the language whitelist) and rebuild the model rows + languages summary.
-    func applyConfig(_ newCfg: Config) {
-        cfg = newCfg
-        rebuildModelRows()
-    }
+    // MARK: Download progress
+    //
+    // Routed by model filename (the download key) to whichever language row is
+    // showing that model. A model no language uses — VAD, or one being fetched
+    // from the Developer pane — simply matches nothing here.
 
-    /// Rebuild the Models card: a row per *installed* model (on disk, a built-in
-    /// preset whose download is in flight, or any custom entry), an empty-state
-    /// line when there are none, and a `+ −` footer — the macOS list-with-toolbar
-    /// pattern. `+` opens a menu of predefined models (plus "Add from Hugging
-    /// Face…"); `−` removes the selected row. Keeping the pane instance stable
-    /// means an inflight download's row keeps updating across the rebuild.
-    func rebuildModelRows() {
-        modelsCard.clearRows()
-        rows.removeAll()
-        entriesByKey.removeAll()
-
-        let fm = FileManager.default
-        let listed = ModelCatalog.load().filter { e in
-            guard let m = e.model() else { return false }
-            return !e.builtin || fm.fileExists(atPath: m.destPath) || pendingKeys.contains(e.filename)
-        }
-        if listed.isEmpty {
-            modelsCard.addRow(RowBuilder.row(
-                label: "No models added yet",
-                sub: "Click the + below to add one."))
-        } else {
-            for e in listed {
-                entriesByKey[e.filename] = e
-                let key = e.filename
-                let row = ModelRowView(key: key, title: e.label, subtitle: subtitle(for: e))
-                row.onAction = { [weak self] in self?.rowAction(key) }
-                row.onSelect = { [weak self] in self?.select(key) }
-                modelsCard.addRow(row)
-                rows[key] = ModelRowState(row: row, key: key)
-            }
-        }
-        modelsCard.addRow(buildModelsFooter(), last: true)
-
-        if let sel = selectedKey, rows[sel] == nil { selectedKey = nil }
-        refreshAllRows()
-        if let sel = selectedKey { rows[sel]?.row.setHighlighted(true) }
-    }
-
-    /// The `+ −` toolbar beneath the model list.
-    private func buildModelsFooter() -> NSView {
-        let seg = NSSegmentedControl()
-        seg.segmentStyle = .smallSquare
-        seg.trackingMode = .momentary
-        seg.segmentCount = 2
-        seg.setImage(NSImage(systemSymbolName: "plus", accessibilityDescription: "Add"), forSegment: 0)
-        seg.setImage(NSImage(systemSymbolName: "minus", accessibilityDescription: "Remove"), forSegment: 1)
-        seg.setWidth(34, forSegment: 0)
-        seg.setWidth(34, forSegment: 1)
-        seg.setEnabled(selectedKey != nil, forSegment: 1)
-        seg.translatesAutoresizingMaskIntoConstraints = false
-        let target = ActionTarget { [weak self, weak seg] in
-            guard let self, let seg else { return }
-            if seg.selectedSegment == 0 { self.showAddMenu(from: seg) }
-            else if let sel = self.selectedKey { self.removeModel(sel) }
-        }
-        seg.target = target
-        seg.action = #selector(ActionTarget.fire)
-        objc_setAssociatedObject(seg, &ActionTarget.key, target, .OBJC_ASSOCIATION_RETAIN)
-        footerSeg = seg
-
-        let container = NSView()
-        container.translatesAutoresizingMaskIntoConstraints = false
-        container.addSubview(seg)
-        NSLayoutConstraint.activate([
-            seg.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 10),
-            seg.topAnchor.constraint(equalTo: container.topAnchor, constant: 6),
-            seg.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -6),
-            seg.heightAnchor.constraint(equalToConstant: 22)
-        ])
-        return container
-    }
-
-    private func select(_ key: String) {
-        selectedKey = key
-        for (k, st) in rows { st.row.setHighlighted(k == key) }
-        footerSeg?.setEnabled(true, forSegment: 1)
-    }
-
-    /// `+` menu: predefined models not yet installed, then "Add from Hugging Face…".
-    private func showAddMenu(from view: NSView) {
-        let fm = FileManager.default
-        let presets = ModelCatalog.load().filter { e in
-            guard e.builtin, let m = e.model() else { return false }
-            return !fm.fileExists(atPath: m.destPath) && !pendingKeys.contains(e.filename)
-        }
-        let menu = NSMenu()
-        let target = MenuTarget { [weak self] item in
-            guard let self else { return }
-            if let fn = item.representedObject as? String { self.startPreset(fn) }
-            else { self.addModel() }
-        }
-        menuTarget = target
-        for e in presets {
-            let it = NSMenuItem(title: e.label, action: #selector(MenuTarget.fire(_:)), keyEquivalent: "")
-            it.representedObject = e.filename
-            it.target = target
-            menu.addItem(it)
-        }
-        if !presets.isEmpty { menu.addItem(.separator()) }
-        let custom = NSMenuItem(title: "Add from Hugging Face…",
-                                action: #selector(MenuTarget.fire(_:)), keyEquivalent: "")
-        custom.target = target
-        menu.addItem(custom)
-        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: view.bounds.height + 4), in: view)
-    }
-
-    /// Add a built-in preset: show its row immediately (pending), grow the
-    /// language whitelist if the user keeps an explicit one, then download.
-    private func startPreset(_ filename: String) {
-        pendingKeys.insert(filename)
-        if let lang = ModelCatalog.load().first(where: { $0.filename == filename })?.language,
-           !lang.isEmpty {
-            change { c in
-                if !c.codeSwitch.languages.isEmpty, !c.codeSwitch.languages.contains(lang) {
-                    c.codeSwitch.languages.append(lang)
-                }
-            }
-        }
-        rebuildModelRows()
-        rowAction(filename)   // → handleModelRowAction → startDownload (.missing)
-    }
-
-    /// A download settled (finished / failed / cancelled): drop it from the
-    /// pending set and rebuild so a failed preset disappears and a finished one
-    /// stays, shown by its on-disk status.
-    func downloadDidSettle(_ key: String) {
-        pendingKeys.remove(key)
-        verifiedStates[key] = nil   // file replaced or removed — verdict is stale
-        rebuildModelRows()
-    }
-
-    /// Last full-hash verdict for a row, if an explicit Verify / Re-verify
-    /// has run. The hash-free refresh path can't tell ok from hashMismatch.
-    func verifiedState(_ key: String) -> ModelDownloader.HealthState? {
-        verifiedStates[key]
-    }
-
-    /// Land the result of an off-main Verify / Re-verify: remember the
-    /// verdict (see `verifiedStates`) and redraw the row with it.
-    func recordVerifiedState(_ state: ModelDownloader.HealthState, forKey key: String) {
-        verifiedStates[key] = state
-        refreshRow(key)
-    }
-
-    /// One-line description per catalog entry: the language it decodes (and
-    /// whether it also drives detection), or a VAD note for the VAD entry.
-    private func subtitle(for e: CatalogEntry) -> String {
-        if e.language.isEmpty {
-            return "Voice activity — lets Ghostie skip silent stretches so it doesn't invent words."
-        }
-        let base = "Decodes ‘\(e.language)’."
-        return e.goodForLID ? base + " Also drives language detection." : base
-    }
-
-    /// One checkbox row per language: everything the installed models decode,
-    /// plus any explicit `codeSwitch.languages` entry whose model is missing
-    /// (kept visible with a warning so the user sees why it can't decode).
-    /// Followup #5: the old binary mode popup couldn't express N languages.
-    private func rebuildLanguageRows() {
-        languagesCard.clearRows()
-        let installed = Models.installed(preferredKBVariant: cfg.codeSwitch.kbWhisperVariant)
-        let onDisk = installed.languages
-        let all = Set(onDisk).union(cfg.codeSwitch.languages).sorted()
-        let active = Set(cfg.codeSwitch.effectiveLanguages(installed: installed))
-        guard !all.isEmpty else {
-            languagesCard.addRow(RowBuilder.row(
-                label: "No languages yet",
-                sub: "Download a model below — Ghostie recognizes whatever languages the installed models decode, and routes each speaker to the matching model.",
-                control: NSView()), last: true)
-            return
-        }
-        for (i, lang) in all.enumerated() {
-            let missing = !onDisk.contains(lang)
-            let name = Locale.current.localizedString(forLanguageCode: lang) ?? lang
-            let box = NSButton(checkboxWithTitle: "", target: nil, action: nil)
-            box.state = active.contains(lang) || (missing && cfg.codeSwitch.languages.contains(lang))
-                ? .on : .off
-            let target = ToggleTarget { [weak self, weak box] in
-                guard let self, let box else { return }
-                self.toggleLanguage(lang, on: box.state == .on)
-            }
-            box.target = target
-            box.action = #selector(ToggleTarget.fire)
-            objc_setAssociatedObject(box, &ToggleTarget.key, target, .OBJC_ASSOCIATION_RETAIN)
-            languagesCard.addRow(RowBuilder.row(
-                label: "\(name) (\(lang))",
-                sub: missing
-                    ? "Configured, but its model isn't installed — add one below or uncheck."
-                    : "Ghostie detects when a speaker uses \(name) and routes it to the matching model.",
-                control: box), last: i == all.count - 1)
+    func setDownloading(modelFilename key: String, percent: Double, status: String) {
+        for r in setup.rows where r.modelFilename == key {
+            rows[r.code]?.setDownloading(percent: percent, status: status)
         }
     }
 
-    /// Write the new selection to `codeSwitch.languages` — an explicit
-    /// whitelist, exactly what the old popup's one-liner wrote. Never allowed
-    /// to go empty (an empty list means "everything installed", so unchecking
-    /// the last language would paradoxically re-enable them all).
-    private func toggleLanguage(_ lang: String, on: Bool) {
-        let installed = Models.installed(preferredKBVariant: cfg.codeSwitch.kbWhisperVariant)
-        var selection = Set(cfg.codeSwitch.languages.isEmpty
-            ? cfg.codeSwitch.effectiveLanguages(installed: installed)
-            : cfg.codeSwitch.languages)
-        if on { selection.insert(lang) } else { selection.remove(lang) }
-        guard !selection.isEmpty else {
-            rebuildLanguageRows()   // restore the checkbox; refuse the edit
-            return
+    func setBusy(modelFilename key: String, status: String) {
+        for r in setup.rows where r.modelFilename == key {
+            rows[r.code]?.setBusy(status: status)
         }
-        change { c in c.codeSwitch.languages = selection.sorted() }
-        refreshAdvanced()   // per-language prompt fields track the selection
-        refreshAllRows()    // model-row tickmarks + language rows
-    }
-
-    func refreshRow(_ key: String) {
-        guard let st = rows[key], let model = modelForKey(key), let e = entriesByKey[key] else { return }
-        // Hash-free: this runs on pane build and every refresh, and a SHA256
-        // of a ~1.1 GB model is ~3 s on the main thread. A mismatch verdict
-        // from an explicit Verify / Re-verify overlays the cheap check.
-        var state = ModelDownloader.health(for: [model], verifyHash: false)[0].state
-        if case .ok = state, let verdict = verifiedStates[key] { state = verdict }
-        let installed = Models.installed(preferredKBVariant: cfg.codeSwitch.kbWhisperVariant)
-        let active = cfg.codeSwitch.effectiveLanguages(installed: installed)
-        let selected: Bool
-        if e.language.isEmpty {
-            // VAD: no explicit toggle — whisper-cli uses it automatically
-            // whenever the file is on disk. Tick it when present.
-            selected = state.isOK
-        } else if active.count < 2 {
-            // Single-language path: the one model the engine will actually use.
-            selected = (model.destPath == cfg.whisperModel)
-        } else {
-            // Multi-language: a model is "active" when its language is in the
-            // effective whitelist — it's the decoder for that language.
-            selected = active.contains(e.language)
-        }
-        st.row.apply(state: state, selected: selected, isPaired: false)
-    }
-
-    func refreshAllRows() {
-        for key in rows.keys { refreshRow(key) }
-        rebuildLanguageRows()
-    }
-
-    func setRowDownloading(_ key: String, percent: Double, status: String) {
-        rows[key]?.row.setDownloading(percent: percent, status: status)
-    }
-    func setRowBusy(_ key: String, status: String) {
-        rows[key]?.row.setBusy(status: status)
-    }
-
-    private func modelForKey(_ key: String) -> Model? {
-        entriesByKey[key]?.model()
     }
 
     private func buildToggleRow(label: String, sub: String, on: Bool,
@@ -491,56 +509,59 @@ final class TranscriptionPane: NSView {
     }
 }
 
-// MARK: - Model row
+// MARK: - Language row
 
-/// Block-based target for `NSMenuItem`s in the "+" menu — the item is passed
-/// back so the handler can read its `representedObject`.
-private final class MenuTarget: NSObject {
-    private let handler: (NSMenuItem) -> Void
-    init(_ handler: @escaping (NSMenuItem) -> Void) { self.handler = handler }
-    @objc func fire(_ sender: NSMenuItem) { handler(sender) }
-}
-
-private final class ModelRowView: NSView {
-    private let radio = RadioCircle()
+/// One language: what it is, which model serves it, whether that model is
+/// ready, and a `⋯` for everything you can do to it. The model is stated in
+/// words on the row rather than implied by a tickmark in a separate list.
+private final class LanguageRowView: NSView {
     private let title = NSTextField(labelWithString: "")
     private let subtitle = NSTextField(labelWithString: "")
-    private let badge = StatusBadgeView(kind: .muted, label: "Not downloaded")
-    private let action: StyledButton
+    private let badge: StatusBadgeView
+    private let menuButton = StyledButton(title: "⋯", target: nil, action: nil)
+    private let actionButton: StyledButton?
     private let progressBar = ProgressBar()
     private let statusLine = NSTextField(labelWithString: "")
     private var progressHeight: NSLayoutConstraint!
     private var statusHeight: NSLayoutConstraint!
     private var subtitleToBottom: NSLayoutConstraint!
     private var statusToBottom: NSLayoutConstraint!
-    var onAction: (() -> Void)?
-    /// Click anywhere on the row (not the action button) to select it for the
-    /// `−` button — the macOS list pattern.
-    var onSelect: (() -> Void)?
 
-    init(key: String, title: String, subtitle: String) {
-        self.action = StyledButton(title: "Download", target: nil, action: nil)
+    var onSelect: (() -> Void)?
+    var onMenu: ((NSView) -> Void)?
+    var onAction: (() -> Void)?
+
+    init(row r: LanguageSetup.Row) {
+        switch r.state {
+        case .onDisk:
+            badge = StatusBadgeView(kind: .ok, label: "Ready")
+            actionButton = nil
+        case .missing:
+            badge = StatusBadgeView(kind: .muted, label: "Not downloaded")
+            actionButton = StyledButton(title: "Download", target: nil, action: nil)
+        case .none:
+            badge = StatusBadgeView(kind: .warn, label: "No model")
+            actionButton = StyledButton(title: "Pick model…", target: nil, action: nil)
+        }
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
         wantsLayer = true
         layer?.cornerRadius = 5
-        // Click anywhere on the row (a gesture recognizer fires even over the
-        // non-interactive labels, which would otherwise swallow `mouseDown`).
-        // Don't delay primary mouse events, so the action button still works.
         let click = NSClickGestureRecognizer(target: self, action: #selector(rowClicked))
         click.delaysPrimaryMouseButtonEvents = false
         addGestureRecognizer(click)
 
-        self.title.stringValue = title
-        self.title.font = .systemFont(ofSize: 13, weight: .semibold)
-        self.title.textColor = Theme.text
-        self.title.translatesAutoresizingMaskIntoConstraints = false
-        self.title.setContentHuggingPriority(.required, for: .horizontal)
+        title.stringValue = WhisperLanguages.label(r.code)
+        title.font = .systemFont(ofSize: 13, weight: .semibold)
+        title.textColor = Theme.text
+        title.translatesAutoresizingMaskIntoConstraints = false
+        title.setContentHuggingPriority(.required, for: .horizontal)
 
-        self.subtitle.stringValue = subtitle
-        self.subtitle.font = .systemFont(ofSize: 11.5)
-        self.subtitle.textColor = Theme.text2
-        self.subtitle.translatesAutoresizingMaskIntoConstraints = false
+        subtitle.stringValue = Self.describe(r)
+        subtitle.font = .systemFont(ofSize: 11.5)
+        subtitle.textColor = Theme.text2
+        subtitle.lineBreakMode = .byTruncatingTail
+        subtitle.translatesAutoresizingMaskIntoConstraints = false
 
         statusLine.font = .systemFont(ofSize: 11)
         statusLine.textColor = Theme.text2
@@ -550,79 +571,93 @@ private final class ModelRowView: NSView {
         progressBar.translatesAutoresizingMaskIntoConstraints = false
         progressBar.isHidden = true
 
-        // Pin the action button to a fixed width so the badge column to its
-        // left lands at a consistent X across all four rows. Long-enough to
-        // fit the widest label ("Re-download") without truncating.
-        action.widthAnchor.constraint(equalToConstant: 110).isActive = true
         badge.translatesAutoresizingMaskIntoConstraints = false
 
-        // The title sits alone now (badge moved out to a right-aligned
-        // column). `.required` hugging keeps it at its intrinsic width so
-        // a shorter model name doesn't stretch into the badge column.
-        let titleLine = self.title
-        titleLine.translatesAutoresizingMaskIntoConstraints = false
+        menuButton.kind = .ghost
+        menuButton.widthAnchor.constraint(equalToConstant: 32).isActive = true
+        let menuTarget = ActionTarget { [weak self] in
+            guard let self else { return }
+            self.onMenu?(self.menuButton)
+        }
+        menuButton.target = menuTarget
+        menuButton.action = #selector(ActionTarget.fire)
+        objc_setAssociatedObject(menuButton, &ActionTarget.key, menuTarget, .OBJC_ASSOCIATION_RETAIN)
 
-        radio.translatesAutoresizingMaskIntoConstraints = false
-
-        let actionTarget = ActionTarget { [weak self] in self?.onAction?() }
-        action.target = actionTarget
-        action.action = #selector(ActionTarget.fire)
-        objc_setAssociatedObject(action, &ActionTarget.key, actionTarget, .OBJC_ASSOCIATION_RETAIN)
-
-        addSubview(radio)
-        addSubview(titleLine)
-        addSubview(self.subtitle)
+        addSubview(title)
+        addSubview(subtitle)
         addSubview(badge)
-        addSubview(action)
+        addSubview(menuButton)
         addSubview(progressBar)
         addSubview(statusLine)
 
-        // Progress and status carry their own height constraints, toggled to
-        // 0 when hidden so the row collapses to title + subtitle without
-        // leaving phantom space.
+        // The trailing control column runs right-to-left: ⋯, then the action
+        // button when there is one, then the badge.
+        var rightAnchorView: NSView = menuButton
+        if let actionButton {
+            actionButton.kind = .primary
+            actionButton.translatesAutoresizingMaskIntoConstraints = false
+            actionButton.widthAnchor.constraint(equalToConstant: 110).isActive = true
+            let t = ActionTarget { [weak self] in self?.onAction?() }
+            actionButton.target = t
+            actionButton.action = #selector(ActionTarget.fire)
+            objc_setAssociatedObject(actionButton, &ActionTarget.key, t, .OBJC_ASSOCIATION_RETAIN)
+            addSubview(actionButton)
+            NSLayoutConstraint.activate([
+                actionButton.trailingAnchor.constraint(equalTo: menuButton.leadingAnchor, constant: -8),
+                actionButton.centerYAnchor.constraint(equalTo: title.centerYAnchor)
+            ])
+            rightAnchorView = actionButton
+        }
+
         progressHeight = progressBar.heightAnchor.constraint(equalToConstant: 0)
         statusHeight = statusLine.heightAnchor.constraint(equalToConstant: 0)
         progressHeight.isActive = true
         statusHeight.isActive = true
 
-        subtitleToBottom = bottomAnchor.constraint(equalTo: self.subtitle.bottomAnchor, constant: 11)
+        subtitleToBottom = bottomAnchor.constraint(equalTo: subtitle.bottomAnchor, constant: 11)
         statusToBottom = bottomAnchor.constraint(equalTo: statusLine.bottomAnchor, constant: 9)
         subtitleToBottom.isActive = true
 
         NSLayoutConstraint.activate([
-            radio.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14),
-            radio.centerYAnchor.constraint(equalTo: titleLine.centerYAnchor),
-            radio.widthAnchor.constraint(equalToConstant: 16),
-            radio.heightAnchor.constraint(equalToConstant: 16),
+            title.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14),
+            title.topAnchor.constraint(equalTo: topAnchor, constant: 11),
+            title.trailingAnchor.constraint(lessThanOrEqualTo: badge.leadingAnchor, constant: -10),
 
-            titleLine.leadingAnchor.constraint(equalTo: radio.trailingAnchor, constant: 12),
-            titleLine.topAnchor.constraint(equalTo: topAnchor, constant: 11),
-            titleLine.trailingAnchor.constraint(lessThanOrEqualTo: badge.leadingAnchor, constant: -10),
+            subtitle.leadingAnchor.constraint(equalTo: title.leadingAnchor),
+            subtitle.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 2),
+            subtitle.trailingAnchor.constraint(lessThanOrEqualTo: badge.leadingAnchor, constant: -10),
 
-            self.subtitle.leadingAnchor.constraint(equalTo: titleLine.leadingAnchor),
-            self.subtitle.topAnchor.constraint(equalTo: titleLine.bottomAnchor, constant: 2),
-            self.subtitle.trailingAnchor.constraint(lessThanOrEqualTo: badge.leadingAnchor, constant: -10),
+            badge.trailingAnchor.constraint(equalTo: rightAnchorView.leadingAnchor, constant: -12),
+            badge.centerYAnchor.constraint(equalTo: title.centerYAnchor),
 
-            // Right-aligned badge column. Trailing pinned to a fixed offset
-            // from the action button's leading edge, vertically aligned with
-            // the title — matches the "Granted" column pattern in the
-            // permissions card so all four pills line up on the right.
-            badge.trailingAnchor.constraint(equalTo: action.leadingAnchor, constant: -12),
-            badge.centerYAnchor.constraint(equalTo: titleLine.centerYAnchor),
+            menuButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
+            menuButton.centerYAnchor.constraint(equalTo: title.centerYAnchor),
 
-            progressBar.leadingAnchor.constraint(equalTo: titleLine.leadingAnchor),
+            progressBar.leadingAnchor.constraint(equalTo: title.leadingAnchor),
             progressBar.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
-            progressBar.topAnchor.constraint(equalTo: self.subtitle.bottomAnchor, constant: 8),
+            progressBar.topAnchor.constraint(equalTo: subtitle.bottomAnchor, constant: 8),
 
-            statusLine.leadingAnchor.constraint(equalTo: titleLine.leadingAnchor),
+            statusLine.leadingAnchor.constraint(equalTo: title.leadingAnchor),
             statusLine.topAnchor.constraint(equalTo: progressBar.bottomAnchor, constant: 3),
-            statusLine.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -14),
-
-            action.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
-            action.centerYAnchor.constraint(equalTo: titleLine.centerYAnchor)
+            statusLine.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -14)
         ])
     }
     required init?(coder: NSCoder) { fatalError() }
+
+    /// The row's one-line story: which model, how big, and any role it plays.
+    /// These roles (detection driver, fallback language) were previously
+    /// invisible — the detection driver in particular decides routing quality
+    /// for every other language and was never surfaced anywhere but `doctor`.
+    private static func describe(_ r: LanguageSetup.Row) -> String {
+        guard let label = r.modelLabel else {
+            return "No model yet — pick one and Ghostie will download it."
+        }
+        var parts = [label]
+        if r.modelIsExplicit { parts.append("pinned") }
+        if r.drivesDetection { parts.append("also tells your languages apart") }
+        if r.isPrimary { parts.append("fallback when detection is unsure") }
+        return parts.joined(separator: " · ")
+    }
 
     @objc private func rowClicked() { onSelect?() }
 
@@ -640,113 +675,16 @@ private final class ModelRowView: NSView {
         statusToBottom.isActive = visible
     }
 
-    func apply(state: ModelDownloader.HealthState, selected: Bool, isPaired: Bool) {
-        setProgressVisible(false)
-        radio.isSelected = selected
-        radio.isPaired = isPaired
-        switch state {
-        case .ok:
-            badge.set(kind: .ok, label: "On disk")
-            action.title = "Re-verify"
-            action.kind = .secondary
-        case .missing:
-            badge.set(kind: .muted, label: "Not downloaded")
-            action.title = "Download"
-            action.kind = .primary
-        case .noSidecar:
-            badge.set(kind: .warn, label: "Unverified")
-            action.title = "Verify"
-            action.kind = .secondary
-        case .sizeWrong, .hashMismatch:
-            badge.set(kind: .danger, label: "Mismatch")
-            action.title = "Re-download"
-            action.kind = .primary
-        }
-    }
     func setDownloading(percent: Double, status: String) {
         badge.set(kind: .info, label: "Downloading")
-        action.title = "Cancel"
-        action.kind = .secondary
         setProgressVisible(true)
         progressBar.set(progress: percent)
         statusLine.stringValue = status
     }
+
     func setBusy(status: String) {
-        // Verify / re-hash: status line only, no progress bar — but we still
-        // need somewhere to land the message. Reuse the progress slot with a
-        // zero bar.
         setProgressVisible(true)
         progressBar.set(progress: 0)
         statusLine.stringValue = status
-        action.title = "Working…"
-        action.kind = .secondary
-    }
-}
-
-/// Status mark in front of each model row. The model the engine actually uses
-/// is driven by `cfg.codeSwitch.languages` + `cfg.whisperModel`, not by clicking
-/// the row — so render a tickmark for the active model and leave the slot
-/// empty otherwise. (Was previously a radio circle which implied a per-row
-/// selection affordance that isn't actually wired.)
-private final class RadioCircle: NSView {
-    var isSelected = false { didSet { needsDisplay = true } }
-    var isPaired = false { didSet { needsDisplay = true } }
-    override var isFlipped: Bool { true }
-    override func draw(_ dirtyRect: NSRect) {
-        guard isSelected || isPaired else { return }
-        let r = bounds.insetBy(dx: 1, dy: 1)
-        Theme.accent.setStroke()
-        let check = NSBezierPath()
-        check.lineWidth = 1.8
-        check.lineCapStyle = .round
-        check.lineJoinStyle = .round
-        // Three-point checkmark inscribed in the 14x14 box.
-        check.move(to: CGPoint(x: r.minX + r.width * 0.18,
-                               y: r.minY + r.height * 0.55))
-        check.line(to: CGPoint(x: r.minX + r.width * 0.42,
-                               y: r.minY + r.height * 0.78))
-        check.line(to: CGPoint(x: r.minX + r.width * 0.85,
-                               y: r.minY + r.height * 0.28))
-        check.stroke()
-    }
-}
-
-private final class ProgressBar: NSView {
-    private var progress: CGFloat = 0
-    private let fillLayer = CALayer()
-    override var isFlipped: Bool { true }
-    init() {
-        super.init(frame: .zero)
-        wantsLayer = true
-        layer?.cornerRadius = 2
-        layer?.backgroundColor = themedCG(Theme.chipBg)
-        layer?.masksToBounds = true
-        fillLayer.backgroundColor = themedCG(Theme.accent)
-        fillLayer.cornerRadius = 2
-        layer?.addSublayer(fillLayer)
-    }
-    required init?(coder: NSCoder) { fatalError() }
-    override func layout() {
-        super.layout()
-        // Drive the fill from layout (not updateLayer); previously this ran
-        // inside updateLayer + re-added a sublayer on every pass, which
-        // accumulated layers and reentered display.
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        fillLayer.frame = CGRect(x: 0, y: 0,
-                                  width: bounds.width * progress,
-                                  height: bounds.height)
-        CATransaction.commit()
-    }
-    override func viewDidChangeEffectiveAppearance() {
-        super.viewDidChangeEffectiveAppearance()
-        layer?.backgroundColor = themedCG(Theme.chipBg)
-        fillLayer.backgroundColor = themedCG(Theme.accent)
-    }
-    func set(progress: Double) {
-        let p = CGFloat(max(0, min(1, progress)))
-        guard p != self.progress else { return }
-        self.progress = p
-        needsLayout = true
     }
 }
