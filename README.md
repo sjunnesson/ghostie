@@ -359,7 +359,7 @@ Edit `~/.ghostie/config.json` (created on first run). Notable keys:
 | `initialPrompt` | business-call primer | Biases whisper punctuation; `""` to disable |
 | `vadModel` | `…/ggml-silero-v5.1.2.bin` | Auto-used if present (`setup.sh --vad`) |
 | `summaryProvider` | `claude` | Summarizer backend: `claude` (cloud) or `ollama` (local) |
-| `summaryModel` | `claude-sonnet-4-6` | Model for `claude -p` (alias or full id); `claude` provider only |
+| `summaryModel` | `sonnet` | Model for `claude -p`. A tier alias (`sonnet`/`opus`/`haiku`/`fable`) tracks Anthropic's latest automatically; a full id pins one version. `claude` provider only |
 | `summaryTimeoutSeconds` | `300` | Wall-clock cap per summarization request (both providers); raise for big local models |
 | `claudeBinary` | _(auto-detected)_ | Path to the `claude` CLI; `claude` provider only |
 | `ollamaUrl` | `http://localhost:11434` | Ollama server URL (LAN host also fine); `ollama` provider only |

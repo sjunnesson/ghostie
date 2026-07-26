@@ -117,10 +117,16 @@ struct Config: Codable {
     /// silently fall back to the other one.
     var summaryProvider: String = "claude"
 
-    /// Model passed to `claude -p --model`. An alias ("sonnet", "opus",
-    /// "haiku") or a full id ("claude-sonnet-4-6"). Only used when
+    /// Model passed to `claude -p --model`. Only used when
     /// `summaryProvider == "claude"`.
-    var summaryModel: String = "claude-sonnet-4-6"
+    ///
+    /// Defaults to the **alias** `"sonnet"`, not a pinned version: the CLI
+    /// resolves an alias to the latest model in that tier, so a fresh install
+    /// follows Anthropic's releases instead of freezing on whatever shipped
+    /// with this build (and can't break when a pinned version is retired). A
+    /// full id (`"claude-sonnet-5"`) still works and is what Settings writes
+    /// when someone deliberately pins one. See `ClaudeModels`.
+    var summaryModel: String = ClaudeModels.defaultModel
 
     /// Path to the `claude` binary. Auto-detected if empty. Summarization uses
     /// your existing Claude Code login (subscription/OAuth) — no API key.

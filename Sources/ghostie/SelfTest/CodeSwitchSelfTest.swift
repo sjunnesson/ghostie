@@ -486,6 +486,60 @@ func runCodeSwitchSelfTest() -> Bool {
               Models.bestSingleLanguageModel { _ in false } == nil)
     }
 
+    // Summary-model picker: tier aliases instead of pinned versions, so the
+    // list can't fall behind Anthropic's releases. The load-bearing property is
+    // that the picker always contains — and selects — whatever is configured:
+    // the old code called `selectItem(withTitle:)`, which fails *silently* on a
+    // miss, so an unlisted model left the menu displaying a different one.
+    do {
+        check("models: the shipped default is an alias, not a pinned version",
+              ClaudeModels.isAlias(Config().summaryModel)
+              && ClaudeModels.isAlias(ClaudeModels.defaultModel))
+        check("models: no alias id looks like a pinned version",
+              ClaudeModels.aliases.allSatisfy { !$0.id.contains("-") && !$0.id.hasPrefix("claude") },
+              "got \(ClaudeModels.aliases.map(\.id))")
+
+        // An alias selects its own row and offers no stray pinned entry.
+        let sonnet = ClaudeModels.menu(configured: "sonnet")
+        check("models: an alias selects its own row",
+              sonnet.entries[sonnet.selected] == .alias("sonnet"))
+        check("models: an alias adds no pinned row",
+              !sonnet.entries.contains { if case .pinned = $0 { return true }; return false })
+        check("models: every menu ends with the custom escape hatch",
+              sonnet.entries.last == .custom)
+
+        // A model this build has never heard of — the exact case that used to
+        // silently mis-display — must appear and be selected.
+        let future = ClaudeModels.menu(configured: "claude-sonnet-7-20270101")
+        check("models: an unknown/newer model still appears in the picker",
+              future.entries.contains(.pinned("claude-sonnet-7-20270101")))
+        check("models: …and is the selected row, not a lookalike",
+              future.entries[future.selected] == .pinned("claude-sonnet-7-20270101"))
+        check("models: a retired pinned id is likewise preserved, not dropped",
+              ClaudeModels.menu(configured: "claude-3-opus-20240229")
+                  .entries.contains(.pinned("claude-3-opus-20240229")))
+
+        // Selection must never land on `.custom` (choosing it opens a prompt).
+        for configured in ["sonnet", "opus", "haiku", "fable", "claude-sonnet-5", "", "   "] {
+            let m = ClaudeModels.menu(configured: configured)
+            check("models: selection is a real row for \"\(configured)\"",
+                  m.selected >= 0 && m.selected < m.entries.count && m.entries[m.selected] != .custom)
+        }
+        check("models: an empty config falls back to the default row",
+              ClaudeModels.menu(configured: "").entries[
+                  ClaudeModels.menu(configured: "").selected] == .alias(ClaudeModels.defaultModel))
+        check("models: whitespace is trimmed, not treated as a pinned id",
+              ClaudeModels.menu(configured: "  sonnet  ").entries[
+                  ClaudeModels.menu(configured: "  sonnet  ").selected] == .alias("sonnet"))
+
+        // The description tells the truth about what pinning costs.
+        check("models: an alias is described as following the latest",
+              ClaudeModels.summary(for: "opus").contains("automatically"))
+        check("models: a pinned version warns it stops following releases",
+              ClaudeModels.summary(for: "claude-sonnet-5").contains("won't move")
+              && ClaudeModels.summary(for: "claude-sonnet-5").contains("claude-sonnet-5"))
+    }
+
     // Model catalog: the user-extensible "bring your own model" layer. The
     // pipeline is already language-agnostic, so these check that a custom
     // catalog entry flows through discovery / capability lookups the same way

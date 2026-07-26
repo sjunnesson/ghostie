@@ -121,13 +121,30 @@ final class SummaryPane: NSView {
             leadingSymbol: "terminal", leadingTint: Theme.text2,
             control: StatusBadgeView(kind: claudeReady ? .ok : .warn,
                                      label: claudeReady ? "Signed in" : "Missing")))
+        // Rows come from `ClaudeModels`, which offers *tier aliases* rather than
+        // pinned version ids — an alias resolves to whatever is current, so this
+        // picker doesn't fall behind Anthropic's releases the way the old
+        // hardcoded version list did. Whatever is configured is always one of
+        // the rows, so the picker can't display one model while another is set.
+        let (entries, selected) = ClaudeModels.menu(configured: cfgState.summaryModel)
         let modelPopup = NSPopUpButton(frame: .zero, pullsDown: false)
-        modelPopup.addItems(withTitles: ["claude-sonnet-4-6", "claude-opus-4-7", "claude-haiku-4-5-20251001"])
-        modelPopup.selectItem(withTitle: cfgState.summaryModel)
+        for entry in entries {
+            modelPopup.addItem(withTitle: ClaudeModels.title(for: entry))
+        }
+        modelPopup.selectItem(at: selected)
         let modelTarget = ToggleTarget { [weak self] in
-            let title = modelPopup.titleOfSelectedItem ?? "claude-sonnet-4-6"
-            self?.cfgState.summaryModel = title
-            self?.changes { c in c.summaryModel = title }
+            guard let self else { return }
+            let i = modelPopup.indexOfSelectedItem
+            guard i >= 0, i < entries.count else { return }
+            switch entries[i] {
+            case .alias(let id), .pinned(let id):
+                self.applySummaryModel(id)
+            case .custom:
+                // Restore the selection first: if the prompt is cancelled the
+                // picker must go back to showing what's actually configured.
+                modelPopup.selectItem(at: selected)
+                if let id = self.promptForModelID() { self.applySummaryModel(id) }
+            }
         }
         modelPopup.target = modelTarget
         modelPopup.action = #selector(ToggleTarget.fire)
@@ -135,8 +152,48 @@ final class SummaryPane: NSView {
         modelPopup.widthAnchor.constraint(equalToConstant: 220).isActive = true
         card.addRow(RowBuilder.row(
             label: "Which Claude writes the note",
-            sub: "Sonnet is the good balance. Opus is slower but smarter. Haiku is faster but lighter.",
+            sub: ClaudeModels.summary(for: cfgState.summaryModel),
             control: modelPopup), last: true)
+    }
+
+    private func applySummaryModel(_ id: String) {
+        guard id != cfgState.summaryModel else { return }
+        cfgState.summaryModel = id
+        changes { c in c.summaryModel = id }
+        // The sentence under the picker describes the selection, and a pinned
+        // id adds a row — so redraw the card rather than leaving stale copy.
+        refreshProviderCard()
+    }
+
+    /// Prompt for an exact model id, for pinning a specific version (or
+    /// reaching a model with no tier alias). Deliberately not validated against
+    /// a list — a list is what went stale in the first place; a wrong id
+    /// surfaces as a clear failure from `claude -p` on the next call.
+    private func promptForModelID() -> String? {
+        let field = NSTextField(string: ClaudeModels.isAlias(cfgState.summaryModel)
+                                ? "" : cfgState.summaryModel)
+        field.placeholderString = "claude-sonnet-5"
+        field.translatesAutoresizingMaskIntoConstraints = false
+        field.widthAnchor.constraint(equalToConstant: 320).isActive = true
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 320, height: 26))
+        container.addSubview(field)
+        NSLayoutConstraint.activate([
+            field.topAnchor.constraint(equalTo: container.topAnchor),
+            field.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            field.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            field.trailingAnchor.constraint(equalTo: container.trailingAnchor)
+        ])
+
+        let a = NSAlert()
+        a.messageText = "Use a specific model version"
+        a.informativeText = "Type the exact model name, like claude-sonnet-5. Pinning a version means Ghostie stops following newer models — and stops working if that one is retired. The tier options above avoid both."
+        a.accessoryView = container
+        a.addButton(withTitle: "Use it")
+        a.addButton(withTitle: "Cancel")
+        a.window.initialFirstResponder = field
+        guard a.runModal() == .alertFirstButtonReturn else { return nil }
+        let id = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        return id.isEmpty ? nil : id
     }
 
     // MARK: Ollama rows
