@@ -7,3 +7,6 @@ build/
 recordings/
 *.wav
 config.json
+
+# Claude Code worktrees
+.claude/worktrees/

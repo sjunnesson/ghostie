@@ -5,9 +5,10 @@ import CoreMedia
 
 /// Records a Teams call entirely locally — no bot joins the meeting.
 ///
-/// ScreenCaptureKit gives us two independent audio taps:
-///   • `.audio`      → everything the system plays  = the other participants
-///   • `.microphone` → the local microphone          = me
+/// Two independent audio paths:
+///   • SCK `.audio` → everything the system plays       = the other participants
+///   • `MicCapture` (echo-cancelled voice-processing I/O), falling back to the
+///     raw SCK `.microphone` tap → the local microphone = me
 ///
 /// We keep them as two separate 16 kHz mono WAV files so the transcripts can be
 /// labelled by speaker ("Me" vs "Participants") without any diarization model.
@@ -26,6 +27,9 @@ final class AudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
 
     private let config: Config
     private var stream: SCStream?
+    /// Voice-processed (echo-cancelled) mic path; nil means the raw SCK
+    /// `.microphone` tap is in use (config opt-out or VP failed to start).
+    private var micCapture: MicCapture?
     private var sessionDir: URL!
     private var micWriter: WavWriter?
     private var systemWriter: WavWriter?
@@ -141,9 +145,15 @@ final class AudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
         } catch {
             // Settle the state machine so a stop() parked on `.starting`
             // (or one yet to come) sees a clean, fully-down recorder.
+            stopMicCapture()
             finishStart(as: .stopped)
             throw error
         }
+    }
+
+    private func stopMicCapture() {
+        micCapture?.stop()
+        micCapture = nil
     }
 
     private func beginCapture() async throws {
@@ -171,12 +181,29 @@ final class AudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
                                      excludingApplications: [],
                                      exceptingWindows: [])
 
+        // Prefer the echo-cancelled mic path (see MicCapture). Routed through
+        // micQueue so the drain fences in stop() cover it exactly like the
+        // SCK tap they replace. Falls back to the raw tap on any VP failure.
+        if config.micEchoCancellation && micOK {
+            let cap = MicCapture { [weak self] samples, pts in
+                guard let self else { return }
+                self.micQueue.async { self.ingestMic(samples, pts: pts) }
+            }
+            do {
+                try cap.start()
+                micCapture = cap
+                Log.info("Mic capture: voice-processed (echo-cancelled).")
+            } catch {
+                Log.warn("Voice-processed mic unavailable (\(error.localizedDescription)) — falling back to the raw ScreenCaptureKit tap; expect speaker echo on the 'Me' track without headphones.")
+            }
+        }
+
         let cfg = SCStreamConfiguration()
         cfg.capturesAudio = true
         cfg.sampleRate = 48000
         cfg.channelCount = 2
         cfg.excludesCurrentProcessAudio = true
-        cfg.captureMicrophone = true            // macOS 15+ : separate mic tap
+        cfg.captureMicrophone = micCapture == nil   // macOS 15+ : raw mic tap (fallback)
         // Minimal video — required to keep the stream alive; frames are dropped.
         cfg.width = 2
         cfg.height = 2
@@ -187,7 +214,9 @@ final class AudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
         let s = SCStream(filter: filter, configuration: cfg, delegate: self)
         try s.addStreamOutput(self, type: .screen, sampleHandlerQueue: videoQueue)
         try s.addStreamOutput(self, type: .audio, sampleHandlerQueue: audioQueue)
-        try s.addStreamOutput(self, type: .microphone, sampleHandlerQueue: micQueue)
+        if micCapture == nil {
+            try s.addStreamOutput(self, type: .microphone, sampleHandlerQueue: micQueue)
+        }
         try await s.startCapture()
 
         // Publish the live stream atomically — unless stop() arrived while we
@@ -203,6 +232,7 @@ final class AudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
         }
         if cancelled {
             try? await s.stopCapture()
+            stopMicCapture()
             finishStart(as: .stopped)
             Log.info("stop() arrived during startup — capture torn down immediately.")
             return
@@ -328,6 +358,7 @@ final class AudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
                 // stopCapture throws if the stream already died (bug-2 path);
                 // that is fine — the queues still drain and the WAVs close.
                 if let s { try? await s.stopCapture() }
+                stopMicCapture()
                 stateLock.withLock { lifecycle = .stopped }
                 return
             }

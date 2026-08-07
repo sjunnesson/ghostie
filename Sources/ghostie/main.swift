@@ -273,6 +273,10 @@ func cmdDoctor(_ config: Config) {
     row(t.isAvailable, "transcription ready")
     row(config.cleanTranscript, "hallucination guard",
         config.cleanTranscript ? "on (run `ghostie selftest` to verify)" : "disabled in config")
+    row(config.micEchoCancellation, "mic echo cancellation",
+        config.micEchoCancellation
+            ? "on (voice-processed mic; raw-tap fallback is automatic)"
+            : "disabled in config — expect speaker echo on the 'Me' track without headphones")
     let vadOn = !config.vadModel.isEmpty && FileManager.default.fileExists(atPath: config.vadModel)
     row(vadOn, "Silero VAD model", vadOn ? config.vadModel : "optional — ./scripts/setup.sh --vad")
     switch config.summaryProvider {
@@ -583,12 +587,14 @@ case "update":
 case "selftest":
     let cleanerOK = runTranscriptCleanerSelfTest()
     print("")
+    let echoOK = runEchoSuppressorSelfTest()
+    print("")
     let codeSwitchOK = runCodeSwitchSelfTest()
     print("")
     let updaterOK = runUpdaterSelfTest()
     print("")
     let detectorOK = runDetectorStateMachineSelfTest()
-    exit(cleanerOK && codeSwitchOK && updaterOK && detectorOK ? 0 : 1)
+    exit(cleanerOK && echoOK && codeSwitchOK && updaterOK && detectorOK ? 0 : 1)
 case "settings":
     launchSettingsOnly()
 case "install-service":

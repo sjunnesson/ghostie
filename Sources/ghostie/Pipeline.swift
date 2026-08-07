@@ -287,21 +287,19 @@ struct Pipeline {
     /// whisper pass; per-track cleaning + the timestamp merge are unchanged so
     /// the cleaner and summary see the same shape either way.
     private func transcribeMerge(mic: URL, sys: URL) throws -> [Line] {
-        var lines: [Line] = []
-        func collect(_ raw: [Transcriber.Segment], _ speaker: String) {
-            let segments: [(startMs: Int, text: String)]
-            if config.cleanTranscript {
-                let (cleaned, stats) = TranscriptCleaner.clean(
-                    raw.map { (startMs: $0.startMs, text: $0.text) })
-                if stats.removed > 0 { Log.info("\(speaker): \(stats.summary)") }
-                segments = cleaned.map { (startMs: $0.startMs, text: $0.text) }
-            } else {
-                segments = raw.map { (startMs: $0.startMs, text: $0.text) }
+        func cleaned(_ raw: [Transcriber.Segment], _ speaker: String)
+            -> [(startMs: Int, text: String)] {
+            guard config.cleanTranscript else {
+                return raw.map { (startMs: $0.startMs, text: $0.text) }
             }
-            for s in segments {
-                lines.append(Line(startMs: s.startMs, speaker: speaker, text: s.text))
-            }
+            let (out, stats) = TranscriptCleaner.clean(
+                raw.map { (startMs: $0.startMs, text: $0.text) })
+            if stats.removed > 0 { Log.info("\(speaker): \(stats.summary)") }
+            return out.map { (startMs: $0.startMs, text: $0.text) }
         }
+
+        var me: [(startMs: Int, text: String)]
+        var part: [(startMs: Int, text: String)]
 
         // Codeswitch is taken whenever ≥2 per-language whisper models are
         // installed on disk. With one model, the single-language path runs
@@ -315,13 +313,27 @@ struct Pipeline {
                 + active.joined(separator: "+") + ").")
             let cst = CodeSwitchTranscriber(config: config, installed: installed)
             let (meSegs, partSegs) = try cst.transcribeBoth(me: mic, participants: sys)
-            collect(meSegs, "Me")
-            collect(partSegs, "Participants")
+            me = cleaned(meSegs, "Me")
+            part = cleaned(partSegs, "Participants")
         } else {
             let transcriber = Transcriber(config: config)
-            collect(try transcriber.transcribe(mic, speaker: "Me"), "Me")
-            collect(try transcriber.transcribe(sys, speaker: "Participants"), "Participants")
+            me = cleaned(try transcriber.transcribe(mic, speaker: "Me"), "Me")
+            part = cleaned(try transcriber.transcribe(sys, speaker: "Participants"), "Participants")
         }
+
+        // Cross-track echo guard: without headphones the speakers' output
+        // re-enters the mic, so Me duplicates Participants. Per-track cleaning
+        // can't see this; it has to run here, between clean and merge.
+        if config.cleanTranscript {
+            let (deEchoed, stats) = EchoSuppressor.suppress(me: me, participants: part)
+            if stats.engaged {
+                Log.info(stats.summary)
+                me = deEchoed
+            }
+        }
+
+        var lines = me.map { Line(startMs: $0.startMs, speaker: "Me", text: $0.text) }
+        lines += part.map { Line(startMs: $0.startMs, speaker: "Participants", text: $0.text) }
         return Self.merge(lines)
     }
 

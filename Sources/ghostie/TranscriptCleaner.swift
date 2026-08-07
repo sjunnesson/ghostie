@@ -170,6 +170,12 @@ enum TranscriptCleaner {
         segs = segs.filter { !isKnownHallucination($0.text) }
         stats.afterKnownHallucinations = segs.count
 
+        // 1.5. Collapse loops *inside* a single segment ("Yeah, yeah, ×14" —
+        // whisper loops within a segment as well as across them, and the
+        // consecutive-dedup below only sees whole segments).
+        segs = segs.map { Seg(startMs: $0.startMs,
+                              text: collapseWithinSegmentLoop($0.text)) }
+
         // 2. Collapse consecutive near-duplicate runs (≥3, similarity ≥0.8).
         segs = collapseConsecutive(segs)
         stats.afterDedup = segs.count
@@ -186,6 +192,49 @@ enum TranscriptCleaner {
         segs = trimTrailingNoise(segs)
         stats.afterTrailingTrim = segs.count
         return (segs, stats)
+    }
+
+    /// Collapses a 1–3-word phrase repeated ≥4× back-to-back inside one
+    /// segment to a single occurrence ("Yeah, yeah, yeah, ×14" → "Yeah.").
+    /// The ≥4 floor keeps genuine emphasis ("no, no, no") intact. Internal
+    /// (not private) for the selftest.
+    static func collapseWithinSegmentLoop(_ text: String) -> String {
+        var tokens = text.split(separator: " ", omittingEmptySubsequences: true)
+            .map(String.init)
+        guard tokens.count >= 4 else { return text }
+        var collapsed = false
+        for phraseLen in 1...3 {
+            var out: [String] = []
+            var i = 0
+            while i < tokens.count {
+                guard i + phraseLen * 2 <= tokens.count else {
+                    out.append(tokens[i]); i += 1; continue
+                }
+                let phrase = tokens[i..<i+phraseLen].map(normalized)
+                guard !phrase.contains("") else {
+                    out.append(tokens[i]); i += 1; continue
+                }
+                var reps = 1
+                while i + (reps + 1) * phraseLen <= tokens.count,
+                      tokens[(i + reps * phraseLen)..<(i + (reps + 1) * phraseLen)]
+                          .map(normalized) == phrase {
+                    reps += 1
+                }
+                if reps >= 4 {
+                    collapsed = true
+                    out.append(contentsOf: tokens[i..<i+phraseLen])
+                    i += reps * phraseLen
+                } else {
+                    out.append(tokens[i]); i += 1
+                }
+            }
+            tokens = out
+        }
+        guard collapsed else { return text }
+        var result = tokens.joined(separator: " ")
+        // A collapsed run usually ends mid-list ("Yeah,") — close it cleanly.
+        if result.hasSuffix(",") { result = String(result.dropLast()) + "." }
+        return result
     }
 
     private static func collapseConsecutive(_ segs: [Seg]) -> [Seg] {

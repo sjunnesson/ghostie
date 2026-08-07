@@ -65,6 +65,26 @@ func runTranscriptCleanerSelfTest() -> Bool {
                 "Next steps are clear.", "Thanks, talk soon."]
     }
 
+    // Within-segment loops: whisper also loops *inside* one segment
+    // ("Yeah, yeah, ×14" as a single segment on backchannel audio), which
+    // the across-segment consecutive collapse can't see.
+    check("within-segment loop collapses",
+          ["Great point.",
+           "Yeah, yeah, yeah, yeah, yeah, yeah, yeah, yeah, yeah, yeah, "
+           + "yeah, yeah, yeah, yeah,",
+           "Let's continue."]) { out in
+        out == ["Great point.", "Yeah.", "Let's continue."]
+    }
+    check("within-segment multi-word loop collapses",
+          ["I'm sorry. I'm sorry. I'm sorry. I'm sorry. I'm sorry. Let's move on."]) { out in
+        out == ["I'm sorry. Let's move on."]
+    }
+    // Genuine emphasis (≤3 repeats) must never be collapsed.
+    check("emphasis run preserved",
+          ["No, no, no, that's wrong.", "It's very, very good."]) { out in
+        out == ["No, no, no, that's wrong.", "It's very, very good."]
+    }
+
     // Non-English training-data leaks (code-switching decodes emit the
     // leak phrases of THEIR language; the English-only list missed them).
     check("swedish training leaks dropped",

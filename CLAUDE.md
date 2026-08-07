@@ -32,14 +32,18 @@ stay at zero (a recent commit silenced them deliberately).
 
 ### Testing
 
-`ghostie selftest` is the only automated test. It runs two suites in
-`main.swift`: `runTranscriptCleanerSelfTest()` (exercises
-`TranscriptCleaner.clean` over silence loops, training-data leaks,
-noise-marker runs, interleaved drift) and `runCodeSwitchSelfTest()` (exercises
-the `Smoother` over synthetic `LanguageDetection`s — single-language collapse,
-mixed 3-run split, cross-track flip vs. isolated fall-back; **no audio or
-models needed**, so it's green everywhere). **Any change to
-`TranscriptCleaner.swift` or `Smoother.swift` must keep `ghostie selftest`
+`ghostie selftest` is the only automated test. Its suites (wired in
+`main.swift`, living in `SelfTest/`): `runTranscriptCleanerSelfTest()`
+(exercises `TranscriptCleaner.clean` over silence loops, training-data leaks,
+noise-marker runs, interleaved drift, within-segment loops),
+`runEchoSuppressorSelfTest()` (exercises `EchoSuppressor.suppress` over
+real-call echo fixtures — pure echo, mixed real+echo segments, ASR variance,
+plus the never-engage guards for headphone/solo calls), and
+`runCodeSwitchSelfTest()` (exercises the `Smoother` over synthetic
+`LanguageDetection`s — single-language collapse, mixed 3-run split,
+cross-track flip vs. isolated fall-back; **no audio or models needed**, so
+it's green everywhere). **Any change to `TranscriptCleaner.swift`,
+`EchoSuppressor.swift` or `Smoother.swift` must keep `ghostie selftest`
 green**; add a `check(...)` case in the relevant suite rather than building a
 separate harness. Optional end-to-end audio fixtures under `Tests/Fixtures`
 are skipped cleanly when absent.
@@ -71,17 +75,32 @@ the same code drives the menu-bar app and the headless daemon.
   away. At confirm the coordinator freezes a `CallSource` (Teams / Zoom /
   Meet, from the evidence's bundle ids / tab site); Engine reads it via
   `currentCallSource()` and threads it to the pipeline for note naming.
-- **`AudioRecorder.swift`** — ScreenCaptureKit with two taps:
-  `.audio` (system → everyone else → `participants.wav`) and `.microphone`
-  (you → `me.wav`), both 16 kHz mono. Speaker labels are **track-based**, not
-  diarization. A 2×2 dropped video stream is required only to keep the stream alive.
-- **`Pipeline.swift`** — transcribe both tracks → clean per track → merge by
-  timestamp → summarize → write `<notesFolder>/<date>_<Source>-Call.md`
-  (+ transcript), where Source is the detected app ("Teams"/"Zoom"/"Meet",
-  generic "Call" when unknown). The name must stay a pure function of
-  `startedAt` + the source stored in backlog meta.json — retries re-derive it
-  to upgrade the queued note in place (pre-source entries default to
-  "Teams"). `Pipeline.drain(config:)` is the backlog retry entry point.
+- **`AudioRecorder.swift`** — two audio paths, both 16 kHz mono:
+  SCK `.audio` (system → everyone else → `participants.wav`), and the mic
+  (you → `me.wav`) via **`MicCapture.swift`** — AVAudioEngine with
+  voice-processing I/O so speaker output (the other participants) is
+  echo-cancelled out of the Me track. If VP can't start (or
+  `config.micEchoCancellation` is off) it falls back to the raw SCK
+  `.microphone` tap, which re-captures everything the speakers play. Speaker
+  labels are **track-based**, not diarization. A 2×2 dropped video stream is
+  required only to keep the stream alive.
+- **`Pipeline.swift`** — transcribe both tracks → clean per track →
+  cross-track echo guard → merge by timestamp → summarize → write
+  `<notesFolder>/<date>_<Source>-Call.md` (+ transcript), where Source is
+  the detected app ("Teams"/"Zoom"/"Meet", generic "Call" when unknown). The
+  name must stay a pure function of `startedAt` + the source stored in
+  backlog meta.json — retries re-derive it to upgrade the queued note in
+  place (pre-source entries default to "Teams"). `Pipeline.drain(config:)`
+  is the backlog retry entry point.
+- **`EchoSuppressor.swift`** — the cross-track echo guard (text-level backstop
+  behind `MicCapture`'s AEC — Bluetooth latency can defeat AEC, and backlogged
+  pre-fix recordings re-process through it). Direction is known a priori:
+  system audio can never contain the mic, so a ≥5-word run on Me that also
+  appears on Participants within its time window is echo and only the Me copy
+  is trimmed/dropped. It only engages when duplication is endemic (≥25% of Me
+  words, ≥100 words), so headphone calls and genuine verbal mirroring are
+  never touched. Pure + deterministic; covered by `selftest` with fixtures
+  from a real speakerphone call.
 - **`Transcriber.swift`** — wraps the whisper.cpp CLI with hardened,
   hallucination-resistant decoding flags (set explicitly so a future
   whisper-cli default change can't silently regress quality). Parses
