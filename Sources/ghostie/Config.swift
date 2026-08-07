@@ -6,8 +6,11 @@ struct Config: Codable {
 
     // MARK: Output
 
-    /// Folder where the final markdown summaries (and transcripts) are written.
-    var notesFolder: String = "\(NSHomeDirectory())/Documents/Teams Call Notes"
+    /// Folder where the final markdown summaries (and transcripts) are
+    /// written. (The pre-Zoom "Teams Call Notes" default decodes to this one
+    /// — see `init(from:)` — existing note FILES are never moved, so notes
+    /// written before the rename stay in the old folder.)
+    var notesFolder: String = "\(NSHomeDirectory())/Documents/Ghostie Call Notes"
 
     /// Keep the raw audio WAV files after processing (useful for debugging).
     var keepAudio: Bool = false
@@ -217,6 +220,8 @@ struct Config: Codable {
         ["com.microsoft.teams", "com.microsoft.teams2"]
     private static let preZoomInitialPrompt =
         "The following is a professional Microsoft Teams business call with clear punctuation and capitalization."
+    private static let preZoomNotesFolder =
+        "\(NSHomeDirectory())/Documents/Teams Call Notes"
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -226,7 +231,13 @@ struct Config: Codable {
             catch {}
             return fallback
         }
-        notesFolder = g(.notesFolder, d.notesFolder)
+        // Fold: the old "Teams Call Notes" default upgrades to the new
+        // Ghostie one (a persisted default was never a choice); a folder the
+        // user actually picked is kept. Files already written stay where
+        // they are — only future notes land in the new folder.
+        let folder = g(.notesFolder, d.notesFolder)
+        notesFolder = folder == Config.preZoomNotesFolder
+            ? d.notesFolder : folder
         keepAudio = g(.keepAudio, d.keepAudio)
         saveTranscript = g(.saveTranscript, d.saveTranscript)
         triggerBundlePrefixes = g(.triggerBundlePrefixes, d.triggerBundlePrefixes)

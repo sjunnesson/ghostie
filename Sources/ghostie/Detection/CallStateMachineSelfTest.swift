@@ -806,6 +806,14 @@ func runDetectorStateMachineSelfTest() -> Bool {
                 == Config().initialPrompt)
         check("config fold: custom initialPrompt is kept",
               decodeCfg(#"{"initialPrompt":"CUSTOM"}"#).initialPrompt == "CUSTOM")
+        let oldFolder = "\(NSHomeDirectory())/Documents/Teams Call Notes"
+        check("config fold: old default notesFolder upgrades to Ghostie Call Notes",
+              decodeCfg(#"{"notesFolder":"\#(oldFolder)"}"#).notesFolder
+                == Config().notesFolder
+              && Config().notesFolder.hasSuffix("Ghostie Call Notes"))
+        check("config fold: custom notesFolder is kept",
+              decodeCfg(#"{"notesFolder":"/tmp/my-notes"}"#).notesFolder
+                == "/tmp/my-notes")
 
         // Backlog meta written before `source` existed must still decode
         // (source nil → drains label it "Teams", matching the queued note).

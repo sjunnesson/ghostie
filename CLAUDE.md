@@ -182,12 +182,14 @@ the same code drives the menu-bar app and the headless daemon.
   `modelPerLanguage`) folds them into `languages` records on decode,
   `Config.LegacyKeys` folds `detectBrowserTeams` into `detectBrowserMeetings`,
   and `LanguageSetting` decodes from a bare string so a pre-v3 `["sv","en"]`
-  migrates by being decoded. Two value-level folds too (Settings writes every
+  migrates by being decoded. Value-level folds too (Settings writes every
   key, so "persisted the old default" ≠ "user chose it"): a `triggerBundleIds`
   equal to the pre-Zoom Teams-only default upgrades to the new default (adds
-  `us.zoom.xos`), and the old Teams-specific `initialPrompt` default upgrades
-  to the app-neutral one. Every legacy shape has a `selftest` case — keep it
-  that way, because a decoder slip here is a silent whole-config reset.
+  `us.zoom.xos`), the old Teams-specific `initialPrompt` default upgrades to
+  the app-neutral one, and the old "Teams Call Notes" `notesFolder` default
+  upgrades to "Ghostie Call Notes" (existing note files are never moved).
+  Every legacy shape has a `selftest` case — keep it that way, because a
+  decoder slip here is a silent whole-config reset.
 - **whisper-cli quirks (codeswitch)**: `--detect-language`/`-dl` ignores
   `--offset-t`/`--duration` (detects from file start) → segments are physically
   sliced before detection; `-nt` collapses the VAD pass to one segment (never
