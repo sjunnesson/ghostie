@@ -26,25 +26,36 @@ struct Config: Codable {
     /// value triggers a warning log when the detector starts.
     var triggerBundlePrefixes: [String] = ["com.microsoft.teams"]
 
-    /// Exact bundle IDs of the Teams **main** apps. The detector queries AX
-    /// against PIDs whose bundle ID matches this list exactly. Audio helper
-    /// processes (e.g. `com.microsoft.teams2.helper`) are still picked up by
-    /// CoreAudio attribution via a prefix-with-dot match derived from these
-    /// IDs, so a single list serves both purposes without cross-matching
-    /// (classic Teams does not silently swallow new Teams helpers, or vice
-    /// versa).
-    var triggerBundleIds: [String] = ["com.microsoft.teams", "com.microsoft.teams2"]
+    /// Exact bundle IDs of the meeting **main** apps to watch: new + classic
+    /// Teams and Zoom desktop out of the box. The detector queries AX against
+    /// PIDs whose bundle ID matches this list exactly. Audio helper processes
+    /// (e.g. `com.microsoft.teams2.helper`) are still picked up by CoreAudio
+    /// attribution via a prefix-with-dot match derived from these IDs, so a
+    /// single list serves both purposes without cross-matching (classic Teams
+    /// does not silently swallow new Teams helpers, or vice versa).
+    ///
+    /// Back-compat: a config that persisted the pre-Zoom default (Settings
+    /// writes every key) decodes to the NEW default — that exact list meant
+    /// "defaults", not a choice. Any other list is user-authored and kept —
+    /// so to watch Teams only, drop the dead classic entry too and write
+    /// `["com.microsoft.teams2"]` (the exact old pair would fold back).
+    var triggerBundleIds: [String] = [
+        "com.microsoft.teams", "com.microsoft.teams2", "us.zoom.xos",
+    ]
 
-    /// Opt-in, experimental: also detect Teams meetings held in a browser tab
-    /// (teams.microsoft.com in Safari/Chrome/Edge/Arc). A browser's mic use
-    /// only counts as a call signal while one of its windows shows a Teams
-    /// meeting tab (AX title probe), so ordinary web-mic use never triggers a
-    /// recording. Off by default: browser attribution is inherently weaker
-    /// than the desktop app's per-PID signal — install the desktop client
-    /// for anything you rely on.
-    var detectBrowserTeams: Bool = false
+    /// Opt-in, experimental: also detect meetings held in a browser tab —
+    /// teams.microsoft.com and meet.google.com in Safari/Chrome/Edge/Arc
+    /// (Meet has no desktop app, so this is the only way to cover it). A
+    /// browser's mic use only counts as a call signal while one of its
+    /// windows shows a meeting tab (AX title probe), so ordinary web-mic use
+    /// never triggers a recording. Off by default: browser attribution is
+    /// inherently weaker than a desktop app's per-PID signal.
+    ///
+    /// Replaces the retired `detectBrowserTeams` key, which is still read
+    /// (see `LegacyKeys`) but never written.
+    var detectBrowserMeetings: Bool = false
 
-    /// Browsers the tab probe may inspect when `detectBrowserTeams` is on.
+    /// Browsers the tab probe may inspect when `detectBrowserMeetings` is on.
     var browserBundleIds: [String] = [
         "com.apple.safari", "com.google.chrome",
         "com.microsoft.edgemac", "company.thebrowser.browser",
@@ -79,8 +90,11 @@ struct Config: Codable {
 
     /// Initial prompt biasing whisper toward clean, punctuated business
     /// speech (also nudges it away from silence hallucinations). Empty = none.
+    /// (The old Teams-specific default decodes to this one — see
+    /// `init(from:)` — so pre-Zoom configs don't keep biasing every call
+    /// toward "Microsoft Teams" phrases.)
     var initialPrompt: String =
-        "The following is a professional Microsoft Teams business call with clear punctuation and capitalization."
+        "The following is a professional business call with clear punctuation and capitalization."
 
     /// Optional ggml Silero VAD model path. When set and present, whisper runs
     /// with Voice Activity Detection — the single biggest reducer of
@@ -180,7 +194,7 @@ struct Config: Codable {
 
     enum CodingKeys: String, CodingKey {
         case notesFolder, keepAudio, saveTranscript, triggerBundlePrefixes
-        case triggerBundleIds, detectBrowserTeams, browserBundleIds
+        case triggerBundleIds, detectBrowserMeetings, browserBundleIds
         case endGraceSeconds, minCallSeconds
         case whisperBinary, whisperServerBinary, whisperModel, language
         case initialPrompt, vadModel
@@ -190,6 +204,19 @@ struct Config: Codable {
         case workDir
         case autoCheckUpdates, lastUpdateCheck, updateFeedOverride
     }
+
+    /// Retired keys: read on decode, never written (they're not in
+    /// `CodingKeys`, and encoding is synthesized from `CodingKeys`).
+    private enum LegacyKeys: String, CodingKey {
+        case detectBrowserTeams   // pre-Meet name of `detectBrowserMeetings`
+    }
+
+    /// The pre-Zoom defaults, pinned verbatim so `init(from:)` can recognize
+    /// "this config just persisted the old defaults" and upgrade them.
+    private static let preZoomTriggerBundleIds: Set<String> =
+        ["com.microsoft.teams", "com.microsoft.teams2"]
+    private static let preZoomInitialPrompt =
+        "The following is a professional Microsoft Teams business call with clear punctuation and capitalization."
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -203,8 +230,20 @@ struct Config: Codable {
         keepAudio = g(.keepAudio, d.keepAudio)
         saveTranscript = g(.saveTranscript, d.saveTranscript)
         triggerBundlePrefixes = g(.triggerBundlePrefixes, d.triggerBundlePrefixes)
-        triggerBundleIds = g(.triggerBundleIds, d.triggerBundleIds)
-        detectBrowserTeams = g(.detectBrowserTeams, d.detectBrowserTeams)
+        // Fold: Settings writes every key, so pre-Zoom configs persisted the
+        // then-default Teams-only list even though the user never chose it.
+        // That exact list upgrades to the new default (which adds Zoom); any
+        // other list is a deliberate edit and is kept verbatim.
+        let ids = g(.triggerBundleIds, d.triggerBundleIds)
+        triggerBundleIds = Set(ids.map { $0.lowercased() }) == Config.preZoomTriggerBundleIds
+            ? d.triggerBundleIds : ids
+        // Fold: the retired `detectBrowserTeams` key still turns the (now
+        // site-generic) browser probe on; an explicit new key wins over it.
+        let legacy = try? decoder.container(keyedBy: LegacyKeys.self)
+        let legacyBrowser = (try? legacy?.decodeIfPresent(
+            Bool.self, forKey: .detectBrowserTeams)) ?? nil
+        detectBrowserMeetings = g(.detectBrowserMeetings,
+                                  legacyBrowser ?? d.detectBrowserMeetings)
         browserBundleIds = g(.browserBundleIds, d.browserBundleIds)
         endGraceSeconds = g(.endGraceSeconds, d.endGraceSeconds)
         minCallSeconds = g(.minCallSeconds, d.minCallSeconds)
@@ -212,7 +251,11 @@ struct Config: Codable {
         whisperServerBinary = g(.whisperServerBinary, d.whisperServerBinary)
         whisperModel = g(.whisperModel, d.whisperModel)
         language = g(.language, d.language)
-        initialPrompt = g(.initialPrompt, d.initialPrompt)
+        // Fold: the old Teams-specific default prompt upgrades to the
+        // app-neutral one; anything else is a user edit and is kept.
+        let prompt = g(.initialPrompt, d.initialPrompt)
+        initialPrompt = prompt == Config.preZoomInitialPrompt
+            ? d.initialPrompt : prompt
         vadModel = g(.vadModel, d.vadModel)
         cleanTranscript = g(.cleanTranscript, d.cleanTranscript)
         transcriptionQuality = g(.transcriptionQuality, d.transcriptionQuality)

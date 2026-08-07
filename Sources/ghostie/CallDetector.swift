@@ -44,6 +44,11 @@ final class CallDetector {
     func start() { coordinator.start() }
     func stop()  { coordinator.stop() }
 
+    /// Which app the current call belongs to (Teams / Zoom / Meet), frozen
+    /// when the call confirmed. Engine reads it in its onCallStart handler
+    /// and threads it into the note's name; nil for a custom trigger app.
+    func currentCallSource() -> CallSource? { coordinator.currentCallSource() }
+
     /// System default input device id (used by `cmdDoctor`).
     static func defaultInputDevice() -> AudioDeviceID? {
         CoreAudioActivityProvider.defaultInputDevice()

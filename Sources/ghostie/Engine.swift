@@ -9,7 +9,7 @@ enum EngineState: Equatable {
     var menuLabel: String {
         switch self {
         case .paused:     return "Paused"
-        case .watching:   return "Watching for Teams calls"
+        case .watching:   return "Watching for calls"
         case .recording:  return "Recording call…"
         case .processing: return "Summarizing call…"
         }
@@ -45,6 +45,10 @@ final class Engine: @unchecked Sendable {
     /// can't cut a fixed-length test short. Gate-only.
     private var testRecorder: AudioRecorder?
     private var recordingStartedAt = Date()   // gate-only
+    /// Which app the live call belongs to (Teams / Zoom / Meet), captured
+    /// from the detector when the call confirmed; nil for a custom trigger
+    /// app (the pipeline then labels the note generically). Gate-only.
+    private var callSource: CallSource?
     /// Recordings currently on (or queued for) the `work` pipeline. Gate-only;
     /// lets `settleStateLocked()` / `swapIsSafe()` see pipeline work even when
     /// a new call has started while the previous one is still summarizing.
@@ -161,7 +165,7 @@ final class Engine: @unchecked Sendable {
         listening = true
         detector.start()
         gate.async { self.settleStateLocked() }
-        Log.ok("Listening for Teams calls (no bot joins your meetings).")
+        Log.ok("Listening for calls — Teams and Zoom (no bot joins your meetings).")
         drainBacklog()   // catch up on anything queued while we were away
         let t = DispatchSource.makeTimerSource(queue: gate)
         t.schedule(deadline: .now() + 600, repeating: 600)   // retry every 10 min
@@ -218,11 +222,14 @@ final class Engine: @unchecked Sendable {
     /// the menu timer matches the audio). Falls back to a fresh start when
     /// no tentative capture exists — e.g. its start() failed.
     private func handleStart() {
-        startRecorderLocked(tentative: false)
+        startRecorderLocked(tentative: false, source: detector.currentCallSource())
     }
 
-    private func startRecorderLocked(tentative: Bool) {
+    private func startRecorderLocked(tentative: Bool, source: CallSource? = nil) {
         gate.async {
+            // A duplicate confirm carries the same call's source, so setting
+            // it unconditionally (before any early return) is safe.
+            if !tentative { self.callSource = source }
             if self.recorder != nil {
                 // Confirm adopting the live tentative capture; duplicate
                 // starts are otherwise ignored (same as before).
@@ -308,9 +315,10 @@ final class Engine: @unchecked Sendable {
                 // (otherwise swapIsSafe() has a microsecond window of "idle").
                 self.gate.async {
                     self.processingCount += 1
+                    let source = self.callSource?.rawValue ?? "Call"
                     self.settleStateLocked()
                     self.work.async {
-                        let note = Pipeline(config: Config.load()).process(result, startedAt: started)
+                        let note = Pipeline(config: Config.load()).process(result, startedAt: started, source: source)
                         if let note {
                             self.lastNote = note
                             self.callsProcessed += 1
@@ -369,7 +377,7 @@ final class Engine: @unchecked Sendable {
                     self.processingCount += 1
                     self.settleStateLocked()
                     self.work.async {
-                        let note = Pipeline(config: Config.load()).process(result, startedAt: started)
+                        let note = Pipeline(config: Config.load()).process(result, startedAt: started, source: "Test")
                         if let note { self.lastNote = note; self.onNote?(note) }
                         self.gate.async {
                             self.processingCount -= 1
@@ -407,8 +415,9 @@ final class Engine: @unchecked Sendable {
                     return
                 }
                 if let r = await rec.stop(), r.duration >= self.config.minCallSeconds {
+                    let source = self.gate.sync { self.callSource?.rawValue ?? "Call" }
                     self.work.async {
-                        _ = Pipeline(config: Config.load()).process(r, startedAt: started)
+                        _ = Pipeline(config: Config.load()).process(r, startedAt: started, source: source)
                         then()
                     }
                 } else { then() }

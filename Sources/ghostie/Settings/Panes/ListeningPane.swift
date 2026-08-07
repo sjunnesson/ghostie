@@ -55,7 +55,7 @@ final class ListeningPane: NSView {
         ])
 
         let header = PageHeaderView(title: "Listening",
-                                    subtitle: "When Ghostie watches for Teams calls and how it confirms one is real.")
+                                    subtitle: "When Ghostie watches for meeting calls and how it confirms one is real.")
         paneStack.addArrangedSubview(header)
         header.widthAnchor.constraint(equalTo: paneStack.widthAnchor).isActive = true
 
@@ -81,7 +81,7 @@ final class ListeningPane: NSView {
         let detection = GroupCard(title: "Detection")
         detection.addRow(buildStepperRow(
             label: "End-call grace",
-            sub: "How long Teams must stay quiet before Ghostie decides the call has ended.",
+            sub: "How long the meeting app must stay quiet before Ghostie decides the call has ended.",
             initial: Int(cfg.endGraceSeconds),
             range: 5...600,
             suffix: "s") { [weak self] v in
@@ -155,7 +155,7 @@ final class ListeningPane: NSView {
             let card = GroupCard(title: "System Access")
             card.addRow(RowBuilder.row(
                 label: "Microphone",
-                sub: "Lets Ghostie capture your voice during a Teams call.",
+                sub: "Lets Ghostie capture your voice during a call.",
                 leadingSymbol: "mic.fill", leadingTint: Theme.danger,
                 control: StatusBadgeView(kind: .ok, label: "Granted")))
             card.addRow(RowBuilder.row(
@@ -166,7 +166,7 @@ final class ListeningPane: NSView {
             card.addRow(RowBuilder.row(
                 label: "Accessibility",
                 sub: p.ax
-                    ? "Helps Ghostie tell a real Teams meeting apart from the app just being open. Optional."
+                    ? "Helps Ghostie tell a real meeting apart from the app just being open. Optional."
                     : "Optional — helps Ghostie spot a real meeting window. Calls still get recorded without it.",
                 leadingSymbol: "figure.stand", leadingTint: NSColor.systemGray,
                 control: StatusBadgeView(kind: p.ax ? .ok : .muted,
@@ -192,8 +192,14 @@ final class ListeningPane: NSView {
         let extras = cfg.triggerBundleIds.count > 1
             ? " +\(cfg.triggerBundleIds.count - 1)"
             : ""
+        card.addRow(buildToggleRow(
+            label: "Meetings in the browser",
+            sub: "Also watch Safari/Chrome tabs for Teams and Google Meet meetings. Experimental — the desktop apps give a stronger signal.",
+            on: cfg.detectBrowserMeetings) { [weak self] v in
+                self?.changes { c in c.detectBrowserMeetings = v }
+            })
         card.addRow(RowBuilder.row(
-            label: "Apps that count as Teams",
+            label: "Meeting apps to watch",
             sub: "Ghostie only treats microphone activity as a call when one of these apps is running.",
             control: NSTextField(labelWithString: primary + extras)
                 .styledAsMono()), last: true)
@@ -368,7 +374,7 @@ private final class LiveStatusRow: NSView {
             let secs = Int(Date().timeIntervalSince(since))
             timeMono.stringValue = String(format: "%02d:%02d", secs / 60, secs % 60)
             timeMono.isHidden = false
-            detail.stringValue = "A Teams call is in progress."
+            detail.stringValue = "A call is being recorded."
             button.title = "Pause listening"
             button.kind = .ghost
         case .watching:
@@ -380,7 +386,7 @@ private final class LiveStatusRow: NSView {
             title.stringValue = "Watching for calls"
             timeMono.stringValue = ""
             timeMono.isHidden = true
-            detail.stringValue = "Idle. Ghostie will wake up the next time Teams starts using the mic."
+            detail.stringValue = "Idle. Ghostie will wake up the next time a meeting app starts using the mic."
             button.title = "Pause listening"
             button.kind = .ghost
         case .processing:

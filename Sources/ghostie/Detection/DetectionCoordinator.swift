@@ -42,11 +42,21 @@ final class DetectionCoordinator {
     /// participate in audio attribution) without accidentally cross-matching
     /// (`com.microsoft.teams` does not absorb `com.microsoft.teams2`).
     private let triggerBundleMatchers: [String]
-    /// Lowercased browser bundle IDs eligible for the Teams-tab probe.
-    /// Empty when `detectBrowserTeams` is off — every browser branch in
+    /// Lowercased browser bundle IDs eligible for the meeting-tab probe.
+    /// Empty when `detectBrowserMeetings` is off — every browser branch in
     /// `buildEvidenceLocked` then short-circuits.
     private let browserMatchers: [String]
     private let tabs: BrowserTabProvider
+    /// Source derived from the most recent evidence build (queue-only), and
+    /// its value frozen at the moment the state machine last confirmed a
+    /// call. `currentCallSource()` serves the frozen one so Engine can label
+    /// the recording even if evidence shifts mid-call. The frozen copy is
+    /// guarded by `sourceLock`, NOT the queue: Engine reads it synchronously
+    /// from inside the onCallStart callback, which itself runs on `queue` —
+    /// a `queue.sync` accessor would deadlock there.
+    private var lastSource: CallSource?
+    private let sourceLock = NSLock()
+    private var sourceAtCallStart: CallSource?   // sourceLock-guarded
 
     var onCallStart: ((UUID) -> Void)?
     var onCallStop: ((UUID) -> Void)?
@@ -74,10 +84,10 @@ final class DetectionCoordinator {
          tabs: BrowserTabProvider = AXBrowserTabProvider(),
          clock: Clock = SystemClock()) {
         let mainIds = config.triggerBundleIds.map { $0.lowercased() }
-        // Browser-Teams is opt-in: with it off the browser matcher list is
-        // empty and browsers never get CoreAudio listeners, presence
-        // tracking, or AX tab probes.
-        let browserIds = config.detectBrowserTeams
+        // Browser meetings (Teams / Google Meet tabs) are opt-in: with the
+        // flag off the browser matcher list is empty and browsers never get
+        // CoreAudio listeners, presence tracking, or AX tab probes.
+        let browserIds = config.detectBrowserMeetings
             ? config.browserBundleIds.map { $0.lowercased() } : []
         self.config = config
         self.audio = audio ?? CoreAudioActivityProvider(matchers: mainIds + browserIds)
@@ -100,7 +110,11 @@ final class DetectionCoordinator {
 
         stateMachine.onCallStart = { [weak self] sid in
             guard let self else { return }
-            Log.ok("Call detected (session \(sid.uuidString.prefix(8))) — starting capture.")
+            // Fires on `queue` from inside evaluate(), so `lastSource` is
+            // the source of the exact evidence that promoted this call.
+            self.sourceLock.withLock { self.sourceAtCallStart = self.lastSource }
+            let app = self.lastSource?.rawValue ?? "meeting app"
+            Log.ok("Call detected (\(app), session \(sid.uuidString.prefix(8))) — starting capture.")
             self.onCallStart?(sid)
         }
         stateMachine.onCallStop = { [weak self] sid in
@@ -234,12 +248,12 @@ final class DetectionCoordinator {
             return p.isRunningInput
                 && Self.matchesTriggerBundle(b, matchers: triggerBundleMatchers)
         }
-        // Browser-Teams (opt-in): the tab probe runs under the same cost
+        // Browser meetings (opt-in): the tab probe runs under the same cost
         // gate as the meeting-window walk — only when a browser is actually
         // using the mic (or a session is already past idle) do we pay the
         // AX title read. A browser PID is then eligible as primary only
-        // while one of its windows shows a Teams meeting tab.
-        var browserTabPids: [pid_t] = []
+        // while one of its windows shows a Teams or Google Meet meeting tab.
+        var browserTabHits: [pid_t: CallSource] = [:]
         if !browserMatchers.isEmpty {
             let browserApps = allApps.filter {
                 browserMatchers.contains($0.bundleId.lowercased())
@@ -251,10 +265,14 @@ final class DetectionCoordinator {
             }
             if !browserApps.isEmpty,
                browserMicInUse || stateMachine.stage != .idle {
-                browserTabPids = tabs.pidsWithMeetingTab(browsers: browserApps)
+                browserTabHits = tabs.meetingTabs(browsers: browserApps)
             }
         }
+        let browserTabPids: [pid_t] = browserTabHits.keys.sorted()
         let primaryAudio = primaryNativeAudio || !browserTabPids.isEmpty
+        lastSource = Self.deriveSource(audio: audioProcs,
+                                       matchers: triggerBundleMatchers,
+                                       tabHits: browserTabHits)
         let meetingWindow: MeetingWindowMatch =
             (stateMachine.stage == .idle && !primaryAudio)
             ? .unavailable(reason: "not queried (idle, no primary signal)")
@@ -310,6 +328,39 @@ final class DetectionCoordinator {
         }
         if sawIntrospectable { return .notMatched }
         return .unavailable(reason: lastUnavailableReason ?? "no introspectable trigger app")
+    }
+
+    /// Which app the current (or most recent) call belongs to, frozen at the
+    /// moment the state machine confirmed it. Engine reads this from its
+    /// onCallStart handler to label the recording; between calls the value is
+    /// stale and unread. nil when the trigger was a custom (non-Teams,
+    /// non-Zoom) bundle id the user added — callers fall back to a generic
+    /// label. Lock-guarded (not queue-hopped) so it is safe to call from
+    /// inside the coordinator's own callbacks, which run on `queue`.
+    func currentCallSource() -> CallSource? {
+        sourceLock.withLock { sourceAtCallStart }
+    }
+
+    /// Which app the evidence points at: the trigger app actually holding the
+    /// mic wins (input outranks output-only, then lowest PID for
+    /// determinism), else the lowest-PID browser meeting tab's site. Static +
+    /// pure for the selftest.
+    static func deriveSource(audio: [AudioProcessInfo],
+                             matchers: [String],
+                             tabHits: [pid_t: CallSource]) -> CallSource? {
+        let native = audio
+            .filter { p in
+                guard let b = p.bundleId else { return false }
+                return matchesTriggerBundle(b, matchers: matchers)
+            }
+            .sorted { a, b in
+                if a.isRunningInput != b.isRunningInput { return a.isRunningInput }
+                return a.pid < b.pid
+            }
+        for p in native {
+            if let b = p.bundleId, let s = CallSource(bundleId: b) { return s }
+        }
+        return tabHits.min { $0.key < $1.key }?.value
     }
 
     // Note: deliberately no public `stage` / `sessionId` / `transitions`
@@ -384,7 +435,7 @@ final class DetectionCoordinator {
             guard let b = p.bundleId?.lowercased() else { return false }
             if matchesTriggerBundle(b, matchers: matchers) { return true }
             // A browser process only counts while its app currently shows a
-            // Teams meeting tab — plain web-mic use never qualifies.
+            // meeting tab — plain web-mic use never qualifies.
             return matchesTriggerBundle(b, matchers: browserMatchers)
                 && browserTabPids.contains(p.pid)
         }

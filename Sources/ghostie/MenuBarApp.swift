@@ -494,9 +494,9 @@ final class MenuBarApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let alert = NSAlert()
         alert.messageText = "Welcome to Ghostie"
         alert.informativeText = """
-        Ghostie sits in your menu bar and listens for Microsoft Teams calls — \
-        no bot ever joins the meeting. Calls are recorded and transcribed \
-        entirely on this Mac, then summarized into a markdown note.
+        Ghostie sits in your menu bar and listens for Microsoft Teams and \
+        Zoom calls — no bot ever joins the meeting. Calls are recorded and \
+        transcribed entirely on this Mac, then summarized into a markdown note.
 
         Two one-time things to know:
 

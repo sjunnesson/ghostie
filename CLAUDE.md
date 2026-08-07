@@ -5,10 +5,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this is
 
 Ghostie is a single macOS executable (SwiftPM, Swift tools 6.0, **macOS 15+**) that
-detects Microsoft Teams calls locally, records them with ScreenCaptureKit,
-transcribes with whisper.cpp, and summarizes via the Claude Code CLI. No bot
-joins the meeting and no Graph API is used — detection is purely local. All
-source is in `Sources/ghostie/`.
+detects Microsoft Teams and Zoom desktop calls locally (plus, opt-in, Teams
+and Google Meet meetings in a browser tab), records them with
+ScreenCaptureKit, transcribes with whisper.cpp, and summarizes via the Claude
+Code CLI. No bot joins the meeting and no Graph API is used — detection is
+purely local. All source is in `Sources/ghostie/`.
 
 ## Commands
 
@@ -58,18 +59,29 @@ the same code drives the menu-bar app and the headless daemon.
   preserve that model when editing — don't introduce actor isolation.
 - **`CallDetector.swift`** — the "no bot" mechanism, now a thin shim over
   `Detection/` (DetectionCoordinator + CallStateMachine + providers): per-PID
-  CoreAudio input/output attribution on Teams bundle IDs, corroborated by
-  AX meeting-window / camera signals. idle → candidate (tentative capture
-  starts, so the confirm window's audio is kept) → confirmed (3 s;
-  `onCallStart`) → ending → idle (30 s grace; `onCallStop`). A demoted
-  candidate fires `onTentativeDiscard` and its capture is thrown away.
+  CoreAudio input/output attribution on the `triggerBundleIds` (Teams + Zoom
+  desktop by default), corroborated by AX meeting-window / camera signals
+  (per-app heuristics via `MeetingWindowHeuristics.forBundleId`). With
+  `detectBrowserMeetings` on, a browser's mic use also counts — but ONLY
+  while a window title matches a Teams or Google Meet meeting tab
+  (`AXBrowserTabProvider.meetingSite(forTitle:)`). idle → candidate
+  (tentative capture starts, so the confirm window's audio is kept) →
+  confirmed (3 s; `onCallStart`) → ending → idle (30 s grace; `onCallStop`).
+  A demoted candidate fires `onTentativeDiscard` and its capture is thrown
+  away. At confirm the coordinator freezes a `CallSource` (Teams / Zoom /
+  Meet, from the evidence's bundle ids / tab site); Engine reads it via
+  `currentCallSource()` and threads it to the pipeline for note naming.
 - **`AudioRecorder.swift`** — ScreenCaptureKit with two taps:
   `.audio` (system → everyone else → `participants.wav`) and `.microphone`
   (you → `me.wav`), both 16 kHz mono. Speaker labels are **track-based**, not
   diarization. A 2×2 dropped video stream is required only to keep the stream alive.
 - **`Pipeline.swift`** — transcribe both tracks → clean per track → merge by
-  timestamp → summarize → write `<notesFolder>/<date>_Teams-Call.md` (+ transcript).
-  `Pipeline.drain(config:)` is the backlog retry entry point.
+  timestamp → summarize → write `<notesFolder>/<date>_<Source>-Call.md`
+  (+ transcript), where Source is the detected app ("Teams"/"Zoom"/"Meet",
+  generic "Call" when unknown). The name must stay a pure function of
+  `startedAt` + the source stored in backlog meta.json — retries re-derive it
+  to upgrade the queued note in place (pre-source entries default to
+  "Teams"). `Pipeline.drain(config:)` is the backlog retry entry point.
 - **`Transcriber.swift`** — wraps the whisper.cpp CLI with hardened,
   hallucination-resistant decoding flags (set explicitly so a future
   whisper-cli default change can't silently regress quality). Parses
@@ -167,9 +179,14 @@ the same code drives the menu-bar app and the headless daemon.
   `init(from:)` using `decodeIfPresent ?? default`; **add new config keys to
   both the property list and that init**. Retired keys are read but never
   written: `CodeSwitchConfig.LegacyKeys` (`promptSv`/`promptEn`, `prompts`,
-  `modelPerLanguage`) folds them into `languages` records on decode, and
-  `LanguageSetting` decodes from a bare string so a pre-v3 `["sv","en"]`
-  migrates by being decoded. Every legacy shape has a `selftest` case — keep it
+  `modelPerLanguage`) folds them into `languages` records on decode,
+  `Config.LegacyKeys` folds `detectBrowserTeams` into `detectBrowserMeetings`,
+  and `LanguageSetting` decodes from a bare string so a pre-v3 `["sv","en"]`
+  migrates by being decoded. Two value-level folds too (Settings writes every
+  key, so "persisted the old default" ≠ "user chose it"): a `triggerBundleIds`
+  equal to the pre-Zoom Teams-only default upgrades to the new default (adds
+  `us.zoom.xos`), and the old Teams-specific `initialPrompt` default upgrades
+  to the app-neutral one. Every legacy shape has a `selftest` case — keep it
   that way, because a decoder slip here is a silent whole-config reset.
 - **whisper-cli quirks (codeswitch)**: `--detect-language`/`-dl` ignores
   `--offset-t`/`--duration` (detects from file start) → segments are physically

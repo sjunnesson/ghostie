@@ -548,12 +548,27 @@ func runDetectorStateMachineSelfTest() -> Bool {
             func bump(_ k: String) { lock.withLock { counts[k, default: 0] += 1 } }
             func get(_ k: String) -> Int { lock.withLock { counts[k] ?? 0 } }
         }
+        final class SourceBox: @unchecked Sendable {
+            private let lock = NSLock()
+            private var _v: CallSource?
+            var value: CallSource? {
+                get { lock.withLock { _v } }
+                set { lock.withLock { _v = newValue } }
+            }
+        }
         let world = FakeDetectionWorld()
         let coord = world.makeCoordinator()
         let c = Counters()
+        let sourceAtStart = SourceBox()
         coord.onTentativeStart = { _ in c.bump("tent") }
         coord.onTentativeDiscard = { _ in c.bump("discard") }
-        coord.onCallStart = { _ in c.bump("start") }
+        coord.onCallStart = { _ in
+            c.bump("start")
+            // Read the source from INSIDE the callback, which runs on the
+            // detector queue — exactly what Engine.handleStart does. A
+            // queue-hopping accessor would deadlock (hang) right here.
+            sourceAtStart.value = coord.currentCallSource()
+        }
         coord.onCallStop = { _ in c.bump("stop") }
 
         func teamsAudio(input: Bool, output: Bool) -> [AudioProcessInfo] {
@@ -579,6 +594,12 @@ func runDetectorStateMachineSelfTest() -> Bool {
         check("coordinator: confirmable 3.5 s promotes (onCallStart)",
               coord.snapshot().stage == .confirmed && c.get("start") == 1,
               "stage=\(coord.snapshot().stage) start=\(c.get("start"))")
+        check("coordinator: call source captured at confirm is Teams",
+              coord.currentCallSource() == .teams,
+              "source=\(String(describing: coord.currentCallSource()))")
+        check("coordinator: source readable from inside onCallStart (no deadlock)",
+              sourceAtStart.value == .teams,
+              "source=\(String(describing: sourceAtStart.value))")
 
         // Device swap quiescence: the coordinator stamps lastDeviceSwapAt
         // from the VirtualClock, so an input loss right after the swap
@@ -620,18 +641,29 @@ func runDetectorStateMachineSelfTest() -> Bool {
         coord.stop()
     }
 
-    // 17d. Browser-Teams detection (opt-in). A browser's mic use counts as
-    //      primary ONLY while its window shows a Teams meeting tab; with the
-    //      flag off, browsers are invisible to the detector entirely.
+    // 17d. Browser meeting detection (opt-in). A browser's mic use counts as
+    //      primary ONLY while its window shows a Teams or Google Meet meeting
+    //      tab; with the flag off, browsers are invisible to the detector
+    //      entirely.
     do {
-        check("browser tab title: meeting tab matches",
-              AXBrowserTabProvider.titleLooksLikeMeetingTab("Meeting in Weekly Sync | Microsoft Teams — Google Chrome"))
-        check("browser tab title: call tab matches",
-              AXBrowserTabProvider.titleLooksLikeMeetingTab("Call with David | Microsoft Teams"))
-        check("browser tab title: background chat tab does not match",
-              !AXBrowserTabProvider.titleLooksLikeMeetingTab("Chat | Microsoft Teams — Google Chrome"))
+        check("browser tab title: Teams meeting tab matches",
+              AXBrowserTabProvider.meetingSite(forTitle: "Meeting in Weekly Sync | Microsoft Teams — Google Chrome") == .teams)
+        check("browser tab title: Teams call tab matches",
+              AXBrowserTabProvider.meetingSite(forTitle: "Call with David | Microsoft Teams") == .teams)
+        check("browser tab title: background Teams chat tab does not match",
+              AXBrowserTabProvider.meetingSite(forTitle: "Chat | Microsoft Teams — Google Chrome") == nil)
         check("browser tab title: unrelated meeting page does not match",
-              !AXBrowserTabProvider.titleLooksLikeMeetingTab("Meeting notes - Google Docs"))
+              AXBrowserTabProvider.meetingSite(forTitle: "Meeting notes - Google Docs") == nil)
+        check("browser tab title: Meet in-meeting tab matches (en dash)",
+              AXBrowserTabProvider.meetingSite(forTitle: "Meet – abc-defg-hij") == .meet)
+        check("browser tab title: Meet tab with browser tail matches",
+              AXBrowserTabProvider.meetingSite(forTitle: "Meet – abc-defg-hij - Google Chrome") == .meet)
+        check("browser tab title: Meet hyphen variant matches",
+              AXBrowserTabProvider.meetingSite(forTitle: "Meet - abc-defg-hij") == .meet)
+        check("browser tab title: Meet landing page does not match",
+              AXBrowserTabProvider.meetingSite(forTitle: "Google Meet") == nil)
+        check("browser tab title: prose containing 'meet' does not match",
+              AXBrowserTabProvider.meetingSite(forTitle: "Places to meet – City Guide") == nil)
 
         // buildEvidence: a browser proc with input only counts when its pid
         // is in browserTabPids.
@@ -665,7 +697,7 @@ func runDetectorStateMachineSelfTest() -> Bool {
         }
         let world = FakeDetectionWorld()
         var cfg = Config()
-        cfg.detectBrowserTeams = true
+        cfg.detectBrowserMeetings = true
         let coord = world.makeCoordinator(config: cfg)
         let c = Counters()
         coord.onCallStart = { _ in c.bump("start") }
@@ -680,15 +712,18 @@ func runDetectorStateMachineSelfTest() -> Bool {
         check("browser coordinator: mic use with NO meeting tab stays idle",
               coord.snapshot().stage == .idle, "stage=\(coord.snapshot().stage)")
 
-        world.tabs.pids = [300]
+        world.tabs.hits = [300: .meet]
         settle()
         world.clock.advance(by: 3.5)
         settle()
         check("browser coordinator: meeting tab + mic + output confirms",
               coord.snapshot().stage == .confirmed && c.get("start") == 1,
               "stage=\(coord.snapshot().stage) start=\(c.get("start"))")
+        check("browser coordinator: call source is the matched tab's site",
+              coord.currentCallSource() == .meet,
+              "source=\(String(describing: coord.currentCallSource()))")
 
-        world.tabs.pids = []
+        world.tabs.hits = [:]
         settle()
         world.clock.advance(by: 31)
         settle()
@@ -699,11 +734,11 @@ func runDetectorStateMachineSelfTest() -> Bool {
 
         // Flag off: identical world, browser never becomes a candidate.
         let world2 = FakeDetectionWorld()
-        let coord2 = world2.makeCoordinator()   // detectBrowserTeams defaults false
+        let coord2 = world2.makeCoordinator()   // detectBrowserMeetings defaults false
         world2.presence.apps = [RunningAppInfo(pid: 300, bundleId: "com.google.chrome")]
         world2.audio.procs = [AudioProcessInfo(pid: 300, bundleId: "com.google.chrome.helper",
                                                isRunningInput: true, isRunningOutput: true)]
-        world2.tabs.pids = [300]
+        world2.tabs.hits = [300: .meet]
         coord2.start()
         Thread.sleep(forTimeInterval: 0.2)
         world2.audio.notify()
@@ -712,6 +747,72 @@ func runDetectorStateMachineSelfTest() -> Bool {
               coord2.snapshot().stage == .idle,
               "stage=\(coord2.snapshot().stage)")
         coord2.stop()
+    }
+
+    // 17e. Call-source derivation + the detection-config back-compat folds.
+    //      A decoder slip here is a silent whole-config reset (see the
+    //      Codable note in Config.swift), so every legacy shape is pinned.
+    do {
+        check("CallSource: teams bundles (incl. helpers) map to .teams",
+              CallSource(bundleId: "com.microsoft.teams2") == .teams
+              && CallSource(bundleId: "com.microsoft.teams2.helper") == .teams)
+        check("CallSource: zoom bundles map to .zoom",
+              CallSource(bundleId: "us.zoom.xos") == .zoom)
+        check("CallSource: custom trigger bundle maps to nil",
+              CallSource(bundleId: "com.cisco.webexmeetings") == nil)
+
+        let m = ["com.microsoft.teams", "com.microsoft.teams2", "us.zoom.xos"]
+        func proc(_ pid: pid_t, _ bundle: String,
+                  input: Bool, output: Bool) -> AudioProcessInfo {
+            AudioProcessInfo(pid: pid, bundleId: bundle,
+                             isRunningInput: input, isRunningOutput: output)
+        }
+        check("deriveSource: zoom holding the mic → .zoom",
+              DetectionCoordinator.deriveSource(
+                audio: [proc(9, "us.zoom.xos", input: true, output: true)],
+                matchers: m, tabHits: [:]) == .zoom)
+        check("deriveSource: input-holder outranks output-only",
+              DetectionCoordinator.deriveSource(
+                audio: [proc(5, "com.microsoft.teams2", input: false, output: true),
+                        proc(9, "us.zoom.xos", input: true, output: false)],
+                matchers: m, tabHits: [:]) == .zoom)
+        check("deriveSource: no native trigger → browser tab site",
+              DetectionCoordinator.deriveSource(
+                audio: [], matchers: m, tabHits: [300: .meet]) == .meet)
+        check("deriveSource: custom trigger app → nil (generic label)",
+              DetectionCoordinator.deriveSource(
+                audio: [proc(7, "com.cisco.webexmeetings", input: true, output: true)],
+                matchers: ["com.cisco.webexmeetings"], tabHits: [:]) == nil)
+
+        func decodeCfg(_ json: String) -> Config {
+            try! JSONDecoder().decode(Config.self, from: Data(json.utf8))
+        }
+        check("config fold: fresh default watches Zoom",
+              Config().triggerBundleIds.contains("us.zoom.xos"))
+        check("config fold: persisted pre-Zoom default list gains Zoom",
+              decodeCfg(#"{"triggerBundleIds":["com.microsoft.teams","com.microsoft.teams2"]}"#)
+                .triggerBundleIds.contains("us.zoom.xos"))
+        check("config fold: user-trimmed trigger list is kept verbatim",
+              decodeCfg(#"{"triggerBundleIds":["com.microsoft.teams2"]}"#)
+                .triggerBundleIds == ["com.microsoft.teams2"])
+        check("config fold: legacy detectBrowserTeams=true enables detectBrowserMeetings",
+              decodeCfg(#"{"detectBrowserTeams":true}"#).detectBrowserMeetings)
+        check("config fold: explicit new browser key beats legacy key",
+              !decodeCfg(#"{"detectBrowserTeams":true,"detectBrowserMeetings":false}"#)
+                .detectBrowserMeetings)
+        let oldPrompt = "The following is a professional Microsoft Teams business call with clear punctuation and capitalization."
+        check("config fold: old default initialPrompt upgrades to neutral one",
+              decodeCfg(#"{"initialPrompt":"\#(oldPrompt)"}"#).initialPrompt
+                == Config().initialPrompt)
+        check("config fold: custom initialPrompt is kept",
+              decodeCfg(#"{"initialPrompt":"CUSTOM"}"#).initialPrompt == "CUSTOM")
+
+        // Backlog meta written before `source` existed must still decode
+        // (source nil → drains label it "Teams", matching the queued note).
+        let legacyMeta = #"{"startedAt":1720000000,"durationMins":"12.0","stage":"transcribe","attempts":1}"#
+        let meta = try? JSONDecoder().decode(Backlog.Meta.self, from: Data(legacyMeta.utf8))
+        check("backlog meta: pre-source meta.json decodes with source nil",
+              meta != nil && meta?.source == nil)
     }
 
     // 18. diagnose-detect --json emits line-delimited JSON that round-trips

@@ -71,7 +71,7 @@ func cmdTestRecord(_ config: Config, seconds: Double) {
             try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
             guard let result = await rec.stop(discardIfBelowMinCallSeconds: false) else { Log.error("No result."); return }
             Log.ok("Captured \(String(format: "%.1f", result.duration))s. Running pipeline…")
-            Pipeline(config: config).process(result, startedAt: started)
+            Pipeline(config: config).process(result, startedAt: started, source: "Test")
         } catch {
             Log.error("Test failed: \(error.localizedDescription)")
             Log.error("Grant Screen Recording + Microphone in System Settings ▸ Privacy & Security.")
@@ -338,11 +338,12 @@ func cmdDoctor(_ config: Config) {
     }
 
     let matchers = config.triggerBundleIds.map { $0.lowercased() }
-    let teams = NSWorkspace.shared.runningApplications.contains {
+    let meetingApp = NSWorkspace.shared.runningApplications.contains {
         guard let b = $0.bundleIdentifier else { return false }
         return DetectionCoordinator.matchesTriggerBundle(b, matchers: matchers)
     }
-    row(teams, "Microsoft Teams running", teams ? "" : "(only needed during a call)")
+    row(meetingApp, "meeting app running (Teams/Zoom)",
+        meetingApp ? "" : "(only needed during a call)")
     row(CallDetector.defaultInputDevice() != nil, "default input device detected")
     if let free = freeDiskBytes(at: config.workDir) {
         row(free >= lowDiskThresholdBytes, "free disk space",
@@ -463,7 +464,9 @@ func launchSettingsOnly() {
 
 func printHelp() {
     print("""
-    Ghostie — local Teams call transcriber & summarizer (no bot joins).
+    Ghostie — local meeting-call transcriber & summarizer (no bot joins).
+    Detects Microsoft Teams and Zoom desktop calls out of the box; Teams and
+    Google Meet in the browser are opt-in (Settings ▸ Listening).
 
     USAGE: ghostie <command>
 

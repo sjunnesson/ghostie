@@ -51,15 +51,15 @@ protocol AppPresenceProvider: AnyObject {
     func observe(_ handler: @escaping () -> Void) -> DetectionToken
 }
 
-/// Which of the given browser main-app PIDs currently show a Teams meeting
-/// tab (AX window-title probe). Pull-based, queried only when browser
-/// detection is enabled AND there's a reason to look (browser input I/O or
-/// an already-active session) — same cost philosophy as the meeting-window
-/// gate. Returning a PID makes that browser's mic use eligible as a primary
-/// signal; ordinary web-mic use in a tab that isn't a Teams meeting never
-/// qualifies.
+/// Which of the given browser main-app PIDs currently show a meeting tab
+/// (AX window-title probe; Teams or Google Meet), and which site it is.
+/// Pull-based, queried only when browser detection is enabled AND there's a
+/// reason to look (browser input I/O or an already-active session) — same
+/// cost philosophy as the meeting-window gate. Returning a PID makes that
+/// browser's mic use eligible as a primary signal; ordinary web-mic use in a
+/// tab that isn't a meeting never qualifies.
 protocol BrowserTabProvider: AnyObject {
-    func pidsWithMeetingTab(browsers: [RunningAppInfo]) -> [pid_t]
+    func meetingTabs(browsers: [RunningAppInfo]) -> [pid_t: CallSource]
 }
 
 /// AX-based meeting-window probe scoped to a single main-app PID. The

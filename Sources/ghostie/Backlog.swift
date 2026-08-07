@@ -8,7 +8,7 @@ import Foundation
 /// `given-up/`, out of the queue but intact for a manual `ghostie process <dir>`.
 ///
 /// Layout: `~/.ghostie/backlog/<yyyy-MM-dd_HH-mm-ss>/`
-///   meta.json                     — startedAt, duration, stage, attempts
+///   meta.json                     — startedAt, duration, stage, attempts, source
 ///   me.wav / participants.wav     — present when stage == "transcribe"
 ///   transcript.md                 — present when stage == "summarize"
 /// `~/.ghostie/backlog/given-up/<yyyy-MM-dd_HH-mm-ss>/` — same shape; retries
@@ -32,6 +32,11 @@ enum Backlog {
         var durationMins: String
         var stage: String              // "transcribe" | "summarize"
         var attempts: Int
+        /// Which app the call came from ("Teams" / "Zoom" / "Meet" / "Call").
+        /// Optional so pre-source meta.json decodes to nil — drains then fall
+        /// back to "Teams", the label those entries' queued notes were
+        /// written under, so the upgrade-in-place name still matches.
+        var source: String?
     }
 
     struct Entry {
@@ -89,6 +94,7 @@ enum Backlog {
     /// backlog entry is eventually processed and removed.
     static func enqueueAudio(micWav: URL, systemWav: URL,
                              startedAt: Date, durationMins: String,
+                             source: String,
                              copyingOriginals: Bool = false) {
         ensureRoot()
         let dir = URL(fileURLWithPath: root)
@@ -108,13 +114,13 @@ enum Backlog {
         }
         writeMeta(Meta(startedAt: startedAt.timeIntervalSince1970,
                        durationMins: durationMins, stage: "transcribe",
-                       attempts: 0), to: dir)
+                       attempts: 0, source: source), to: dir)
         Log.info("Queued recording to backlog (transcription pending): \(dir.lastPathComponent)")
     }
 
     /// Queue a finished transcript whose summary failed (audio not needed).
     static func enqueueTranscript(startedAt: Date, durationMins: String,
-                                  transcript: String) {
+                                  transcript: String, source: String) {
         ensureRoot()
         let dir = URL(fileURLWithPath: root)
             .appendingPathComponent(stamp.string(from: startedAt))
@@ -123,7 +129,7 @@ enum Backlog {
                               atomically: true, encoding: .utf8)
         writeMeta(Meta(startedAt: startedAt.timeIntervalSince1970,
                        durationMins: durationMins, stage: "summarize",
-                       attempts: 0), to: dir)
+                       attempts: 0, source: source), to: dir)
         Log.info("Queued transcript to backlog (summary pending): \(dir.lastPathComponent)")
     }
 

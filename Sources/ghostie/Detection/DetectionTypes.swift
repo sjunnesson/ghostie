@@ -35,6 +35,27 @@ struct AudioProcessInfo: Equatable {
     let isRunningOutput: Bool
 }
 
+/// Which meeting app a detected call belongs to. Derived from audio
+/// attribution's bundle ids (native apps) or from the site the browser tab
+/// probe matched, captured by `DetectionCoordinator` at the moment a call
+/// confirms, and carried through Engine → Pipeline into the note's name
+/// (`<stamp>_Zoom-Call.md`). `rawValue` is the user-visible label.
+enum CallSource: String, Equatable {
+    case teams = "Teams"
+    case zoom = "Zoom"
+    case meet = "Meet"
+
+    /// nil for bundle ids that are neither Teams nor Zoom (e.g. a custom
+    /// user-added trigger app) — callers then fall back to a generic "Call"
+    /// label rather than guessing.
+    init?(bundleId: String) {
+        let b = bundleId.lowercased()
+        if b.hasPrefix("com.microsoft.teams") { self = .teams }
+        else if b.hasPrefix("us.zoom.") { self = .zoom }
+        else { return nil }
+    }
+}
+
 /// AX meeting-window probe outcome. `.unavailable` is permission denied or
 /// the app cannot be introspected; logged distinctly from `.notMatched`.
 enum MeetingWindowMatch: Equatable {

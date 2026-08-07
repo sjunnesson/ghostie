@@ -51,11 +51,11 @@ struct MeetingWindowHeuristics {
         },
     ])
 
-    /// Zoom desktop (`us.zoom.xos`), for installs that add it to
-    /// `triggerBundleIds`. Same philosophy as the Teams v1 set: only the
-    /// stable, documented in-meeting window titles, no fuzzy matching — a
-    /// miss just removes one corroborator (output I/O still carries the
-    /// signal).
+    /// Zoom desktop (`us.zoom.xos`), watched by default since
+    /// `triggerBundleIds` grew a Zoom entry. Same philosophy as the Teams v1
+    /// set: only the stable, documented in-meeting window titles, no fuzzy
+    /// matching — a miss just removes one corroborator (output I/O still
+    /// carries the signal).
     static let zoomV1: MeetingWindowHeuristics = .init(version: 1, rules: [
         .init(name: "title 'Zoom Meeting'") { a in
             a.title == "Zoom Meeting" || a.title.hasPrefix("Zoom Meeting ")

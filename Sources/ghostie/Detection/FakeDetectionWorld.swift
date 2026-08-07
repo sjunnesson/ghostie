@@ -82,15 +82,15 @@ final class FakeDetectionWorld {
 
     final class Tabs: BrowserTabProvider {
         private let lock = NSLock()
-        private var _pids: [pid_t] = []
-        /// Browser PIDs currently "showing a Teams meeting tab".
-        var pids: [pid_t] {
-            get { lock.withLock { _pids } }
-            set { lock.withLock { _pids = newValue } }
+        private var _hits: [pid_t: CallSource] = [:]
+        /// Browser PIDs currently "showing a meeting tab", by site.
+        var hits: [pid_t: CallSource] {
+            get { lock.withLock { _hits } }
+            set { lock.withLock { _hits = newValue } }
         }
-        func pidsWithMeetingTab(browsers: [RunningAppInfo]) -> [pid_t] {
+        func meetingTabs(browsers: [RunningAppInfo]) -> [pid_t: CallSource] {
             let eligible = Set(browsers.map(\.pid))
-            return pids.filter { eligible.contains($0) }.sorted()
+            return hits.filter { eligible.contains($0.key) }
         }
     }
 

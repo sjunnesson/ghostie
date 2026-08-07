@@ -2,7 +2,8 @@ import Foundation
 
 /// Turns a finished recording into a markdown note:
 /// transcribe both tracks → merge by timestamp with speaker labels →
-/// summarize → write `<notesFolder>/<date>_Teams-Call.md` (+ transcript).
+/// summarize → write `<notesFolder>/<date>_<Source>-Call.md` (+ transcript),
+/// where Source is the app the call was detected in (Teams / Zoom / Meet).
 ///
 /// If transcription or summarization can't run (whisper missing, Claude Code
 /// not logged in, offline, …) the work is queued to the [Backlog] and the
@@ -43,7 +44,8 @@ struct Pipeline {
     // MARK: Live processing
 
     @discardableResult
-    func process(_ rec: AudioRecorder.Result, startedAt: Date) -> URL? {
+    func process(_ rec: AudioRecorder.Result, startedAt: Date,
+                 source: String = "Call") -> URL? {
         let durationMins = String(format: "%.1f", rec.duration / 60.0)
         Log.info("Processing recording (\(durationMins) min) at \(rec.sessionDir.lastPathComponent)…")
 
@@ -54,10 +56,12 @@ struct Pipeline {
             Log.error("Transcription failed: \(error.localizedDescription) — queued to backlog")
             Backlog.enqueueAudio(micWav: rec.micWav, systemWav: rec.systemWav,
                                  startedAt: startedAt, durationMins: durationMins,
+                                 source: source,
                                  copyingOriginals: config.keepAudio)
             let url = writeNote(meta: metaBlock(startedAt, durationMins),
                 summary: "> ⏳ **Queued.** Transcription wasn't available (\(error.localizedDescription)). Ghostie will process this recording automatically once it can run again.",
-                transcript: "_(Pending transcription.)_", startedAt: startedAt)
+                transcript: "_(Pending transcription.)_", startedAt: startedAt,
+                source: source)
             cleanup(rec.sessionDir)
             return url
         }
@@ -68,13 +72,13 @@ struct Pipeline {
         if lines.isEmpty {
             let url = writeNote(meta: meta,
                 summary: "_No speech detected on either track, so there is nothing to summarize._",
-                transcript: transcript, startedAt: startedAt)
+                transcript: transcript, startedAt: startedAt, source: source)
             cleanup(rec.sessionDir)
             return url
         }
 
         let url = finishWithSummary(startedAt: startedAt, durationMins: durationMins,
-                                    meta: meta, transcript: transcript)
+                                    meta: meta, transcript: transcript, source: source)
         cleanup(rec.sessionDir)
         return url
     }
@@ -83,7 +87,8 @@ struct Pipeline {
     /// entry and write the transcript now with a "summary queued" banner.
     @discardableResult
     private func finishWithSummary(startedAt: Date, durationMins: String,
-                                   meta: String, transcript: String) -> URL? {
+                                   meta: String, transcript: String,
+                                   source: String) -> URL? {
         let summarizer = Summarizer(config: config)
         do {
             guard summarizer.isConfigured else {
@@ -93,14 +98,17 @@ struct Pipeline {
             let summary = try summarizer.summarize(transcript: transcript, meta: meta)
             Log.ok("Summary generated.")
             return writeNote(meta: meta, summary: summary,
-                             transcript: transcript, startedAt: startedAt)
+                             transcript: transcript, startedAt: startedAt,
+                             source: source)
         } catch {
             Log.error("Summary unavailable: \(error.localizedDescription) — queued to backlog")
             Backlog.enqueueTranscript(startedAt: startedAt,
-                                      durationMins: durationMins, transcript: transcript)
+                                      durationMins: durationMins, transcript: transcript,
+                                      source: source)
             let banner = "> ⏳ **Summary queued.** Claude Code wasn't available (\(error.localizedDescription)). Ghostie will add the analysis automatically once it can run again — the full transcript below is already complete."
             return writeNote(meta: meta, summary: banner,
-                             transcript: transcript, startedAt: startedAt)
+                             transcript: transcript, startedAt: startedAt,
+                             source: source)
         }
     }
 
@@ -119,9 +127,13 @@ struct Pipeline {
         for entry in entries {
             let startedAt = entry.startedAtDate
             let meta = p.metaBlock(startedAt, entry.meta.durationMins)
+            // Pre-source entries default to "Teams" — the label their queued
+            // note was originally written under, so the note name re-derives
+            // identically and the upgrade lands in place.
+            let source = entry.meta.source ?? "Teams"
 
             if entry.meta.attempts >= maxAttempts {
-                if p.finalizeGivenUp(entry, meta: meta) { completed += 1 }
+                if p.finalizeGivenUp(entry, meta: meta, source: source) { completed += 1 }
                 continue
             }
 
@@ -136,13 +148,14 @@ struct Pipeline {
                 if lines.isEmpty {
                     _ = p.writeNote(meta: meta,
                         summary: "_No speech detected on either track._",
-                        transcript: transcript, startedAt: startedAt)
+                        transcript: transcript, startedAt: startedAt, source: source)
                     Backlog.remove(entry); completed += 1
                     continue
                 }
                 if let summary = p.trySummary(transcript: transcript, meta: meta) {
                     _ = p.writeNote(meta: meta, summary: summary,
-                                    transcript: transcript, startedAt: startedAt)
+                                    transcript: transcript, startedAt: startedAt,
+                                    source: source)
                     Backlog.remove(entry); completed += 1
                 } else {
                     // Transcribed OK but summary still down: keep the
@@ -150,7 +163,7 @@ struct Pipeline {
                     Backlog.convertToSummarize(entry, transcript: transcript)
                     _ = p.writeNote(meta: meta,
                         summary: "> ⏳ **Summary queued.** Transcript is ready; the AI analysis will be added automatically when Claude Code is available.",
-                        transcript: transcript, startedAt: startedAt)
+                        transcript: transcript, startedAt: startedAt, source: source)
                 }
 
             case "summarize":
@@ -158,7 +171,8 @@ struct Pipeline {
                                               encoding: .utf8)) ?? ""
                 if let summary = p.trySummary(transcript: transcript, meta: meta) {
                     _ = p.writeNote(meta: meta, summary: summary,
-                                    transcript: transcript, startedAt: startedAt)
+                                    transcript: transcript, startedAt: startedAt,
+                                    source: source)
                     Backlog.remove(entry); completed += 1
                 } else {
                     Backlog.bump(entry)
@@ -183,7 +197,8 @@ struct Pipeline {
     /// preserved under the backlog's `given-up/` folder and the note tells the
     /// user where it lives and how to retry manually. Returns true when the
     /// entry left the queue (false leaves it queued for the next drain).
-    private func finalizeGivenUp(_ entry: Backlog.Entry, meta: String) -> Bool {
+    private func finalizeGivenUp(_ entry: Backlog.Entry, meta: String,
+                                 source: String) -> Bool {
         // Read before the move below relocates the file.
         let transcript = entry.meta.stage == "summarize"
             ? (try? String(contentsOf: entry.transcriptFile, encoding: .utf8)) : nil
@@ -192,12 +207,12 @@ struct Pipeline {
             _ = writeNote(meta: meta,
                 summary: "> ⚠️ Summary could not be generated after several retries. The full transcript below is complete; run `claude` once to log in and future calls will summarize automatically. (The transcript is also preserved at `\(preserved.path)`.)",
                 transcript: transcript ?? "_(Transcript file could not be read — preserved at `\(preserved.path)`.)_",
-                startedAt: entry.startedAtDate)
+                startedAt: entry.startedAtDate, source: source)
         } else {
             _ = writeNote(meta: meta,
                 summary: "> ⚠️ This recording could not be transcribed after several retries (check `ghostie doctor`). Nothing is lost: the audio is preserved at `\(preserved.path)` — once transcription works again, run `ghostie process \"\(preserved.path)\"` to transcribe it.",
                 transcript: "_(Transcription failed — audio preserved at `\(preserved.path)`.)_",
-                startedAt: entry.startedAtDate)
+                startedAt: entry.startedAtDate, source: source)
         }
         Log.warn("Backlog: gave up on \(entry.dir.lastPathComponent) after \(entry.meta.attempts) attempts — preserved at \(preserved.path).")
         return true
@@ -239,12 +254,16 @@ struct Pipeline {
                 ?? Date()
             let durationMins = String(format: "%.1f", wavSeconds(mic, sys) / 60.0)
             Log.info("Recovered orphaned recording \(dir.lastPathComponent) — queued to backlog.")
+            // The session dir doesn't record which app the call came from, so
+            // recovered recordings get the generic label.
             Backlog.enqueueAudio(micWav: mic, systemWav: sys,
                                  startedAt: startedAt, durationMins: durationMins,
+                                 source: "Call",
                                  copyingOriginals: config.keepAudio)
             _ = p.writeNote(meta: p.metaBlock(startedAt, durationMins),
                 summary: "> ⏳ **Queued.** Ghostie quit before this recording could be processed. It has been queued and will be processed automatically.",
-                transcript: "_(Pending transcription.)_", startedAt: startedAt)
+                transcript: "_(Pending transcription.)_", startedAt: startedAt,
+                source: "Call")
             p.cleanup(dir)
             swept += 1
         }
@@ -334,17 +353,27 @@ struct Pipeline {
         }
     }
 
+    /// `source` is the app label ("Teams" / "Zoom" / "Meet" / "Test", or the
+    /// generic "Call"): it names the file (`<stamp>_Zoom-Call.md`) and titles
+    /// the note. Required (no default) so every caller decides deliberately —
+    /// backlog paths must re-derive the exact label the queued note was
+    /// written under for the in-place upgrade to land.
     @discardableResult
     private func writeNote(meta: String, summary: String,
-                           transcript: String, startedAt: Date) -> URL? {
+                           transcript: String, startedAt: Date,
+                           source: String) -> URL? {
         let folder = URL(fileURLWithPath: config.notesFolder)
         try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
 
-        let base = Self.fileStamp.string(from: startedAt) + "_Teams-Call"
+        // "Zoom" → "Zoom-Call" / "Zoom Call"; the bare generic label stays
+        // "Call" (never "Call-Call").
+        let token = source == "Call" ? "Call" : "\(source)-Call"
+        let title = source == "Call" ? "Call" : "\(source) Call"
+        let base = Self.fileStamp.string(from: startedAt) + "_" + token
         let noteURL = folder.appendingPathComponent(base + ".md")
 
         var doc = """
-        # Teams Call — \(Self.human.string(from: startedAt))
+        # \(title) — \(Self.human.string(from: startedAt))
 
         \(meta)
 
@@ -385,8 +414,9 @@ struct Pipeline {
 
     /// Seconds precision so two calls in the same minute (short call + redial,
     /// a test run next to a real call) can't overwrite each other's notes,
-    /// while staying a pure function of `startedAt` — backlog retries re-derive
-    /// the same name from meta.json and upgrade the queued note in place.
+    /// while the note name stays a pure function of `startedAt` + `source` —
+    /// backlog retries re-derive both from meta.json and upgrade the queued
+    /// note in place.
     private static let fileStamp: DateFormatter = {
         let f = DateFormatter()
         f.dateFormat = "yyyy-MM-dd_HH-mm-ss"
