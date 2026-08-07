@@ -14,6 +14,7 @@ final class MenuBarApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var backlogItem: NSMenuItem!
     private var lastEventItem: NSMenuItem!
     private var toggleItem: NSMenuItem!
+    private var recordItem: NSMenuItem!
     private var lastNoteItem: NSMenuItem!
     private var updateItem: NSMenuItem!
     /// UNUserNotificationCenter grant. When denied, every async signal
@@ -141,6 +142,12 @@ final class MenuBarApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Trimmed menu: only the actions that make sense from the menu bar
         // itself live here. Anything tied to configuration, diagnostics, the
         // backlog, login-at-startup or version info moved into Settings.
+        // Manual override: record without (or despite) call detection —
+        // in-person meetings, calls the detector doesn't cover. Toggles to
+        // "Stop Recording" whenever a capture is live, detected or manual.
+        recordItem = item("Start Recording", #selector(toggleManualRecording), key: "r")
+        menu.addItem(recordItem)
+
         toggleItem = item("Pause Listening", #selector(toggleListening))
         menu.addItem(toggleItem)
 
@@ -169,6 +176,10 @@ final class MenuBarApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Cheap (one directory listing when empty); keeps the indicator
         // honest even if a drain happened outside onBacklogChange.
         updateBacklogItem(pending: Backlog.pendingCount)
+        // A just-clicked "Start Recording" flips this before the capture
+        // stream finishes spinning up (no state change yet) — re-read so a
+        // quick reopen already shows "Stop Recording".
+        recordItem.title = engine.canStopRecording ? "Stop Recording" : "Start Recording"
     }
 
     private func updateBacklogItem(pending: Int) {
@@ -222,10 +233,12 @@ final class MenuBarApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         var title = "● " + state.menuLabel
         if case .recording(let since) = state {
             let secs = Int(Date().timeIntervalSince(since))
-            title = String(format: "● Recording call… %02d:%02d", secs / 60, secs % 60)
+            let what = engine.isManualRecording ? "Recording…" : "Recording call…"
+            title = String(format: "● %@ %02d:%02d", what, secs / 60, secs % 60)
         }
         statusMenuItem.title = title
         toggleItem.title = engine.isListening ? "Pause Listening" : "Resume Listening"
+        recordItem.title = engine.canStopRecording ? "Stop Recording" : "Start Recording"
 
         // Always the ghost; its tint conveys state. The image itself is set
         // once at launch (`menuBarIcon`) and never reassigned.
@@ -286,6 +299,17 @@ final class MenuBarApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func toggleListening() {
         engine.isListening ? engine.stopListening() : engine.startListening()
+        render(engine.state)
+    }
+
+    @objc private func toggleManualRecording() {
+        if engine.canStopRecording {
+            engine.stopManualRecording()
+        } else if engine.startManualRecording() {
+            notify("Ghostie", "Recording — choose “Stop Recording” when you're done.")
+        } else {
+            notify("Ghostie", "A test recording is running — wait for it to finish.")
+        }
         render(engine.state)
     }
 

@@ -36,6 +36,11 @@ final class Engine: @unchecked Sendable {
     /// `EngineState` (the icon stays "watching") and are discarded — never
     /// processed — if the candidate demotes. Gate-only.
     private var isTentative = false
+    /// True while `recorder` is a user-initiated capture (menu "Start
+    /// Recording"). A manual capture is immune to detector-driven stops —
+    /// only the user's "Stop Recording", a fatal stream error, or app quit
+    /// ends it. Gate-only.
+    private var isManual = false
     /// The in-flight `AudioRecorder.start()` for `recorder`. Finalizers await
     /// it before taking the recorder, so a stop can never slip inside the
     /// SCShareableContent/startCapture window and orphan a live SCStream.
@@ -89,6 +94,17 @@ final class Engine: @unchecked Sendable {
 
     var isListening: Bool { listening }
 
+    /// True when the live capture is user-initiated (drives the menu's
+    /// "Recording…" vs "Recording call…" wording).
+    var isManualRecording: Bool { gate.sync { recorder != nil && isManual } }
+
+    /// True when there is a live, non-tentative capture the user can end
+    /// via "Stop Recording" — a confirmed call or a manual capture. The
+    /// fixed-length test capture is excluded (it stops itself), and so is
+    /// an invisible tentative capture (stopping what the UI never showed
+    /// as recording would be baffling; starting manually adopts it instead).
+    var canStopRecording: Bool { gate.sync { recorder != nil && !isTentative } }
+
     // MARK: Gate-only helpers
 
     /// Replaces the old stored-property `didSet`: fires `onStateChange` only
@@ -127,6 +143,7 @@ final class Engine: @unchecked Sendable {
         recorder = nil
         let tentative = isTentative
         isTentative = false
+        isManual = false
         return (rec, recordingStartedAt, tentative)
     }
 
@@ -175,7 +192,7 @@ final class Engine: @unchecked Sendable {
         listening = false
         detector.stop()
         backlogTimer?.cancel(); backlogTimer = nil
-        handleStop()   // finalize an in-progress call (no-op when idle)
+        handleStop()   // finalize an in-progress call (no-op when idle; a manual capture survives pausing)
         gate.async { self.settleStateLocked() }
         Log.info("Listening paused.")
     }
@@ -221,8 +238,32 @@ final class Engine: @unchecked Sendable {
         startRecorderLocked(tentative: false)
     }
 
-    private func startRecorderLocked(tentative: Bool) {
+    /// Menu "Start Recording": user-initiated capture, independent of call
+    /// detection (in-person meetings, calls the detector doesn't cover).
+    /// Works while paused, too. Reuses the normal recorder → pipeline path;
+    /// if a capture is already live (typically the invisible tentative one)
+    /// it is adopted rather than restarted, so no audio is lost. Returns
+    /// false when refused (a fixed-length test owns the capture stream) so
+    /// the menu can say why; the check-then-start is not atomic, but both
+    /// this and runTest are only ever initiated from the main thread, and
+    /// startRecorderLocked re-checks on `gate` as a backstop.
+    @discardableResult
+    func startManualRecording() -> Bool {
+        guard gate.sync(execute: { testRecorder == nil }) else {
+            Log.warn("Recording refused — a test recording is running.")
+            return false
+        }
+        startRecorderLocked(tentative: false, manual: true)
+        return true
+    }
+
+    private func startRecorderLocked(tentative: Bool, manual: Bool = false) {
         gate.async {
+            if manual && self.testRecorder != nil {
+                // A second concurrent SCStream would clobber the test.
+                Log.warn("Recording refused — a test recording is running.")
+                return
+            }
             if self.recorder != nil {
                 // Confirm adopting the live tentative capture; duplicate
                 // starts are otherwise ignored (same as before).
@@ -230,9 +271,19 @@ final class Engine: @unchecked Sendable {
                     self.isTentative = false
                     self.settleStateLocked()   // → .recording
                 }
+                // A manual start over a live capture adopts it: the audio
+                // captured so far is kept, and from here on only the user
+                // (not the detector) can stop it.
+                if manual && !self.isManual {
+                    self.isManual = true
+                    Log.info("Recording is now manual — it runs until you stop it.")
+                    self.settleStateLocked()
+                }
                 return
             }
             self.isTentative = tentative
+            self.isManual = manual
+            if manual { Log.info("Manual recording started.") }
             self.recordingStartedAt = Date()
             if let free = freeDiskBytes(at: self.config.workDir),
                free < lowDiskThresholdBytes {
@@ -243,11 +294,13 @@ final class Engine: @unchecked Sendable {
             // Stream death mid-call (display sleep, permission revoked, SCK
             // error): finalize through the normal stop path so the audio
             // captured so far still becomes a note instead of accumulating
-            // nothing behind a stuck "Recording…". handleStop takes the
-            // recorder through `gate` exactly once, so the detector's own
-            // onCallStop firing later is a harmless no-op. (For a tentative
-            // capture the same path discards instead of processing.)
-            rec.onFatalError = { [weak self] in self?.handleStop() }
+            // nothing behind a stuck "Recording…". `.fatal` (not `.detector`)
+            // so a manual capture is finalized too, not left stuck. The
+            // finalizer takes the recorder through `gate` exactly once, so
+            // the detector's own onCallStop firing later is a harmless
+            // no-op. (For a tentative capture the same path discards
+            // instead of processing.)
+            rec.onFatalError = { [weak self] in self?.finalizeRecorder(.fatal) }
             self.startTask = Task {
                 do {
                     try await rec.start()
@@ -258,6 +311,7 @@ final class Engine: @unchecked Sendable {
                         if self.recorder === rec {
                             self.recorder = nil
                             self.isTentative = false
+                            self.isManual = false
                         }
                     }
                 }
@@ -269,9 +323,25 @@ final class Engine: @unchecked Sendable {
         }
     }
 
-    private func handleStop() {
+    /// Who is asking the live capture to end. `.detector` (onCallStop,
+    /// onTentativeDiscard, stopListening) must not end a manual capture;
+    /// `.user` (menu "Stop Recording") ends anything and always processes
+    /// it — an explicit stop is never a silent discard; `.fatal` (stream
+    /// death) ends anything with the normal discard rules.
+    private enum StopSource { case detector, user, fatal }
+
+    private func handleStop() { finalizeRecorder(.detector) }
+
+    /// Menu "Stop Recording": ends the live capture — manual or detected —
+    /// and sends it through the pipeline, bypassing the short-recording
+    /// discard (same rationale as "Run Test": the user asked, so even a
+    /// brief capture becomes a note instead of vanishing).
+    func stopManualRecording() { finalizeRecorder(.user) }
+
+    private func finalizeRecorder(_ source: StopSource) {
         gate.async {
             guard self.recorder != nil else { return }
+            if source == .detector && self.isManual { return }
             let pendingStart = self.startTask
             Task {
                 // An in-flight start() may still be awaiting SCShareableContent
@@ -282,10 +352,14 @@ final class Engine: @unchecked Sendable {
                 await pendingStart?.value
                 // Exactly-once handoff: a concurrent finalizer (onFatalError,
                 // shutdown, a duplicate onCallStop) loses this race and just
-                // returns.
-                guard let (rec, started, tentative) = (self.gate.sync { self.takeRecorderLocked() })
+                // returns. The manual re-check is atomic with the take — a
+                // "Start Recording" click may have promoted the capture to
+                // manual while a detector stop was awaiting the start.
+                guard let (rec, started, tentative) = (self.gate.sync {
+                    (source == .detector && self.isManual) ? nil : self.takeRecorderLocked()
+                })
                 else { return }
-                if tentative {
+                if tentative && source != .user {
                     // Candidate demoted without confirming: this was never a
                     // call. Discard everything — usually just the in-memory
                     // ring, but a long-lived candidate may have flushed to
@@ -298,8 +372,11 @@ final class Engine: @unchecked Sendable {
                 }
                 // AudioRecorder.stop() returns nil for sub-`minCallSeconds`
                 // calls (the in-memory ring is dropped without ever writing
-                // to disk). No post-hoc disk-discard needed here.
-                guard let result = await rec.stop() else {
+                // to disk). No post-hoc disk-discard needed here. A user
+                // stop bypasses that discard (see stopManualRecording).
+                guard let result = await rec.stop(
+                    discardIfBelowMinCallSeconds: source != .user)
+                else {
                     self.gate.async { self.settleStateLocked() }
                     return
                 }
@@ -347,7 +424,7 @@ final class Engine: @unchecked Sendable {
             return r
         }
         guard let rec else {
-            Log.warn("Test recording refused — a call is being recorded right now.")
+            Log.warn("Test recording refused — a recording is already in progress.")
             completion(nil)
             return
         }
