@@ -59,6 +59,16 @@ struct Config: Codable {
     /// Ignore "calls" shorter than this (avoids ringtones / accidental clicks).
     var minCallSeconds: Double = 20.0
 
+    // MARK: Recording
+
+    /// Capture the mic through Apple's voice-processing I/O (AEC) so speaker
+    /// output — the other participants — is cancelled from the "Me" track.
+    /// Without it the raw ScreenCaptureKit tap re-records everything the
+    /// speakers play, duplicating Participants into Me when no headphones are
+    /// used. Falls back to the raw tap automatically if voice processing
+    /// cannot start; set false to force the raw tap.
+    var micEchoCancellation: Bool = true
+
     // MARK: Transcription (local, private — audio never leaves the machine)
 
     /// Path to the whisper.cpp CLI binary. Auto-detected if empty.
@@ -181,7 +191,7 @@ struct Config: Codable {
     enum CodingKeys: String, CodingKey {
         case notesFolder, keepAudio, saveTranscript, triggerBundlePrefixes
         case triggerBundleIds, detectBrowserTeams, browserBundleIds
-        case endGraceSeconds, minCallSeconds
+        case endGraceSeconds, minCallSeconds, micEchoCancellation
         case whisperBinary, whisperServerBinary, whisperModel, language
         case initialPrompt, vadModel
         case cleanTranscript, transcriptionQuality, codeSwitch
@@ -208,6 +218,7 @@ struct Config: Codable {
         browserBundleIds = g(.browserBundleIds, d.browserBundleIds)
         endGraceSeconds = g(.endGraceSeconds, d.endGraceSeconds)
         minCallSeconds = g(.minCallSeconds, d.minCallSeconds)
+        micEchoCancellation = g(.micEchoCancellation, d.micEchoCancellation)
         whisperBinary = g(.whisperBinary, d.whisperBinary)
         whisperServerBinary = g(.whisperServerBinary, d.whisperServerBinary)
         whisperModel = g(.whisperModel, d.whisperModel)

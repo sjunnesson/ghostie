@@ -98,6 +98,17 @@ final class ListeningPane: NSView {
         paneStack.addArrangedSubview(detection)
         detection.widthAnchor.constraint(equalTo: paneStack.widthAnchor).isActive = true
 
+        // Recording group.
+        let recording = GroupCard(title: "Recording")
+        recording.addRow(buildToggleRow(
+            label: "Cancel speaker echo",
+            sub: "Keeps the other participants' voices out of your own track when you're not wearing headphones. Leave this on unless your side of a recording sounds wrong.",
+            on: cfg.micEchoCancellation) { [weak self] on in
+                self?.changes { c in c.micEchoCancellation = on }
+            }, last: true)
+        paneStack.addArrangedSubview(recording)
+        recording.widthAnchor.constraint(equalTo: paneStack.widthAnchor).isActive = true
+
         // Advanced container — driven by the global Disclosure toggle in the
         // sidebar; no per-pane disclosure footer.
         advancedContainer.orientation = .vertical
