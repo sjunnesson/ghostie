@@ -7,9 +7,11 @@ import Foundation
 enum SummarizerPrompt {
     static let system: String = """
     You are an expert meeting analyst. You receive a timestamped transcript of a \
-    Microsoft Teams call captured locally. Speaker "Me" is the user running this \
-    tool; "Participants" is everyone else on the call. Transcription is automatic \
-    and may contain minor errors — infer intent sensibly and never invent facts \
+    Microsoft Teams call captured locally. Speakers carry a real name wherever the \
+    conversation established one; otherwise "Me" is the user running this tool and \
+    "Participant N" (or "Participants") is everyone else on the call. Transcription \
+    and speaker labelling are automatic and may contain minor errors — infer intent \
+    sensibly, treat a label as evidence rather than proof, and never invent facts \
     that are not supported by the transcript.
 
     Produce ONLY a clear, skimmable markdown document with EXACTLY these sections \
@@ -30,8 +32,9 @@ enum SummarizerPrompt {
     "_No explicit decisions were made._"
 
     ## Action Items
-    A markdown table with columns: Owner | Action | Due / Timeframe. Use "Me" or \
-    a named participant as Owner. If none, write "_No action items were identified._"
+    A markdown table with columns: Owner | Action | Due / Timeframe. Use the \
+    speaker labels as they appear in the transcript as Owner. If none, write \
+    "_No action items were identified._"
 
     ## Open Questions & Risks
     Bullet list of unresolved questions, blockers or risks raised.
@@ -61,9 +64,10 @@ enum SummarizerPrompt {
     static let segmentSystem: String = """
     You are an expert meeting analyst taking working notes. You receive ONE \
     consecutive segment of a longer timestamped Microsoft Teams call transcript. \
-    Speaker "Me" is the user running this tool; "Participants" is everyone else. \
-    Transcription is automatic and may contain minor errors — infer intent \
-    sensibly and never invent facts.
+    Speakers carry a real name where one was established; otherwise "Me" is the \
+    user running this tool and "Participant N" (or "Participants") is everyone \
+    else. Transcription and speaker labelling are automatic and may contain minor \
+    errors — infer intent sensibly and never invent facts.
 
     Produce ONLY dense markdown notes for THIS segment (no preamble):
     - Topics discussed (with who said what where it matters)

@@ -81,11 +81,33 @@ the same code drives the menu-bar app and the headless daemon.
   voice-processing I/O so speaker output (the other participants) is
   echo-cancelled out of the Me track. If VP can't start (or
   `config.micEchoCancellation` is off) it falls back to the raw SCK
-  `.microphone` tap, which re-captures everything the speakers play. Speaker
-  labels are **track-based**, not diarization. A 2×2 dropped video stream is
-  required only to keep the stream alive.
-- **`Pipeline.swift`** — transcribe both tracks → clean per track →
-  cross-track echo guard → merge by timestamp → summarize → write
+  `.microphone` tap, which re-captures everything the speakers play. The Me/
+  far-end split is **track-based**, never inferred — diarization only ever runs
+  *within* the Participants track. VP failure is not always a throw: a stopped
+  graph keeps emitting zero-filled buffers, so `MicCapture` rebuilds on
+  `AVAudioEngineConfigurationChange` and `AudioRecorder` probes for a non-zero
+  sample before committing, then watchdogs the track for the rest of the call.
+  A 2×2 dropped video stream is required only to keep the stream alive.
+- **`SpeakerDiarizer.swift` / `SpeakerEmbedder.swift` / `Fbank.swift`** —
+  splits the Participants track per person. Kaldi-compatible 80-bin fbank →
+  WeSpeaker ResNet34 (ONNX, `feats [1,T,80] → embs [1,256]`) → average-linkage
+  agglomerative clustering on cosine distance. Windows below the voiced gate
+  are never embedded (silence yields a meaningless but unit-length vector that
+  clustering cannot ignore) and are backfilled from their neighbours instead.
+  The 0.70 merge threshold is measured, not guessed — see the doc comment.
+  Entirely optional: no ONNX runtime or no model means the far end keeps one
+  "Participants" label.
+- **`SpeakerNamer.swift`** — replaces placeholder labels with names read off
+  the transcript by the configured summarization provider. Every failure path
+  keeps the placeholder, and `isPlausibleName` rejects roles, descriptions and
+  anything with a digit, because a wrongly named speaker corrupts the summary
+  built on it.
+- **`WavLevel.swift`** — post-hoc signal probe on the finished WAVs. Catches a
+  track that recorded nothing regardless of cause, on every route to a note,
+  and puts a ⚠️ line in the meta block (which the summarizer also sees).
+- **`Pipeline.swift`** — transcribe both tracks → clean per track → diarize
+  Participants → cross-track echo guard → merge by timestamp → name speakers →
+  summarize → write
   `<notesFolder>/<date>_<Source>-Call.md` (+ transcript), where Source is
   the detected app ("Teams"/"Zoom"/"Meet", generic "Call" when unknown). The
   name must stay a pure function of `startedAt` + the source stored in

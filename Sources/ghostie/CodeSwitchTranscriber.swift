@@ -300,7 +300,11 @@ struct CodeSwitchTranscriber {
             let segs = try whisperDecode(stitched.url, language: lang)
             for s in segs {
                 if let orig = stitched.table.toOriginal(s.startMs) {
-                    out.append(Transcriber.Segment(startMs: orig, text: s.text))
+                    // Shift the end by the same amount as the start so the
+                    // span survives the run-batch offset remap intact.
+                    out.append(Transcriber.Segment(
+                        startMs: orig, text: s.text,
+                        endMs: s.endMs.map { $0 + (orig - s.startMs) }))
                 } else {
                     // Segments inside the silence pads map to nil. Usually
                     // whisper hallucinating into the gap — but if it decoded

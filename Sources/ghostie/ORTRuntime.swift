@@ -145,16 +145,29 @@ final class ORTSession {
     }
 
     /// Run `[1, wav.count] Float32 → [1, C] Float32` and return the C logits.
+    /// Used by the language identifier, whose export carries its own feature
+    /// pipeline in-graph and so takes raw waveform.
     func run(wav: [Float]) throws -> [Float] {
-        guard !wav.isEmpty else { throw ORTError.failed("empty input") }
+        try run(input: wav, shape: [1, Int64(wav.count)])
+    }
+
+    /// Run an arbitrarily shaped Float32 input and return the flattened
+    /// output. The speaker embedder needs this: WeSpeaker takes precomputed
+    /// `[1, T, 80]` filterbank features rather than a waveform.
+    func run(input data: [Float], shape dims: [Int64]) throws -> [Float] {
+        guard !data.isEmpty else { throw ORTError.failed("empty input") }
+        guard dims.reduce(1, *) == Int64(data.count) else {
+            throw ORTError.failed(
+                "shape \(dims) does not describe \(data.count) values")
+        }
         var input: OpaquePointer?
-        var shape: [Int64] = [1, Int64(wav.count)]
-        var data = wav
+        var shape = dims
+        var data = data
         let created = data.withUnsafeMutableBytes { buf in
             shape.withUnsafeMutableBufferPointer { dims in
                 check(api, api.pointee.CreateTensorWithDataAsOrtValue(
                     memoryInfo, buf.baseAddress, buf.count,
-                    dims.baseAddress, 2,
+                    dims.baseAddress, dims.count,
                     ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &input))
             }
         }

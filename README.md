@@ -41,7 +41,9 @@ meeting** — automatically transcribes each call and writes a markdown summary
    runs entirely on your machine. Call audio never leaves your Mac. Decoding
    uses hallucination-resistant settings and a per-track **hallucination
    guard** (see below). The two tracks are merged by timestamp and labelled
-   **Me** vs **Participants**.
+   by speaker: **Me** vs the far end, which is split per person when several
+   people share it, and then given real **names** read off the conversation.
+   See [Speaker labels](#speaker-labels).
 
 4. **Summarize.** The transcript is turned into a structured markdown note —
    Context, Participants, Discussion, Decisions, Action Items, Open Questions,
@@ -429,8 +431,46 @@ ready. See [Summarization](#summarization).
 - **System-audio capture records all system sound during the call.** During
   a Teams call that is overwhelmingly the other participants, but anything
   else playing audio at the time gets mixed in.
-- **Speaker labels are track-based** (Me vs everyone-else), not per-person
-  diarization.
+- **Diarization only splits the far end.** Two people talking over each other
+  on the *same* far-end track land wherever the overlap sounds most like, and
+  a speaker who says only a word or two may be folded into whoever is talking
+  around them. Your own track is never diarized — it does not need to be.
+
+## Speaker labels
+
+Ghostie records the microphone and the call on **two separate tracks**, so the
+first and hardest question — is this me, or them? — is answered by physics
+rather than by a model. The microphone cannot contain the far end and system
+audio cannot contain the microphone. No diarizer can beat that, and none is
+used for it.
+
+What the tracks cannot answer is who is speaking when three people share the
+other end of the call. That is what the two optional layers below add.
+
+**Telling participants apart.** The far-end track is cut at the pauses Whisper
+already found, each piece is turned into a 256-dimensional voice embedding by
+[WeSpeaker ResNet34](https://github.com/wespeaker/wespeaker) running locally
+through ONNX Runtime, and the pieces are clustered. Pieces too quiet to carry a
+voice are skipped and then given whichever speaker is talking around them —
+without that gate the same person's own embeddings drift far enough apart to
+smear two speakers into one cluster. Measured on real recorded calls,
+same-speaker windows score a mean cosine similarity of +0.73 and
+different-speaker windows −0.06, which is what the merge threshold sits in the
+middle of. A single-speaker call stays a single speaker.
+
+**Using people's names.** Names are almost always in the conversation already —
+greetings, introductions, hand-offs. The summarizer you have configured reads
+them off and the placeholder labels are replaced. A name that looks like a role
+("the advisor"), a description, or an invention is rejected and the placeholder
+kept: a transcript labelled "Participant 1" is honest, one labelled with the
+wrong name quietly corrupts every summary built on it. Set `userName` in the
+config to state your own name rather than have it inferred.
+
+Both layers are on by default and degrade to the plain **Me** / **Participants**
+labels whenever they cannot run. Turn them off in **Settings ▸ Transcription ▸
+Speakers**, or with `diarization` / `nameSpeakers` in the config. `ghostie
+doctor` reports what is active; `ghostie fetch-models --diarization` fetches the
+embedding model on its own.
 
 ## License
 

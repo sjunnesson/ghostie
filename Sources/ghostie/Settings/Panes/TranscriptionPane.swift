@@ -407,6 +407,35 @@ final class TranscriptionPane: NSView {
                        last: true)
         qualityContainer.addArrangedSubview(quality)
         quality.widthAnchor.constraint(equalTo: qualityContainer.widthAnchor).isActive = true
+
+        // Speakers card. Telling your voice from theirs never needs a model —
+        // that comes from recording the microphone and the call on separate
+        // tracks. These two rows are about the far end: splitting it into
+        // individual people, and giving those people names.
+        let speakers = GroupCard(title: "Speakers")
+        let spkOnDisk = FileManager.default.fileExists(
+            atPath: cfg.speakerModel.isEmpty ? SpeakerEmbedder.defaultModelPath
+                                             : cfg.speakerModel)
+        let ortOnDisk = ORTRuntime.shared != nil
+        let canDiarize = spkOnDisk && ortOnDisk
+        speakers.addRow(buildToggleRow(
+            label: "Tell participants apart",
+            sub: canDiarize
+                ? "When several people share the other end of the call, label each of them separately instead of lumping them together."
+                : (spkOnDisk
+                   ? "Needs the ONNX Runtime — install it with `brew install onnxruntime`, or reinstall Ghostie from a build that includes it."
+                   : "Downloading the speaker model (~27 MB). Until it arrives, everyone on the other end shares one label."),
+            on: cfg.diarization && canDiarize) { [weak self] on in
+                self?.change { c in c.diarization = on }
+            })
+        speakers.addRow(buildToggleRow(
+            label: "Use people's names",
+            sub: "Reads names off the conversation — greetings, introductions, who gets addressed — and uses them in the transcript instead of \"Me\" and \"Participant 1\". Falls back to the plain labels when a name isn't clear.",
+            on: cfg.nameSpeakers) { [weak self] on in
+                self?.change { c in c.nameSpeakers = on }
+            }, last: true)
+        qualityContainer.addArrangedSubview(speakers)
+        speakers.widthAnchor.constraint(equalTo: qualityContainer.widthAnchor).isActive = true
     }
 
     // MARK: Advanced disclosure

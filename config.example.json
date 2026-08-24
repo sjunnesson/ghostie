@@ -16,6 +16,11 @@
   "vadModel": "/Users/YOU/.ghostie/models/ggml-silero-v5.1.2.bin",
   "cleanTranscript": true,
 
+  "diarization": true,
+  "speakerModel": "",
+  "nameSpeakers": true,
+  "userName": "",
+
   "codeSwitch": {
     "languages": [
       { "code": "sv", "prompt": "Affärssamtal på svenska. Termer: Ingka, Xplore, IKEA, IFB." },

@@ -326,6 +326,8 @@ struct Pipeline {
             part = cleaned(try transcriber.transcribe(sys, speaker: "Participants"), "Participants")
         }
 
+        let partLabels = diarizeParticipants(part, wav: sys)
+
         // Cross-track echo guard: without headphones the speakers' output
         // re-enters the mic, so Me duplicates Participants. Per-track cleaning
         // can't see this; it has to run here, between clean and merge.
@@ -338,8 +340,67 @@ struct Pipeline {
         }
 
         var lines = me.map { Line(startMs: $0.startMs, speaker: "Me", text: $0.text) }
-        lines += part.map { Line(startMs: $0.startMs, speaker: "Participants", text: $0.text) }
-        return Self.merge(lines)
+        lines += part.map { Line(startMs: $0.startMs, speaker: partLabels[$0.startMs] ?? "Participants",
+                                 text: $0.text) }
+        return named(Self.merge(lines))
+    }
+
+    /// Splits the Participants track into individual speakers.
+    ///
+    /// Only that track: "Me" is the local microphone and holds exactly one
+    /// person by construction, so diarizing it could only invent speakers who
+    /// are not there. This is also why Ghostie needs a diarizer far less than
+    /// a single-stream recorder does — the hard half of the problem, "which
+    /// side is this", is already answered by the capture itself.
+    ///
+    /// Returns a label per segment start time. Empty on every unavailable or
+    /// inconclusive path, which leaves the single "Participants" label in
+    /// place: no model, no ONNX runtime, a short track, or one speaker.
+    private func diarizeParticipants(_ segments: [(startMs: Int, text: String)],
+                                     wav: URL) -> [Int: String] {
+        guard config.diarization, segments.count > 1 else { return [:] }
+        guard let embedder = SpeakerEmbedder.load(config: config) else { return [:] }
+        defer { embedder.shutdown() }
+        guard let pcm = try? AudioStitcher.readPCM(wav) else { return [:] }
+
+        // The cleaner may have dropped or merged segments since transcription,
+        // so spans are rebuilt here from what actually reached the transcript.
+        let input = segments.enumerated().map { i, s in
+            Transcriber.Segment(
+                startMs: s.startMs, text: s.text,
+                endMs: i + 1 < segments.count ? segments[i + 1].startMs : nil)
+        }
+        let t0 = Date()
+        guard let a = SpeakerDiarizer().diarize(
+                segments: input,
+                samples: SpeakerDiarizer.floatSamples(pcm),
+                embedder: embedder) else {
+            Log.info("Diarization: one speaker on the Participants track.")
+            return [:]
+        }
+        Log.info(a.summary + String(format: " in %.0fs", Date().timeIntervalSince(t0)))
+        var labels: [Int: String] = [:]
+        for (i, speaker) in a.speakers.enumerated() {
+            guard let speaker else { continue }
+            labels[segments[i].startMs] = "Participant \(speaker + 1)"
+        }
+        return labels
+    }
+
+    /// Replaces placeholder labels with real names, when they can be
+    /// established from the conversation. Anything that cannot be named keeps
+    /// its placeholder.
+    private func named(_ lines: [Line]) -> [Line] {
+        var labels: [String] = []
+        for l in lines where !labels.contains(l.speaker) { labels.append(l.speaker) }
+        guard let naming = SpeakerNamer(config: config)
+                .name(labels: labels, transcript: render(lines)),
+              !naming.names.isEmpty else { return lines }
+        Log.info(naming.summary)
+        return lines.map {
+            guard let name = naming.names[$0.speaker] else { return $0 }
+            return Line(startMs: $0.startMs, speaker: name, text: $0.text)
+        }
     }
 
     func render(_ lines: [Line]) -> String {

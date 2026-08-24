@@ -7,6 +7,12 @@ struct Transcriber {
     struct Segment {
         let startMs: Int
         let text: String
+        /// Whisper's own segment end, when the JSON carried one. Diarization
+        /// needs a span to embed, and inferring it from the next segment's
+        /// start would swallow the pause in between — which is exactly where
+        /// a speaker change lives, and the last place you want to sample
+        /// someone's voice from.
+        var endMs: Int? = nil
     }
 
     let config: Config
@@ -105,7 +111,10 @@ struct Transcriber {
             let offsets = item["offsets"] as? [String: Any]
             let from = (offsets?["from"] as? Int)
                 ?? (offsets?["from"] as? NSNumber)?.intValue ?? 0
-            segments.append(Segment(startMs: from, text: text))
+            let to = (offsets?["to"] as? Int)
+                ?? (offsets?["to"] as? NSNumber)?.intValue
+            segments.append(Segment(startMs: from, text: text,
+                                    endMs: to.map { max($0, from) }))
         }
         return segments
     }

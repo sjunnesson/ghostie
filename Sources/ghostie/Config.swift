@@ -83,6 +83,27 @@ struct Config: Codable {
     /// cannot start; set false to force the raw tap.
     var micEchoCancellation: Bool = true
 
+    // MARK: Speaker labelling
+
+    /// Split the Participants track into individual speakers when more than
+    /// one person is on the far end. Needs the WeSpeaker embedding model and
+    /// an ONNX Runtime; without either, the track keeps a single
+    /// "Participants" label exactly as before.
+    var diarization: Bool = true
+
+    /// Path to the speaker-embedding ONNX. Empty means the catalog default
+    /// under `~/.ghostie/models/`.
+    var speakerModel: String = ""
+
+    /// Ask the summarization model to replace "Me" and "Participant N" with
+    /// the real names people use for each other on the call. Falls back to the
+    /// generic labels whenever a name cannot be established.
+    var nameSpeakers: Bool = true
+
+    /// What to call the local speaker. Empty means "let the naming pass infer
+    /// it from the conversation, and keep 'Me' if it cannot".
+    var userName: String = ""
+
     // MARK: Transcription (local, private — audio never leaves the machine)
 
     /// Path to the whisper.cpp CLI binary. Auto-detected if empty.
@@ -209,6 +230,7 @@ struct Config: Codable {
         case notesFolder, keepAudio, saveTranscript, triggerBundlePrefixes
         case triggerBundleIds, detectBrowserMeetings, browserBundleIds
         case endGraceSeconds, minCallSeconds, micEchoCancellation
+        case diarization, speakerModel, nameSpeakers, userName
         case whisperBinary, whisperServerBinary, whisperModel, language
         case initialPrompt, vadModel
         case cleanTranscript, transcriptionQuality, codeSwitch
@@ -269,6 +291,10 @@ struct Config: Codable {
         endGraceSeconds = g(.endGraceSeconds, d.endGraceSeconds)
         minCallSeconds = g(.minCallSeconds, d.minCallSeconds)
         micEchoCancellation = g(.micEchoCancellation, d.micEchoCancellation)
+        diarization = g(.diarization, d.diarization)
+        speakerModel = g(.speakerModel, d.speakerModel)
+        nameSpeakers = g(.nameSpeakers, d.nameSpeakers)
+        userName = g(.userName, d.userName)
         whisperBinary = g(.whisperBinary, d.whisperBinary)
         whisperServerBinary = g(.whisperServerBinary, d.whisperServerBinary)
         whisperModel = g(.whisperModel, d.whisperModel)

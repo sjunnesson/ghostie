@@ -106,13 +106,17 @@ func cmdFetchModels(_ config: Config, args: [String]) {
     let wantsAll = args.contains("--all")
     let wantsCodeswitch = args.contains("--codeswitch")
     let wantsVAD = args.contains("--vad")
+    let wantsDiarization = args.contains("--diarization")
     let explicitVariant = args.first { !$0.hasPrefix("--") }
     let variant = explicitVariant ?? config.codeSwitch.kbWhisperVariant
 
     var models: [Model] = []
     if wantsAll {
-        models = [Models.baseEnglish, Models.largeV3, Models.sileroVAD]
+        models = [Models.baseEnglish, Models.largeV3, Models.sileroVAD,
+                  Models.speakerEmbedding]
         if let kb = Models.kbWhisperLarge(variant: variant) { models.insert(kb, at: 1) }
+    } else if wantsDiarization {
+        models = [Models.speakerEmbedding]
     } else if wantsCodeswitch || explicitVariant != nil {
         guard let kb = Models.kbWhisperLarge(variant: variant) else {
             Log.error(ModelDownloader.DLError.subtitleUnavailable.localizedDescription)
@@ -279,6 +283,25 @@ func cmdDoctor(_ config: Config) {
             : "disabled in config — expect speaker echo on the 'Me' track without headphones")
     let vadOn = !config.vadModel.isEmpty && FileManager.default.fileExists(atPath: config.vadModel)
     row(vadOn, "Silero VAD model", vadOn ? config.vadModel : "optional — ./scripts/setup.sh --vad")
+
+    // Speaker labelling. "Me" vs "Participants" always works — it comes from
+    // the two capture tracks, not a model. These two rows are about splitting
+    // the far end into individual people and giving them names.
+    let spkPath = config.speakerModel.isEmpty
+        ? SpeakerEmbedder.defaultModelPath : config.speakerModel
+    let spkModel = FileManager.default.fileExists(atPath: spkPath)
+    let ortOK = ORTRuntime.shared != nil
+    let diarizeOK = config.diarization && spkModel && ortOK
+    row(diarizeOK, "speaker diarization",
+        !config.diarization ? "disabled in config — the far end stays one 'Participants' label"
+            : !spkModel ? "no embedding model — `ghostie fetch-models --diarization`"
+            : !ortOK ? "ONNX Runtime not found — `brew install onnxruntime`, or use a bundled build"
+            : "on — the Participants track is split per speaker")
+    row(config.nameSpeakers && s.isConfigured, "speaker naming",
+        !config.nameSpeakers ? "disabled in config — labels stay generic"
+            : !s.isConfigured ? "needs a working summarization provider (see below)"
+            : config.userName.isEmpty ? "on — names are read from the conversation"
+            : "on — you are \(config.userName); others are read from the conversation")
     switch config.summaryProvider {
     case "ollama":
         let detail = s.isConfigured
@@ -485,7 +508,7 @@ func printHelp() {
       diagnose-detect [--duration N] [--json]
                           Live readout of the call detector. 30s default,
                           500ms refresh. --json emits line-delimited JSON.
-      fetch-models [variant] [--all|--codeswitch|--vad]
+      fetch-models [variant] [--all|--codeswitch|--vad|--diarization]
                           Download the model set Ghostie needs. With no flag,
                           fetches exactly what current config requires (single
                           mode → base.en + VAD; codeswitch on → KB + large-v3
@@ -503,6 +526,68 @@ func printHelp() {
     Build the menu bar app:  ./scripts/build-app.sh
     Config: \(Config.configPath)
     """)
+}
+
+// MARK: - diarize-probe (hidden)
+
+/// Field debugging for speaker diarization: chops a WAV into fixed-length
+/// segments, clusters them, and prints who the diarizer thinks is speaking
+/// when. Fixed segments (rather than Whisper's) keep the probe independent of
+/// transcription, so it answers "can the embeddings tell these voices apart?"
+/// on its own.
+func cmdDiarizeProbe(_ config: Config, wavPath: String, segmentMs: Int) {
+    guard let embedder = SpeakerEmbedder.load(config: config) else {
+        print("diarize-probe: speaker embedding unavailable"); exit(1)
+    }
+    defer { embedder.shutdown() }
+    let url = URL(fileURLWithPath: wavPath)
+    guard let samples = try? AudioStitcher.readPCM(url) else {
+        print("diarize-probe: could not read \(wavPath)"); exit(1)
+    }
+    let floats = SpeakerDiarizer.floatSamples(samples)
+    let totalMs = floats.count * 1000 / Fbank.sampleRate
+    var segments: [Transcriber.Segment] = []
+    var t = 0
+    while t + segmentMs <= totalMs {
+        segments.append(Transcriber.Segment(startMs: t, text: "", endMs: t + segmentMs))
+        t += segmentMs
+    }
+    print("\(segments.count) segments of \(segmentMs) ms over \(String(format: "%.1f", Double(totalMs) / 60_000)) min")
+    let t0 = Date()
+    var diarizer = SpeakerDiarizer()
+    diarizer.fillUnlabelled = ProcessInfo.processInfo.environment["GHOSTIE_DIARIZE_NOFILL"] == nil
+    guard let a = diarizer.diarize(segments: segments, samples: floats,
+                                   embedder: embedder) else {
+        print("verdict: a single speaker (or too little audio to split)")
+        return
+    }
+    print(a.summary)
+    print(String(format: "embedded + clustered in %.1f s", Date().timeIntervalSince(t0)))
+    var line = ""
+    for (i, s) in a.speakers.enumerated() {
+        line += s.map { String($0) } ?? "."
+        if (i + 1) % 60 == 0 { print("  \(line)"); line = "" }
+    }
+    if !line.isEmpty { print("  \(line)") }
+}
+
+// MARK: - embed-dump (hidden, diagnostics)
+
+/// Prints one L2-normalized speaker embedding per fixed-length segment as
+/// TSV, for offline analysis of separability.
+func cmdEmbedDump(_ config: Config, wavPath: String, segmentMs: Int) {
+    guard let embedder = SpeakerEmbedder.load(config: config) else { exit(1) }
+    defer { embedder.shutdown() }
+    guard let pcm = try? AudioStitcher.readPCM(URL(fileURLWithPath: wavPath)) else { exit(1) }
+    let f = SpeakerDiarizer.floatSamples(pcm)
+    let step = Fbank.sampleRate * segmentMs / 1000
+    var i = 0, n = 0
+    while i + step <= f.count {
+        if let e = embedder.embed(Array(f[i..<(i + step)])) {
+            print("\(n)\t" + e.map { String(format: "%.5f", $0) }.joined(separator: ","))
+        }
+        i += step; n += 1
+    }
 }
 
 // MARK: - wav-probe (hidden)
@@ -618,6 +703,16 @@ case "icon":
     // Hidden: render the app icon PNG (used by scripts/build-app.sh).
     let out = args.count > 1 ? args[1] : "icon.png"
     exit(GhostIcon.writeAppIconPNG(to: out) ? 0 : 1)
+case "diarize-probe":
+    // Hidden: cluster a WAV's speakers on fixed segments and print a timeline.
+    guard args.count > 1 else {
+        Log.error("Usage: ghostie diarize-probe <wav> [segment-ms]"); exit(1)
+    }
+    cmdDiarizeProbe(config, wavPath: args[1],
+                    segmentMs: Int(args.count > 2 ? args[2] : "") ?? 3000)
+case "embed-dump":
+    guard args.count > 1 else { Log.error("Usage: ghostie embed-dump <wav> [ms]"); exit(1) }
+    cmdEmbedDump(config, wavPath: args[1], segmentMs: Int(args.count > 2 ? args[2] : "") ?? 3000)
 case "wav-probe":
     // Hidden: report per-track signal level for a session dir or a WAV.
     guard args.count > 1 else {
@@ -642,7 +737,10 @@ case "selftest":
     let detectorOK = runDetectorStateMachineSelfTest()
     print("")
     let wavOK = runWavLevelSelfTest()
-    exit(cleanerOK && echoOK && codeSwitchOK && updaterOK && detectorOK && wavOK ? 0 : 1)
+    print("")
+    let speakerOK = runSpeakerSelfTest()
+    exit(cleanerOK && echoOK && codeSwitchOK && updaterOK && detectorOK && wavOK
+         && speakerOK ? 0 : 1)
 case "settings":
     launchSettingsOnly()
 case "install-service":

@@ -832,7 +832,8 @@ func runCodeSwitchSelfTest() -> Bool {
                                     present: onDisk([lv3, kb, vad])).rows.map(\.code) == ["en", "sv"])
         check("required: German adds nothing to fetch when large-v3 is present",
               Models.required(for: withDE, catalog: catalog, installed: inst)
-                  .map(\.filename).sorted()
+                  .map(\.filename)
+                  .filter { $0 != Models.speakerEmbedding.filename }.sorted()
                   == [Models.kbWhisperLarge(variant: "standard")!.filename,
                       Models.largeV3.filename, Models.sileroVAD.filename].sorted())
     }
@@ -851,7 +852,13 @@ func runCodeSwitchSelfTest() -> Bool {
         let catalog = [lv3, kb, base, vad, de]
         let nothing = InstalledModels(perLanguage: [:])
 
-        func names(_ ms: [Model]) -> [String] { ms.map(\.filename) }
+        func allNames(_ ms: [Model]) -> [String] { ms.map(\.filename) }
+        // The checks below are about which *speech* models get fetched, so the
+        // speaker-embedding model is filtered out of them and asserted on its
+        // own terms further down.
+        func names(_ ms: [Model]) -> [String] {
+            allNames(ms).filter { $0 != Models.speakerEmbedding.filename }
+        }
 
         var deEn = Config()
         deEn.codeSwitch.languages = ["de", "en"]
@@ -880,6 +887,16 @@ func runCodeSwitchSelfTest() -> Bool {
         check("required: an explicitly pinned model is what gets fetched",
               names(Models.required(for: pinned, catalog: catalog, installed: nothing))
                   == [Models.baseEnglish.filename, Models.sileroVAD.filename])
+
+        // Speaker embeddings ride along by default — 27 MB is what makes
+        // diarization work on a fresh install rather than being a flag to find.
+        check("required: the speaker model is fetched when diarization is on",
+              allNames(Models.required(for: Config(), catalog: catalog, installed: nothing))
+                  .contains(Models.speakerEmbedding.filename))
+        var noDiar = Config(); noDiar.diarization = false
+        check("required: the speaker model is skipped when diarization is off",
+              !allNames(Models.required(for: noDiar, catalog: catalog, installed: nothing))
+                  .contains(Models.speakerEmbedding.filename))
     }
 
     // LanguageIdentifier seam: WhisperLID parse + spread, and the segmenter's

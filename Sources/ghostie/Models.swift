@@ -87,6 +87,18 @@ enum Models {
         approxBytes: 885_098
     )
 
+    /// Speaker embeddings for splitting the Participants track when more than
+    /// one person shares the far end. WeSpeaker ResNet34-LM, trained on
+    /// VoxCeleb and exported to ONNX by the sherpa-onnx project (Apache-2.0);
+    /// `feats [1, T, 80] → embs [1, 256]`. Optional: without it Ghostie keeps
+    /// today's single "Participants" label.
+    static let speakerEmbedding = Model(
+        filename: "wespeaker_en_voxceleb_resnet34_LM.onnx",
+        url: URL(string: "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/wespeaker_en_voxceleb_resnet34_LM.onnx")!,
+        label: "WeSpeaker ResNet34 speaker embeddings · ~27 MB",
+        approxBytes: 26_530_550
+    )
+
     /// KB-Whisper has multiple variants on different Hugging Face revisions.
     /// `subtitle` is HF-format only (no prebuilt GGML) and returns nil.
     static func kbWhisperLarge(variant: String) -> Model? {
@@ -157,6 +169,12 @@ enum Models {
         // VAD is optional for one language (doctor flags it as recommended) and
         // load-bearing for code-switching — required either way, it's ~900 KB.
         add(sileroVAD)
+        // Speaker embeddings, so a call with three people on the far end comes
+        // out labelled per speaker rather than as one "Participants". ~27 MB
+        // against a speech model measured in hundreds, and fetching it here is
+        // what makes diarization work on a fresh install instead of being a
+        // flag the user has to find.
+        if config.diarization { add(speakerEmbedding) }
         return out
     }
 
