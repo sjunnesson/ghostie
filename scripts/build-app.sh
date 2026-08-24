@@ -193,8 +193,12 @@ if [ "$SELFCONTAINED" = "1" ]; then
       install_name_tool -id @rpath/libonnxruntime.dylib \
         "$APP/Contents/Frameworks/libonnxruntime.dylib" 2>/dev/null || true
       NESTED_BINS+=("$APP/Contents/Frameworks/libonnxruntime.dylib")
+      # `grep -v` exits 1 when it filters everything out, which under
+      # `set -o pipefail` is the *success* case here — hence `|| true`.
       EXTERNAL_DEPS=$(otool -L "$APP/Contents/Frameworks/libonnxruntime.dylib" \
-        | tail -n +2 | grep -vE "/System/|/usr/lib/|@rpath/libonnxruntime" | wc -l | tr -d " ")
+        | tail -n +2 \
+        | { grep -vE "/System/|/usr/lib/|@rpath/libonnxruntime" || true; } \
+        | wc -l | tr -d " ")
       if [ "$EXTERNAL_DEPS" != "0" ]; then
         echo "!! bundled libonnxruntime has $EXTERNAL_DEPS non-system dependencies — it will not load on a clean Mac" >&2
         exit 1
