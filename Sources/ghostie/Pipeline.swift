@@ -58,7 +58,8 @@ struct Pipeline {
                                  startedAt: startedAt, durationMins: durationMins,
                                  source: source,
                                  copyingOriginals: config.keepAudio)
-            let url = writeNote(meta: metaBlock(startedAt, durationMins),
+            let url = writeNote(meta: metaBlock(startedAt, durationMins,
+                                                mic: rec.micWav, sys: rec.systemWav),
                 summary: "> ⏳ **Queued.** Transcription wasn't available (\(error.localizedDescription)). Ghostie will process this recording automatically once it can run again.",
                 transcript: "_(Pending transcription.)_", startedAt: startedAt,
                 source: source)
@@ -67,7 +68,8 @@ struct Pipeline {
         }
 
         let transcript = render(lines)
-        let meta = metaBlock(startedAt, durationMins)
+        let meta = metaBlock(startedAt, durationMins,
+                             mic: rec.micWav, sys: rec.systemWav)
 
         if lines.isEmpty {
             let url = writeNote(meta: meta,
@@ -126,7 +128,10 @@ struct Pipeline {
 
         for entry in entries {
             let startedAt = entry.startedAtDate
-            let meta = p.metaBlock(startedAt, entry.meta.durationMins)
+            let meta = entry.meta.stage == "transcribe"
+                ? p.metaBlock(startedAt, entry.meta.durationMins,
+                              mic: entry.micWav, sys: entry.systemWav)
+                : p.metaBlock(startedAt, entry.meta.durationMins)
             // Pre-source entries default to "Teams" — the label their queued
             // note was originally written under, so the note name re-derives
             // identically and the upgrade lands in place.
@@ -344,12 +349,52 @@ struct Pipeline {
                    .joined(separator: "\n\n")
     }
 
-    private func metaBlock(_ startedAt: Date, _ durationMins: String) -> String {
-        """
+    private func metaBlock(_ startedAt: Date, _ durationMins: String,
+                           mic: URL? = nil, sys: URL? = nil) -> String {
+        var block = """
         - Date: \(Self.human.string(from: startedAt))
         - Duration: \(durationMins) minutes
         - Captured locally via ScreenCaptureKit (no bot joined the call)
         """
+        if let warning = Self.trackHealthWarning(mic: mic, sys: sys) {
+            block += "\n- ⚠️ \(warning)"
+        }
+        return block
+    }
+
+    /// Names a track that recorded nothing while the other one recorded a
+    /// conversation. This is the last line of defence against shipping a
+    /// half-recorded call as a complete one: it runs on the finished WAVs, so
+    /// it covers every route to a note — live, backlog drain, orphan sweep and
+    /// `ghostie process` — regardless of which capture path failed or why.
+    ///
+    /// Deliberately hard to trip. A track only counts as broken when it is
+    /// digitally silent (or all but), *and* the other track is carrying real
+    /// speech — so a muted participant, a listener who never spoke, and a call
+    /// that was quiet at both ends all pass without comment. The line goes
+    /// into the meta block, which is also handed to the summarizer, so the
+    /// analysis knows it is working from one side of the conversation.
+    static func trackHealthWarning(mic: URL?, sys: URL?) -> String? {
+        guard let mic, let sys,
+              let me = WavLevel.probe(mic), let them = WavLevel.probe(sys) else {
+            return nil
+        }
+        // Both silent = nothing was said; the "no speech detected" path already
+        // covers that and says it better.
+        func broken(_ track: WavLevel.Stats, against other: WavLevel.Stats) -> Bool {
+            other.activeFraction > 0.05
+                && (track.isDigitalSilence || track.activeFraction < 0.005)
+        }
+        let advice = "Check System Settings ▸ Privacy & Security ▸ Microphone and which input device is selected."
+        if broken(me, against: them) {
+            Log.warn("'Me' track recorded no audio (peak \(me.peak), \(String(format: "%.2f", me.activeFraction * 100))% active) while 'Participants' carried speech — the note covers only the other participants.")
+            return "**Your microphone recorded nothing on this call.** This note and transcript cover only the other participants — everything you said is missing. \(advice)"
+        }
+        if broken(them, against: me) {
+            Log.warn("'Participants' track recorded no audio (peak \(them.peak)) while 'Me' carried speech — the note covers only the local speaker.")
+            return "**The other participants' audio was not captured.** This note and transcript cover only your own side of the call."
+        }
+        return nil
     }
 
     /// The session has been fully handled (note written and/or audio queued):

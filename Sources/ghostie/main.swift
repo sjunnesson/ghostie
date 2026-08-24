@@ -505,6 +505,46 @@ func printHelp() {
     """)
 }
 
+// MARK: - wav-probe (hidden)
+
+/// Field debugging for the "half-recorded call" class of bug: prints the
+/// signal level of a session's tracks and the verdict the pipeline would
+/// reach. `ghostie wav-probe ~/.ghostie/recordings/<session>` answers "was my
+/// microphone actually recording?" without re-running an hour of transcription.
+func cmdWavProbe(_ path: String) {
+    let url = URL(fileURLWithPath: path)
+    var isDir: ObjCBool = false
+    FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir)
+    let wavs: [(String, URL)] = isDir.boolValue
+        ? [("me", url.appendingPathComponent("me.wav")),
+           ("participants", url.appendingPathComponent("participants.wav"))]
+        : [(url.lastPathComponent, url)]
+
+    for (label, wav) in wavs {
+        guard FileManager.default.fileExists(atPath: wav.path) else {
+            print("\(label): missing (\(wav.path))"); continue
+        }
+        guard let st = WavLevel.probe(wav) else {
+            print("\(label): unreadable"); continue
+        }
+        let dbfs = st.peak == 0
+            ? "-inf" : String(format: "%.1f", 20 * log10(Double(st.peak) / 32768))
+        let name = label.padding(toLength: max(13, label.count), withPad: " ",
+                                 startingAt: 0)
+        print(name
+              + String(format: " %6.1f min  peak %7s dBFS  active %5.1f%%",
+                       st.seconds / 60, (dbfs as NSString).utf8String!,
+                       st.activeFraction * 100)
+              + (st.isDigitalSilence ? "   ← DIGITAL SILENCE" : ""))
+    }
+    if isDir.boolValue {
+        let verdict = Pipeline.trackHealthWarning(
+            mic: url.appendingPathComponent("me.wav"),
+            sys: url.appendingPathComponent("participants.wav"))
+        print("verdict: " + (verdict ?? "both tracks carry audio."))
+    }
+}
+
 // MARK: - lid-probe (hidden)
 
 /// Hidden field-debugging subcommand: builds the default language identifier
@@ -578,6 +618,12 @@ case "icon":
     // Hidden: render the app icon PNG (used by scripts/build-app.sh).
     let out = args.count > 1 ? args[1] : "icon.png"
     exit(GhostIcon.writeAppIconPNG(to: out) ? 0 : 1)
+case "wav-probe":
+    // Hidden: report per-track signal level for a session dir or a WAV.
+    guard args.count > 1 else {
+        Log.error("Usage: ghostie wav-probe <session-dir|wav>"); exit(1)
+    }
+    cmdWavProbe(args[1])
 case "lid-probe":
     // Hidden: run the active language identifier on a WAV (field debugging).
     guard args.count > 1 else { Log.error("Usage: ghostie lid-probe <wav>"); exit(1) }
@@ -594,7 +640,9 @@ case "selftest":
     let updaterOK = runUpdaterSelfTest()
     print("")
     let detectorOK = runDetectorStateMachineSelfTest()
-    exit(cleanerOK && echoOK && codeSwitchOK && updaterOK && detectorOK ? 0 : 1)
+    print("")
+    let wavOK = runWavLevelSelfTest()
+    exit(cleanerOK && echoOK && codeSwitchOK && updaterOK && detectorOK && wavOK ? 0 : 1)
 case "settings":
     launchSettingsOnly()
 case "install-service":

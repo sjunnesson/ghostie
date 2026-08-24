@@ -104,7 +104,20 @@ struct CodeSwitchTranscriber {
         let meRuns = smMe.refine(meDet, priorFrom: partPrelim)
         let partRuns = smPart.refine(partDet, priorFrom: mePrelim)
 
-        Log.info("Code-switching: Me \(runSummary(meRuns)), Participants \(runSummary(partRuns)).")
+        // One empty track beside a talkative one is not a quiet participant —
+        // it is a capture that failed silently, and the note is about to be
+        // written from half a conversation. `WavLevel` catches this on the
+        // audio itself; say it here too, because this is the first moment the
+        // *transcription* can see it, and it used to slip by as an INFO.
+        let meEmpty = meRuns.isEmpty, partEmpty = partRuns.isEmpty
+        let line = "Code-switching: Me \(runSummary(meRuns)), Participants \(runSummary(partRuns))."
+        if meEmpty != partEmpty {
+            Log.warn(line + " One track carries no speech at all — check that "
+                + (meEmpty ? "the microphone was" : "system audio was")
+                + " actually captured.")
+        } else {
+            Log.info(line)
+        }
 
         // Snap each language-switch boundary to the nearest silence trough
         // (or merge the two runs when no trough lives in the search window).

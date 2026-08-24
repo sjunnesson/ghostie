@@ -123,6 +123,68 @@ final class AudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
     /// ~100 ms at the output rate; lags beyond this get silence-padded.
     private var maxLagSamples: Int { outputSampleRate / 10 }
 
+    // MARK: - Mic liveness watchdog
+    //
+    // A capture path can fail *silently*: `AVAudioEngine` stops its graph on a
+    // device change and keeps handing back buffers of digital zeros, and the
+    // SCK tap does the same when the input device disappears. Nothing throws,
+    // conversion succeeds, the WAV keeps pace with wall-clock — and an hour
+    // later the "Me" track is an hour of silence. That is precisely how the
+    // 2026-08-24 call lost 82% of the local speaker.
+    //
+    // The test is "this track has never produced a single non-zero sample",
+    // not "the track is quiet right now": a live mic always carries a noise
+    // floor, so digital silence means a dead graph, while a listener who has
+    // genuinely said nothing for a minute still breathes into a working one.
+    // Escalation, all gated on the *other* track actually receiving audio so
+    // a silent room or a paused call never trips it:
+    //
+    //   ~3 s  (before the SCK stream is even built) → don't use VP at all,
+    //         configure the raw SCK mic tap instead. Free: nothing recorded yet.
+    //   60 s  → rebuild the voice-processing graph against the current device.
+    //   150 s → give up on VP; switch the live SCStream to the raw mic tap.
+    //           Echo may return, and `EchoSuppressor` handles that at text level.
+    //   300 s → nothing works (permission, hardware); say so once, loudly.
+    //
+    /// Guards the two liveness latches, which are written from the sample
+    /// queues and read from the watchdog queue and stop().
+    private let signalLock = NSLock()
+    private var micEverHadSignal = false
+    private var systemEverHadSignal = false
+
+    private var watchdog: DispatchSourceTimer?
+    private let watchdogQueue = DispatchQueue(label: "ghostie.mic.watchdog")
+    /// Retained so the watchdog can flip `captureMicrophone` and re-apply it.
+    private var streamConfig: SCStreamConfiguration?
+    private var micEscalation = 0
+    private var deadMicReported = false
+
+    /// How long to wait at startup for the voice-processed path to prove it
+    /// is alive. A healthy graph latches on its first buffer (~20 ms), so this
+    /// only ever costs time on a call that was about to lose its mic anyway.
+    private let micProbeSeconds: Double = 3.0
+    /// A live mic latches on its *first* buffer — an ADC always carries dither
+    /// and room noise, so exact zeros eight buffers running is not a quiet
+    /// room, it is a dead source. (A starved voice-processing unit trickles
+    /// buffers at ~100 ms rather than the usual ~21 ms, so counting buffers
+    /// rather than seconds is what keeps this decision quick.) Deciding early
+    /// costs echo at worst, which the transcript's echo guard removes;
+    /// deciding late costs head off the front of the "Me" track.
+    private let micProbeMinBuffers = 8
+    /// A live graph delivers its first buffer within ~100 ms of `start()`.
+    /// Silence past this with *nothing at all* arriving is the other shape of
+    /// the same failure, and waiting out the full window only costs the "Me"
+    /// track more head. Generous enough to let a Bluetooth device finish
+    /// negotiating, since the price of deciding early is echo (recoverable),
+    /// not silence (not).
+    private let micProbeNoBufferSeconds: Double = 1.25
+    /// Head deliberately given up while probing, so the flush-time desync
+    /// check does not report our own choice as a symptom.
+    private var micProbeDelaySeconds: Double = 0
+    private let micRebuildAfterSeconds: Double = 60
+    private let micFallbackAfterSeconds: Double = 150
+    private let micDeadAfterSeconds: Double = 300
+
     init(config: Config) {
         self.config = config
     }
@@ -154,6 +216,141 @@ final class AudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
     private func stopMicCapture() {
         micCapture?.stop()
         micCapture = nil
+    }
+
+    // MARK: - Mic liveness
+
+    /// Waits (bounded) for the voice-processed path to deliver its first
+    /// non-zero sample. Returns false if it only ever produced digital
+    /// silence, which means the graph is dead and the raw tap should be used.
+    private func awaitMicSignal(_ cap: MicCapture) async -> Bool {
+        let began = Date()
+        let deadline = began.addingTimeInterval(micProbeSeconds)
+        defer { micProbeDelaySeconds = Date().timeIntervalSince(began) }
+        while !cap.hasEverHadSignal, Date() < deadline {
+            // Nothing arriving at all is the second shape of a dead graph.
+            if cap.deliveredBuffers == 0,
+               Date().timeIntervalSince(began) >= micProbeNoBufferSeconds {
+                return false
+            }
+            // Decide as soon as enough empty buffers have arrived rather than
+            // burning the whole window: the "Me" track starts when this
+            // returns, and every millisecond spent here is a millisecond it
+            // has to be silence-padded to stay aligned with "Participants".
+            if cap.deliveredBuffers >= micProbeMinBuffers { return false }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        return cap.hasEverHadSignal
+    }
+
+    /// Latches "this track has carried real audio". Written from the sample
+    /// queues; the scan costs one pass over the first non-silent buffer and
+    /// nothing thereafter. Realignment padding bypasses this (it is appended
+    /// below `ingest*`), so inserted silence can never latch a dead track.
+    private func noteSignal(_ samples: [Int16], mic: Bool) {
+        let already = signalLock.withLock { mic ? micEverHadSignal : systemEverHadSignal }
+        guard !already, samples.contains(where: { $0 != 0 }) else { return }
+        signalLock.withLock {
+            if mic { micEverHadSignal = true } else { systemEverHadSignal = true }
+        }
+    }
+
+    /// Re-anchors the "Me" track's PTS clock after the mic source changes.
+    /// A new source starts a fresh timeline, so without this the next buffer
+    /// would look hours late and `realignmentPaddingLocked` would inject a
+    /// correspondingly enormous block of silence.
+    private func reanchorMicTrack() {
+        bufferQueue.async { [self] in micAnchor = TrackAnchor() }
+    }
+
+    private func startMicWatchdog() {
+        watchdogQueue.async { [self] in
+            let t = DispatchSource.makeTimerSource(queue: watchdogQueue)
+            t.schedule(deadline: .now() + 5, repeating: 5)
+            t.setEventHandler { [weak self] in self?.checkMicLiveness() }
+            watchdog = t
+            t.resume()
+        }
+    }
+
+    private func stopMicWatchdog() {
+        watchdogQueue.sync {
+            watchdog?.cancel()
+            watchdog = nil
+        }
+    }
+
+    /// Runs on `watchdogQueue` every 5 s until the "Me" track proves itself.
+    /// See the escalation ladder documented with the liveness state above.
+    private func checkMicLiveness() {
+        let (micOK, sysOK) = signalLock.withLock {
+            (micEverHadSignal, systemEverHadSignal)
+        }
+        if micOK {
+            if micEscalation > 0 { Log.ok("'Me' track is receiving audio again.") }
+            watchdog?.cancel()
+            watchdog = nil
+            return
+        }
+        // Gate on the other track: before it has heard anything there is no
+        // call to speak into, and a silent room must never trip an escalation.
+        guard sysOK else { return }
+        let elapsed = Date().timeIntervalSince(startedAt)
+
+        if micEscalation == 0, elapsed >= micRebuildAfterSeconds {
+            if let cap = micCapture {
+                micEscalation = 1
+                Log.warn("'Me' track has recorded only digital silence for \(Int(elapsed))s while the call has audio — rebuilding the voice-processing mic graph.")
+                cap.restart(reason: "the 'Me' track is recording silence")
+            } else {
+                // Already on the raw tap; there is nothing left to fall back
+                // to, so skip straight to the terminal report.
+                micEscalation = 2
+                Log.warn("'Me' track has recorded only digital silence for \(Int(elapsed))s while the call has audio — the raw microphone tap is delivering no signal. Check the selected input device and Microphone permission.")
+            }
+            return
+        }
+        if micEscalation == 1, elapsed >= micFallbackAfterSeconds {
+            micEscalation = 2
+            switchToRawMicTap()
+            return
+        }
+        if micEscalation < 3, elapsed >= micDeadAfterSeconds {
+            micEscalation = 3
+            if !deadMicReported {
+                deadMicReported = true
+                Log.error("'Me' track has recorded no audio at all after \(Int(elapsed))s — this call will be transcribed from the other participants only. Check System Settings ▸ Privacy & Security ▸ Microphone, and which input device is selected.")
+            }
+            watchdog?.cancel()
+            watchdog = nil
+        }
+    }
+
+    /// Last resort: drop voice processing and switch the *live* SCStream over
+    /// to its raw microphone tap. Echo can return on the "Me" track — that is
+    /// what `EchoSuppressor` is for, and a track with echo is recoverable
+    /// where a silent one is not.
+    private func switchToRawMicTap() {
+        guard let cap = micCapture else { return }
+        guard let cfg = streamConfig,
+              let s = stateLock.withLock({ stream }) else {
+            Log.error("'Me' track is silent and the raw microphone tap is unavailable — the local side of this call cannot be recovered.")
+            return
+        }
+        Log.warn("Voice-processed mic still silent after \(Int(micFallbackAfterSeconds))s and \(cap.rebuildCount) rebuild(s) — switching the 'Me' track to the raw ScreenCaptureKit tap. Speaker echo may appear on that track; the transcript's echo guard removes it.")
+        cap.stop()
+        micCapture = nil
+        cfg.captureMicrophone = true
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await s.updateConfiguration(cfg)
+                self.reanchorMicTrack()
+                Log.info("'Me' track switched to the raw microphone tap.")
+            } catch {
+                Log.error("Could not switch the 'Me' track to the raw microphone tap: \(error.localizedDescription).")
+            }
+        }
     }
 
     private func beginCapture() async throws {
@@ -189,13 +386,30 @@ final class AudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
                 guard let self else { return }
                 self.micQueue.async { self.ingestMic(samples, pts: pts) }
             }
+            cap.onRebuilt = { [weak self] in self?.reanchorMicTrack() }
             do {
                 try cap.start()
                 micCapture = cap
-                Log.info("Mic capture: voice-processed (echo-cancelled).")
             } catch {
                 Log.warn("Voice-processed mic unavailable (\(error.localizedDescription)) — falling back to the raw ScreenCaptureKit tap; expect speaker echo on the 'Me' track without headphones.")
             }
+        }
+
+        // `start()` returning is not proof of a working graph — a stopped
+        // AVAudioEngine hands back well-formed buffers of zeros. Wait for the
+        // first non-zero sample before committing; a healthy mic latches
+        // immediately on its noise floor, so this is normally instant.
+        if let cap = micCapture, await !awaitMicSignal(cap) {
+            let shape = cap.deliveredBuffers == 0
+                ? "delivered no audio buffers at all"
+                : "delivered \(cap.deliveredBuffers) buffers of digital silence"
+            Log.warn("Voice-processed mic \(shape) in \(String(format: "%.2f", micProbeDelaySeconds))s (dead audio graph, a muted/absent input device, or another app holding voice processing on it) — falling back to the raw ScreenCaptureKit tap; expect speaker echo on the 'Me' track without headphones.")
+            cap.stop()
+            micCapture = nil
+            micQueue.sync { }
+            reanchorMicTrack()
+        } else if micCapture != nil {
+            Log.info("Mic capture: voice-processed (echo-cancelled), signal confirmed.")
         }
 
         let cfg = SCStreamConfiguration()
@@ -203,7 +417,10 @@ final class AudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
         cfg.sampleRate = 48000
         cfg.channelCount = 2
         cfg.excludesCurrentProcessAudio = true
-        cfg.captureMicrophone = micCapture == nil   // macOS 15+ : raw mic tap (fallback)
+        // macOS 15+ raw mic tap. Off while the voice-processed path is
+        // healthy; the watchdog flips it on via `updateConfiguration` if that
+        // path turns out to be recording silence.
+        cfg.captureMicrophone = micCapture == nil
         // Minimal video — required to keep the stream alive; frames are dropped.
         cfg.width = 2
         cfg.height = 2
@@ -214,9 +431,17 @@ final class AudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
         let s = SCStream(filter: filter, configuration: cfg, delegate: self)
         try s.addStreamOutput(self, type: .screen, sampleHandlerQueue: videoQueue)
         try s.addStreamOutput(self, type: .audio, sampleHandlerQueue: audioQueue)
-        if micCapture == nil {
+        // Registered unconditionally: with `captureMicrophone == false` no
+        // buffers are delivered, and having the handler already in place makes
+        // the watchdog's mid-call switch a config update rather than a stream
+        // rebuild. Non-fatal if the OS refuses it — we simply lose the ability
+        // to fall back, which is strictly better than failing to record.
+        do {
             try s.addStreamOutput(self, type: .microphone, sampleHandlerQueue: micQueue)
+        } catch {
+            Log.warn("Could not register the raw microphone tap (\(error.localizedDescription)) — the 'Me' track cannot fall back if voice processing fails.")
         }
+        streamConfig = cfg
         try await s.startCapture()
 
         // Publish the live stream atomically — unless stop() arrived while we
@@ -238,6 +463,7 @@ final class AudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
             return
         }
         Log.ok("Recording → \(sessionDir.path)")
+        startMicWatchdog()
     }
 
     /// Settles the state machine after start() finishes (success was already
@@ -357,6 +583,7 @@ final class AudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
             case .stop(let s):
                 // stopCapture throws if the stream already died (bug-2 path);
                 // that is fine — the queues still drain and the WAVs close.
+                stopMicWatchdog()
                 if let s { try? await s.stopCapture() }
                 stopMicCapture()
                 stateLock.withLock { lifecycle = .stopped }
@@ -435,6 +662,7 @@ final class AudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
     // MARK: - Buffering + flush
 
     private func ingestMic(_ samples: [Int16], pts: Double?) {
+        noteSignal(samples, mic: true)
         bufferQueue.async { [self] in
             if let pad = realignmentPaddingLocked(anchor: &micAnchor, pts: pts, track: "me") {
                 appendMicLocked(pad)
@@ -444,6 +672,7 @@ final class AudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
     }
 
     private func ingestSystem(_ samples: [Int16], pts: Double?) {
+        noteSignal(samples, mic: false)
         bufferQueue.async { [self] in
             if let pad = realignmentPaddingLocked(anchor: &systemAnchor, pts: pts, track: "participants") {
                 appendSystemLocked(pad)
@@ -538,7 +767,10 @@ final class AudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
         let diff = abs(micFrames - sysFrames)
         if diff > 0 {
             let silenceSeconds = Double(diff) / Double(outputSampleRate)
-            if silenceSeconds > 1.0 {
+            // Probing the voice-processed path holds the "Me" track back by a
+            // known amount before falling back to the raw tap. That head is a
+            // decision, not a symptom, so it does not count as desync.
+            if silenceSeconds - micProbeDelaySeconds > 1.0 {
                 Log.warn("Track desync at flush: |me - participants| = \(String(format: "%.2f", silenceSeconds))s. Silence-padding the shorter side; investigate if this recurs.")
             }
             let silence = [Int16](repeating: 0, count: diff)
