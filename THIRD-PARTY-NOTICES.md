@@ -27,6 +27,19 @@ redistributed with Ghostie:
 - Voice-activity detection that suppresses silence-driven whisper hallucination.
   Small (~900 KB), so bundled directly rather than downloaded.
 
+### ONNX Runtime (`Contents/Frameworks/libonnxruntime.dylib`)
+
+- Source: https://github.com/microsoft/onnxruntime — the official
+  `onnxruntime-osx-arm64` release binary, fetched by `scripts/build-app.sh`
+  at build time and redistributed inside the `.app`.
+- Copyright (c) Microsoft Corporation. License: **MIT** — the full text
+  ships in the release archive and applies to the bundled dylib.
+- Runs the speaker-embedding model locally for diarization (and the optional
+  VoxLingua107 language identifier). Build with `GHOSTIE_BUNDLE_ORT=0` to
+  omit it; Ghostie then falls back to any `libonnxruntime.dylib` the user has
+  installed themselves, and to undiarized "Participants" labels if there is
+  none.
+
 ## Downloaded at runtime by the user (not redistributed by this project)
 
 These are fetched on demand from their upstream source into
@@ -41,6 +54,7 @@ terms.
 | `ggml-base.en.bin` (~140 MB) | Default English transcription | https://huggingface.co/ggerganov/whisper.cpp | First-launch auto-download (Settings ▸ Transcription), `ghostie fetch-models`, or `scripts/setup.sh` | **MIT** (OpenAI Whisper) — https://github.com/openai/whisper |
 | whisper-large-v3 (GGML) | English decode in code-switching | https://huggingface.co/ggerganov/whisper.cpp | Settings ▸ Download models, `ghostie fetch-models` | MIT (OpenAI Whisper) — see model card for authoritative terms |
 | KB-Whisper-large (GGML) | Swedish decode in code-switching | https://huggingface.co/KBLab/kb-whisper-large (KBLab / National Library of Sweden) | Settings ▸ Download models, `ghostie fetch-models` | **Apache-2.0** (verified against the model card metadata, 2026-05-19) |
+| `wespeaker_en_voxceleb_resnet34_LM.onnx` (~27 MB) | Speaker embeddings for diarizing the Participants track | https://github.com/k2-fsa/sherpa-onnx/releases/tag/speaker-recongition-models (ONNX export of https://github.com/wespeaker/wespeaker) | First-launch auto-download, `ghostie fetch-models --diarization` | **Apache-2.0** (WeSpeaker) — see the model card for authoritative terms |
 
 ## Vendored source
 
@@ -49,11 +63,11 @@ terms.
 `onnxruntime_c_api.h` and `onnxruntime_ep_c_api.h` are vendored verbatim
 from ONNX Runtime 1.27.1 — Copyright (c) Microsoft Corporation, **MIT
 License** (https://github.com/microsoft/onnxruntime). Declarations only:
-Ghostie never links or redistributes the ONNX Runtime library itself by
-default; the dylib is loaded at runtime only if the user installed it
-(e.g. `brew install onnxruntime`, MIT). `build-app.sh` can optionally
-bundle `libonnxruntime.dylib` into the `.app` with `GHOSTIE_BUNDLE_ORT=1`
-— if you redistribute such a build, the MIT notice above covers it.
+Ghostie never *links* the ONNX Runtime library — it is dlopened at runtime.
+Released `.app` builds bundle the official Microsoft dylib (see "ONNX
+Runtime" above); a build made with `GHOSTIE_BUNDLE_ORT=0` instead uses
+whatever the user installed themselves (e.g. `brew install onnxruntime`,
+MIT). Either way the MIT notice covers redistribution.
 
 ### VoxLingua107 ECAPA-TDNN language-ID model (optional, user-generated)
 

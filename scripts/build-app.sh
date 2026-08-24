@@ -164,23 +164,44 @@ if [ "$SELFCONTAINED" = "1" ]; then
   # Bundle the ONNX Runtime dylib. On by default since speaker diarization
   # needs it — without it, a downloaded embedding model is inert and the far
   # end silently stays one "Participants" label on every install that has no
-  # Homebrew onnxruntime. Costs ~40 MB in the .dmg. The optional VoxLingua107
-  # LID uses the same runtime. ORTRuntime.swift looks in Contents/Frameworks
-  # first. Set GHOSTIE_BUNDLE_ORT=0 to build without it.
+  # onnxruntime of its own. ORTRuntime.swift dlopens Contents/Frameworks first.
+  # Set GHOSTIE_BUNDLE_ORT=0 to build without it.
+  #
+  # Microsoft's official release, NOT Homebrew's: the Homebrew dylib is linked
+  # against /opt/homebrew/opt/onnx/lib/libonnx.dylib and friends, so bundling
+  # it produces an app that works only on a machine that already has Homebrew's
+  # onnxruntime — the exact machines that did not need it bundled. The official
+  # build depends on system frameworks alone. Pinned, not "latest", so a build
+  # is reproducible; ORTRuntime negotiates the API version at load.
   if [ "${GHOSTIE_BUNDLE_ORT:-1}" = "1" ]; then
-    ORT_DYLIB=""
-    for c in /opt/homebrew/lib/libonnxruntime.dylib /usr/local/lib/libonnxruntime.dylib; do
-      [ -f "$c" ] && ORT_DYLIB="$c" && break
-    done
-    if [ -n "$ORT_DYLIB" ]; then
-      echo "==> Bundling ONNX Runtime ($(basename "$(readlink -f "$ORT_DYLIB")"))"
+    ORT_VERSION="${GHOSTIE_ORT_VERSION:-1.29.0}"
+    ORT_TGZ="$MODEL_CACHE/onnxruntime-osx-arm64-$ORT_VERSION.tgz"
+    ORT_LIB="$MODEL_CACHE/onnxruntime-osx-arm64-$ORT_VERSION/lib/libonnxruntime.$ORT_VERSION.dylib"
+    if [ ! -f "$ORT_LIB" ]; then
+      echo "==> Downloading ONNX Runtime $ORT_VERSION"
+      curl -fL --progress-bar \
+        "https://github.com/microsoft/onnxruntime/releases/download/v$ORT_VERSION/onnxruntime-osx-arm64-$ORT_VERSION.tgz" \
+        -o "$ORT_TGZ" || rm -f "$ORT_TGZ"
+      [ -f "$ORT_TGZ" ] && tar xzf "$ORT_TGZ" -C "$MODEL_CACHE" \
+        "onnxruntime-osx-arm64-$ORT_VERSION/lib/libonnxruntime.$ORT_VERSION.dylib"
+    fi
+    if [ -f "$ORT_LIB" ]; then
+      echo "==> Bundling ONNX Runtime $ORT_VERSION"
       mkdir -p "$APP/Contents/Frameworks"
-      # readlink -f: copy the real versioned dylib, not the symlink chain.
-      cp "$(readlink -f "$ORT_DYLIB")" "$APP/Contents/Frameworks/libonnxruntime.dylib"
+      cp "$ORT_LIB" "$APP/Contents/Frameworks/libonnxruntime.dylib"
+      chmod u+w "$APP/Contents/Frameworks/libonnxruntime.dylib"
+      install_name_tool -id @rpath/libonnxruntime.dylib \
+        "$APP/Contents/Frameworks/libonnxruntime.dylib" 2>/dev/null || true
       NESTED_BINS+=("$APP/Contents/Frameworks/libonnxruntime.dylib")
-      lipo -info "$APP/Contents/Frameworks/libonnxruntime.dylib" | sed 's/^/    /'
+      EXTERNAL_DEPS=$(otool -L "$APP/Contents/Frameworks/libonnxruntime.dylib" \
+        | tail -n +2 | grep -vE "/System/|/usr/lib/|@rpath/libonnxruntime" | wc -l | tr -d " ")
+      if [ "$EXTERNAL_DEPS" != "0" ]; then
+        echo "!! bundled libonnxruntime has $EXTERNAL_DEPS non-system dependencies — it will not load on a clean Mac" >&2
+        exit 1
+      fi
+      echo "    self-contained ($(lipo -info "$APP/Contents/Frameworks/libonnxruntime.dylib" | sed 's/.*: //'))"
     else
-      echo "    No libonnxruntime.dylib found (brew install onnxruntime) — building without it; speaker diarization will be unavailable on installs that lack their own."
+      echo "    Could not fetch ONNX Runtime — building without it; speaker diarization will be unavailable on installs that lack their own."
     fi
   fi
 fi
