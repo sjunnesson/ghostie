@@ -146,9 +146,59 @@ func runSpeakerSelfTest() -> Bool {
     check("junk yields no names", SpeakerNamer.parse("I could not tell.", labels: labels).isEmpty)
     check("labels that were not asked about are ignored",
           SpeakerNamer.parse(#"{"Participant 9":"Bob"}"#, labels: labels).isEmpty)
-    check("two labels may share a name (an over-split speaker)",
+    check("parse keeps a duplicated name — the collision guard, not parse, decides",
           SpeakerNamer.parse(#"{"Participant 1":"Agneta","Participant 2":"Agneta"}"#,
                              labels: labels).count == 2)
+
+    // A name the transcript never says was invented, whatever it looks like.
+    // (It does NOT arbitrate spelling: when whisper writes one name two ways,
+    // both spellings are genuinely present — see the doc comment.)
+    let script = SpeakerNamer.spokenWords(
+        "Hey Paula, good morning. — Morning, David. — Thanks José, that works.")
+    check("a name spoken in the transcript is accepted",
+          SpeakerNamer.isSpoken("Paula", in: script))
+    check("a spelling the transcript does not contain is rejected",
+          !SpeakerNamer.isSpoken("Paola", in: script))
+    check("an invented name is rejected", !SpeakerNamer.isSpoken("Agneta", in: script))
+    check("matching ignores case", SpeakerNamer.isSpoken("paula", in: script))
+    check("a transcript's José accepts Jose, and vice versa",
+          SpeakerNamer.isSpoken("Jose", in: script)
+            && SpeakerNamer.isSpoken("José", in: script))
+    check("only the first token must be spoken (David Sjunnesson)",
+          SpeakerNamer.isSpoken("David Sjunnesson", in: script))
+    check("a surname alone is not enough", !SpeakerNamer.isSpoken("Sjunnesson", in: script))
+    check("an empty name is not spoken", !SpeakerNamer.isSpoken("", in: script))
+    check("a substring of a longer word does not count",
+          !SpeakerNamer.isSpoken("Paul", in: script))
+
+    // Collision guard. Diarization separating two people is the hard part and
+    // is usually right; a name landing on both erases it and attributes one
+    // person's words to the other, invisibly.
+    func collide(_ names: [String: String], facts: Set<String> = [])
+        -> (names: [String: String], dropped: [String]) {
+        SpeakerNamer.resolveCollisions(names, facts: facts)
+    }
+    let clash = collide(["Participant 1": "Agneta", "Participant 2": "Agneta"])
+    check("a name on two labels is dropped from both",
+          clash.names.isEmpty && clash.dropped.sorted() == ["Participant 1", "Participant 2"],
+          "got \(clash)")
+    check("distinct names are all kept",
+          collide(["Participant 1": "Agneta", "Participant 2": "David"]).names.count == 2)
+    check("only the colliding labels are dropped, others survive",
+          collide(["Participant 1": "Agneta", "Participant 2": "Agneta",
+                   "Participant 3": "David"]).names == ["Participant 3": "David"])
+    check("collision ignores case and diacritics (José/jose)",
+          collide(["Participant 1": "José", "Participant 2": "jose"]).names.isEmpty)
+    check("a configured userName is a fact and survives the collision",
+          collide(["Me": "David", "Participant 1": "David"], facts: ["Me"]).names
+            == ["Me": "David"])
+    check("an unconfigured 'Me' is a guess like any other and drops",
+          collide(["Me": "David", "Participant 1": "David"]).names.isEmpty)
+    check("three labels sharing one name all drop",
+          collide(["Participant 1": "A", "Participant 2": "A", "Participant 3": "A"])
+            .names.isEmpty)
+    check("no names in, no names out",
+          collide([:]).names.isEmpty && collide([:]).dropped.isEmpty)
 
     // The guard that matters: a model with no answer must not be allowed to
     // put a confident-looking role on a speaker.

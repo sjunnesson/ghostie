@@ -101,9 +101,23 @@ the same code drives the menu-bar app and the headless daemon.
   "Participants" label.
 - **`SpeakerNamer.swift`** — replaces placeholder labels with names read off
   the transcript by the configured summarization provider. Every failure path
-  keeps the placeholder, and `isPlausibleName` rejects roles, descriptions and
-  anything with a digit, because a wrongly named speaker corrupts the summary
-  built on it.
+  keeps the placeholder, because a wrongly named speaker corrupts the summary
+  built on it. Three guards, all pure + covered by `selftest`:
+  `isPlausibleName` rejects roles, descriptions and anything with a digit;
+  **`isSpoken`** rejects any name the transcript never actually says — the
+  rules already restrict names to people addressing each other, so a name
+  that isn't in the text was invented; it deliberately does *not* arbitrate
+  spelling, because whisper writing one name two ways ("Paula" 5×, "Paola" 4×
+  on the 2026-08-28 call) puts both genuinely in the transcript and only a
+  roster could settle it; and **`resolveCollisions`**
+  drops a name handed to more than one label, since diarization separating two
+  voices is the hard-won part and one name across both erases it — on that
+  call the merged label matched *neither* speaker. Don't "keep the bigger
+  cluster" on a collision: on that same call the bigger one was the other
+  person. The prompt window is the provider's own `maxTranscriptChars` (floor
+  `promptBudget`), not a flat 24 k — the transcript already goes to this
+  provider for the summary, so showing all of it costs no extra exposure and
+  the flat cap was leaving one mention of a participant inside the window.
 - **`WavLevel.swift`** — post-hoc signal probe on the finished WAVs. Catches a
   track that recorded nothing regardless of cause, on every route to a note,
   and puts a ⚠️ line in the meta block (which the summarizer also sees).

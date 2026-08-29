@@ -20,8 +20,16 @@ struct SpeakerNamer {
     /// Names are short. Anything longer is the model explaining itself rather
     /// than answering, and gets dropped.
     static let maxNameLength = 40
-    /// How much transcript to show. Names surface early (greetings) and at
-    /// hand-offs, so the head of the call is worth more than the middle.
+    /// Floor on how much transcript to show; the provider's own
+    /// `maxTranscriptChars` is used when it is larger. Names surface early
+    /// (greetings) and at hand-offs, so when the budget does bind, the head of
+    /// the call is the part worth keeping.
+    ///
+    /// This used to be a flat 24 000 for every provider, which on the
+    /// 2026-08-28 call cut the transcript in half and left exactly one mention
+    /// of one participant's name inside the window — the model was guessing
+    /// from almost nothing. The whole transcript already goes to this same
+    /// provider for the summary, so showing all of it here exposes nothing new.
     static let promptBudget = 24_000
 
     struct Naming {
@@ -57,12 +65,115 @@ struct SpeakerNamer {
         guard let reply = try? provider.complete(
                 system: Self.system,
                 user: Self.user(labels: ask, transcript: transcript,
-                                knownSelf: resolved["Me"])) else {
+                                knownSelf: resolved["Me"],
+                                budget: max(Self.promptBudget,
+                                            provider.maxTranscriptChars))) else {
             Log.info("Speaker naming skipped: the summarization model could not be reached.")
             return resolved.isEmpty ? nil : Naming(names: resolved)
         }
-        for (label, name) in Self.parse(reply, labels: ask) { resolved[label] = name }
-        return Naming(names: resolved)
+        let spoken = Self.spokenWords(transcript)
+        for (label, name) in Self.parse(reply, labels: ask) {
+            guard Self.isSpoken(name, in: spoken) else {
+                Log.info("Speaker naming: dropped \"\(name)\" for \(label) — that name is "
+                    + "never spoken in the transcript.")
+                continue
+            }
+            resolved[label] = name
+        }
+        let (deduped, dropped) = Self.resolveCollisions(
+            resolved, facts: resolved["Me"] != nil && !config.userName.isEmpty ? ["Me"] : [])
+        if !dropped.isEmpty {
+            Log.warn("Speaker naming: \(dropped.sorted().joined(separator: ", ")) "
+                + "came back sharing a name with another speaker — keeping the generic "
+                + "label(s), because a name on the wrong voice corrupts the summary built on it.")
+        }
+        return Naming(names: deduped)
+    }
+
+    /// Every distinct word in the transcript, folded for comparison. Built
+    /// once per call because `isSpoken` is asked about every label.
+    static func spokenWords(_ transcript: String) -> Set<String> {
+        var out: Set<String> = []
+        var current = ""
+        for ch in transcript.folding(options: [.diacriticInsensitive, .caseInsensitive],
+                                     locale: nil) {
+            if ch.isLetter || ch.isNumber { current.append(ch) }
+            else if !current.isEmpty { out.insert(current); current = "" }
+        }
+        if !current.isEmpty { out.insert(current) }
+        return out
+    }
+
+    /// Whether a name is one the transcript actually contains.
+    ///
+    /// The rules already tell the model to take names only from people
+    /// addressing each other or introducing themselves, which means the name
+    /// has to be *in the text*. A name that isn't was invented — from the
+    /// topic, the company, or a plausible-sounding guess — and no other guard
+    /// here catches that.
+    ///
+    /// What it deliberately does **not** do is adjudicate spelling. When
+    /// whisper writes one spoken name two ways — the 2026-08-28 call has both
+    /// "Paula" (5×) and "Paola" (4×) for the same person — both are genuinely
+    /// in the transcript and this has no basis for preferring either. Fixing
+    /// that needs a source of truth outside the audio, e.g. the meeting
+    /// roster; don't reach for a fuzzy match here, which would just as happily
+    /// merge two people with similar names.
+    ///
+    /// Only the first token has to appear: people are addressed by first name
+    /// and the model may reasonably return "David Sjunnesson" from a signature
+    /// or a calendar-style introduction. Comparison ignores case and
+    /// diacritics, so a transcript's "José" accepts "Jose". Static + pure for
+    /// the self-test.
+    static func isSpoken(_ name: String, in spoken: Set<String>) -> Bool {
+        guard let first = name.split(whereSeparator: { !$0.isLetter && !$0.isNumber }).first
+        else { return false }
+        return spoken.contains(String(first).folding(
+            options: [.diacriticInsensitive, .caseInsensitive], locale: nil))
+    }
+
+    /// Drops any name the model handed to more than one label.
+    ///
+    /// Diarization splitting two people apart is the hard-won part, and it is
+    /// usually right: on the 2026-08-28 call its clusters matched the meeting
+    /// roster 77% and 69% of the time. When the naming pass then puts one name
+    /// on both, that distinction is erased and every word either person said
+    /// is attributed to whoever got the name — on that call the merged label
+    /// matched *neither* speaker (54% one, 27% the other, 13% a third).
+    ///
+    /// There is no way to tell which label the name was meant for, and picking
+    /// the talkative one is not a tiebreak — it would have been wrong on
+    /// exactly that call, where the larger cluster was the *other* person. So
+    /// every label in a collision keeps its placeholder. A transcript labelled
+    /// "Participant 1" is honest; one that merges two people under a single
+    /// name is not, and nothing downstream can tell.
+    ///
+    /// A name from config (`userName`) is a fact rather than a guess, so it
+    /// survives and only the guesses colliding with it are dropped.
+    /// Comparison ignores case and diacritics, so "José"/"Jose" collide.
+    /// Static + pure for the self-test.
+    static func resolveCollisions(_ names: [String: String], facts: Set<String>)
+        -> (names: [String: String], dropped: [String]) {
+        var byName: [String: [String]] = [:]
+        for (label, name) in names {
+            let key = name.folding(options: [.diacriticInsensitive, .caseInsensitive],
+                                   locale: nil)
+                .trimmingCharacters(in: .whitespaces)
+            byName[key, default: []].append(label)
+        }
+        var out = names
+        var dropped: [String] = []
+        for (_, labels) in byName where labels.count > 1 {
+            let fact = labels.filter { facts.contains($0) }
+            // Exactly one fact keeps its name; zero facts (or a fact colliding
+            // with another fact, which config cannot produce today) drops all.
+            let survivors = fact.count == 1 ? Set(fact) : Set<String>()
+            for label in labels where !survivors.contains(label) {
+                out[label] = nil
+                dropped.append(label)
+            }
+        }
+        return (out, dropped)
     }
 
     // MARK: - Prompt
@@ -86,15 +197,17 @@ struct SpeakerNamer {
     - Never infer a name from the topic, the company, or who is being \
       discussed. Only from who is being addressed or who introduces themselves.
     - People mentioned but not speaking must not be assigned to a label.
-    - Two labels may share a name if the transcript makes clear they are one \
-      person split in two.
+    - Each label is a different voice. Never give the same name to two \
+      labels. If you cannot tell which of two labels a name belongs to, put \
+      it on neither — use "" for both.
 
     Example reply: {"Me": "David", "Participant 1": "Agneta", "Participant 2": ""}
     """
 
-    static func user(labels: [String], transcript: String, knownSelf: String?) -> String {
+    static func user(labels: [String], transcript: String, knownSelf: String?,
+                     budget: Int = promptBudget) -> String {
         var head = transcript
-        if head.count > promptBudget { head = String(head.prefix(promptBudget)) }
+        if head.count > budget { head = String(head.prefix(budget)) }
         var s = "Labels to identify: \(labels.joined(separator: ", "))\n"
         if let knownSelf {
             s += "\nAlready known: the local speaker (\"Me\") is \(knownSelf).\n"
