@@ -48,6 +48,10 @@ final class CallDetector {
     /// when the call confirmed. Engine reads it in its onCallStart handler
     /// and threads it into the note's name; nil for a custom trigger app.
     func currentCallSource() -> CallSource? { coordinator.currentCallSource() }
+    /// Everyone the meeting window named during this call; empty when there
+    /// was no readable roster (see `AXParticipantRosterProvider`).
+    func currentRoster() -> MeetingRoster { coordinator.currentRoster() }
+    func clearRoster() { coordinator.clearRoster() }
 
     /// System default input device id (used by `cmdDoctor`).
     static func defaultInputDevice() -> AudioDeviceID? {

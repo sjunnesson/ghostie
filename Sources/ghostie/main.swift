@@ -79,6 +79,37 @@ func cmdTestRecord(_ config: Config, seconds: Double) {
     }
 }
 
+/// `ghostie roster-probe` — what `AXParticipantRosterProvider` can see right
+/// now. Meant to be run while a browser meeting is on screen; prints nothing
+/// interesting otherwise, which is itself the answer.
+func cmdRosterProbe(_ config: Config) {
+    guard AXIsProcessTrusted() else {
+        Log.error("Accessibility permission not granted — System Settings ▸ Privacy & Security ▸ Accessibility.")
+        exit(1)
+    }
+    let browsers = NSWorkspace.shared.runningApplications.compactMap { app -> RunningAppInfo? in
+        guard let bid = app.bundleIdentifier?.lowercased(),
+              config.browserBundleIds.map({ $0.lowercased() }).contains(bid)
+        else { return nil }
+        return RunningAppInfo(pid: app.processIdentifier, bundleId: bid)
+    }
+    guard !browsers.isEmpty else {
+        print("No configured browser is running (browserBundleIds: \(config.browserBundleIds.joined(separator: ", ")))")
+        return
+    }
+    print("Probing \(browsers.count) browser(s): \(browsers.map(\.bundleId).joined(separator: ", "))")
+    let roster = AXParticipantRosterProvider().roster(browsers: browsers)
+    if roster.isEmpty {
+        print("No participant roster found.")
+        print("  In Google Meet the tiles carry names on their own; opening the")
+        print("  People panel gives the complete list and marks which one is you.")
+    } else {
+        print("Roster:")
+        for n in roster.others { print("  • \(n)") }
+        if let me = roster.selfName { print("  • \(me)  (you)") }
+    }
+}
+
 func cmdProcess(_ config: Config, dir: String) {
     let url = URL(fileURLWithPath: dir)
     let mic = url.appendingPathComponent("me.wav")
@@ -703,6 +734,10 @@ case "icon":
     // Hidden: render the app icon PNG (used by scripts/build-app.sh).
     let out = args.count > 1 ? args[1] : "icon.png"
     exit(GhostIcon.writeAppIconPNG(to: out) ? 0 : 1)
+case "roster-probe":
+    // Hidden: read the meeting roster out of every running browser, once.
+    // Run it during a real call to see what the AX rules find.
+    cmdRosterProbe(config)
 case "diarize-probe":
     // Hidden: cluster a WAV's speakers on fixed segments and print a timeline.
     guard args.count > 1 else {

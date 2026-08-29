@@ -99,6 +99,24 @@ the same code drives the menu-bar app and the headless daemon.
   The 0.70 merge threshold is measured, not guessed — see the doc comment.
   Entirely optional: no ONNX runtime or no model means the far end keeps one
   "Participants" label.
+- **`Detection/AXParticipantRosterProvider.swift`** — reads who is in the
+  meeting off the meeting window over AX, so naming picks from a closed set
+  instead of guessing. Verified against Google Meet in Chrome (2026-08-29):
+  Chrome builds its web a11y tree on demand once AX queries arrive (no
+  `AXManualAccessibility` poke — that attribute is gone, setting it returns
+  -25205). **The People side panel is the only source that actually works**:
+  `AXList ⟨Participants⟩` → one `AXGroup` per person titled with their name,
+  `(You)` marking the local user. With the panel closed a solo Meet exposed no
+  participant name at all, and the per-tile `More options for <Name>` button
+  proved hover-transient — that rule is kept but nothing relies on it, and it
+  needs a real multi-person call to verify (`ghostie roster-probe`, hidden
+  subcommand, prints what the rules can see right now). The coordinator
+  samples every 20 s while a browser meeting tab is up and unions the result,
+  so opening the panel once during a call is enough; Engine reads it at stop
+  and threads it to `Pipeline` → `SpeakerNamer`, and `Backlog.Meta` carries it
+  so a retry names speakers identically. No roster is the normal case (desktop
+  Teams/Zoom, panel never opened, AX denied) and costs nothing. The rules are
+  pure over `RosterNode` and covered by `selftest`.
 - **`SpeakerNamer.swift`** — replaces placeholder labels with names read off
   the transcript by the configured summarization provider. Every failure path
   keeps the placeholder, because a wrongly named speaker corrupts the summary
@@ -118,6 +136,13 @@ the same code drives the menu-bar app and the headless daemon.
   `promptBudget`), not a flat 24 k — the transcript already goes to this
   provider for the summary, so showing all of it costs no extra exposure and
   the flat cap was leaving one mention of a participant inside the window.
+  When a roster is available it goes in the prompt and **replaces `isSpoken`
+  as the membership test**: `rosterMatch` resolves a first name to the
+  meeting's own spelling (settling what the transcript cannot when whisper
+  writes one name two ways), falls back to the full name when two people share
+  a first name, and refuses anyone not in the call. `completeFromRoster` then
+  fills the last label by elimination — only when exactly one label and
+  exactly one roster name are left, which is deduction rather than guessing.
 - **`WavLevel.swift`** — post-hoc signal probe on the finished WAVs. Catches a
   track that recorded nothing regardless of cause, on every route to a note,
   and puts a ⚠️ line in the meta block (which the summarizer also sees).

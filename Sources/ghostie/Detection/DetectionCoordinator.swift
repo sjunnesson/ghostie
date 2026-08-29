@@ -58,6 +58,20 @@ final class DetectionCoordinator {
     private let sourceLock = NSLock()
     private var sourceAtCallStart: CallSource?   // sourceLock-guarded
 
+    /// Who the meeting window says is in the call, unioned over the whole
+    /// session. Unlike `CallSource` this is NOT frozen at confirm: people join
+    /// late, and the roster is only readable while whichever UI carries it
+    /// (the People panel, the tiles) happens to be on screen — so it is
+    /// sampled repeatedly and only ever grows. sourceLock-guarded, for the
+    /// same reason the frozen source is: Engine reads it from inside a
+    /// coordinator callback running on `queue`.
+    private let participants: ParticipantRosterProvider
+    private var rosterSoFar = MeetingRoster()    // sourceLock-guarded
+    private var lastRosterSampleAt: TimeInterval = -.greatestFiniteMagnitude
+    /// The roster changes on the timescale of people joining, not of audio
+    /// evidence, and the AX walk is by far the most expensive probe here.
+    private static let rosterSampleIntervalSeconds: TimeInterval = 20
+
     var onCallStart: ((UUID) -> Void)?
     var onCallStop: ((UUID) -> Void)?
     var onTentativeStart: ((UUID) -> Void)?
@@ -82,6 +96,7 @@ final class DetectionCoordinator {
          device: DefaultInputDeviceProvider = CoreAudioDefaultDeviceProvider(),
          presence: AppPresenceProvider? = nil,
          tabs: BrowserTabProvider = AXBrowserTabProvider(),
+         participants: ParticipantRosterProvider = AXParticipantRosterProvider(),
          clock: Clock = SystemClock()) {
         let mainIds = config.triggerBundleIds.map { $0.lowercased() }
         // Browser meetings (Teams / Google Meet tabs) are opt-in: with the
@@ -95,6 +110,7 @@ final class DetectionCoordinator {
         self.camera = camera
         self.device = device
         self.tabs = tabs
+        self.participants = participants
         self.clock = clock
         var smConfig = CallStateMachine.Config()
         smConfig.endGraceSeconds = config.endGraceSeconds
@@ -112,7 +128,12 @@ final class DetectionCoordinator {
             guard let self else { return }
             // Fires on `queue` from inside evaluate(), so `lastSource` is
             // the source of the exact evidence that promoted this call.
-            self.sourceLock.withLock { self.sourceAtCallStart = self.lastSource }
+            self.sourceLock.withLock {
+                self.sourceAtCallStart = self.lastSource
+                // Keep whatever this call has already contributed: the tab
+                // probe (and therefore the roster) runs from `candidate`
+                // onward, so the pre-confirm samples belong to this call.
+            }
             let app = self.lastSource?.rawValue ?? "meeting app"
             Log.ok("Call detected (\(app), session \(sid.uuidString.prefix(8))) — starting capture.")
             self.onCallStart?(sid)
@@ -269,6 +290,7 @@ final class DetectionCoordinator {
             }
         }
         let browserTabPids: [pid_t] = browserTabHits.keys.sorted()
+        sampleRosterIfDue(browserTabHits: browserTabHits, apps: allApps)
         let primaryAudio = primaryNativeAudio || !browserTabPids.isEmpty
         lastSource = Self.deriveSource(audio: audioProcs,
                                        matchers: triggerBundleMatchers,
@@ -339,6 +361,45 @@ final class DetectionCoordinator {
     /// inside the coordinator's own callbacks, which run on `queue`.
     func currentCallSource() -> CallSource? {
         sourceLock.withLock { sourceAtCallStart }
+    }
+
+    /// Everyone the meeting window has named during this call. Empty is the
+    /// normal answer for a desktop Teams/Zoom call, for a browser call whose
+    /// roster UI was never on screen, and whenever AX is not granted.
+    func currentRoster() -> MeetingRoster {
+        sourceLock.withLock { rosterSoFar }
+    }
+
+    /// Clears the accumulated roster so the next call starts from nothing.
+    /// Called when a session ends rather than when one begins, so the value
+    /// is still readable from Engine's stop handler.
+    func clearRoster() {
+        sourceLock.withLock { rosterSoFar = MeetingRoster() }
+    }
+
+    /// Walk the meeting browser's AX tree for participant names, at most
+    /// every `rosterSampleIntervalSeconds`. Only browsers the tab probe just
+    /// flagged are walked, so this never touches an ordinary browser window.
+    private func sampleRosterIfDue(browserTabHits: [pid_t: CallSource],
+                                   apps: [RunningAppInfo]) {
+        guard !browserTabHits.isEmpty else { return }
+        let now = clock.now
+        guard now - lastRosterSampleAt >= Self.rosterSampleIntervalSeconds else { return }
+        lastRosterSampleAt = now
+        let meetingBrowsers = apps.filter { browserTabHits[$0.pid] != nil }
+        guard !meetingBrowsers.isEmpty else { return }
+        let found = participants.roster(browsers: meetingBrowsers)
+        guard !found.isEmpty else { return }
+        sourceLock.withLock {
+            let before = rosterSoFar
+            rosterSoFar = before.merged(with: found)
+            if rosterSoFar != before {
+                Log.info("Meeting roster: "
+                    + (rosterSoFar.others.isEmpty ? "(no other participants named)"
+                       : rosterSoFar.others.joined(separator: ", "))
+                    + (rosterSoFar.selfName.map { " (you: \($0))" } ?? ""))
+            }
+        }
     }
 
     /// Which app the evidence points at: the trigger app actually holding the

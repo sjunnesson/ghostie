@@ -126,12 +126,25 @@ final class FakeDetectionWorld {
     let presence = Presence()
     let ax = AX()
     let tabs = Tabs()
+    /// Roster reads are pure AX in production; the fake keeps the selftest
+    /// off the real accessibility API and lets a test hand the coordinator a
+    /// participant list.
+    final class Participants: ParticipantRosterProvider {
+        var value = MeetingRoster()
+        var calls = 0
+        func roster(browsers: [RunningAppInfo]) -> MeetingRoster {
+            calls += 1
+            return value
+        }
+    }
+    let participants = Participants()
     let clock = VirtualClock()
 
     /// A real coordinator wired entirely to the fakes.
     func makeCoordinator(config: Config = Config()) -> DetectionCoordinator {
         DetectionCoordinator(config: config, audio: audio, ax: ax,
                              camera: camera, device: device,
-                             presence: presence, tabs: tabs, clock: clock)
+                             presence: presence, tabs: tabs,
+                             participants: participants, clock: clock)
     }
 }

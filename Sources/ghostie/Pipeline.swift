@@ -45,18 +45,19 @@ struct Pipeline {
 
     @discardableResult
     func process(_ rec: AudioRecorder.Result, startedAt: Date,
-                 source: String = "Call") -> URL? {
+                 source: String = "Call",
+                 roster: MeetingRoster = MeetingRoster()) -> URL? {
         let durationMins = String(format: "%.1f", rec.duration / 60.0)
         Log.info("Processing recording (\(durationMins) min) at \(rec.sessionDir.lastPathComponent)…")
 
         let lines: [Line]
         do {
-            lines = try transcribeMerge(mic: rec.micWav, sys: rec.systemWav)
+            lines = try transcribeMerge(mic: rec.micWav, sys: rec.systemWav, roster: roster)
         } catch {
             Log.error("Transcription failed: \(error.localizedDescription) — queued to backlog")
             Backlog.enqueueAudio(micWav: rec.micWav, systemWav: rec.systemWav,
                                  startedAt: startedAt, durationMins: durationMins,
-                                 source: source,
+                                 source: source, roster: roster,
                                  copyingOriginals: config.keepAudio)
             let url = writeNote(meta: metaBlock(startedAt, durationMins,
                                                 mic: rec.micWav, sys: rec.systemWav),
@@ -80,7 +81,8 @@ struct Pipeline {
         }
 
         let url = finishWithSummary(startedAt: startedAt, durationMins: durationMins,
-                                    meta: meta, transcript: transcript, source: source)
+                                    meta: meta, transcript: transcript, source: source,
+                                    roster: roster)
         cleanup(rec.sessionDir)
         return url
     }
@@ -90,7 +92,8 @@ struct Pipeline {
     @discardableResult
     private func finishWithSummary(startedAt: Date, durationMins: String,
                                    meta: String, transcript: String,
-                                   source: String) -> URL? {
+                                   source: String,
+                                   roster: MeetingRoster = MeetingRoster()) -> URL? {
         let summarizer = Summarizer(config: config)
         do {
             guard summarizer.isConfigured else {
@@ -106,7 +109,7 @@ struct Pipeline {
             Log.error("Summary unavailable: \(error.localizedDescription) — queued to backlog")
             Backlog.enqueueTranscript(startedAt: startedAt,
                                       durationMins: durationMins, transcript: transcript,
-                                      source: source)
+                                      source: source, roster: roster)
             let banner = "> ⏳ **Summary queued.** Claude Code wasn't available (\(error.localizedDescription)). Ghostie will add the analysis automatically once it can run again — the full transcript below is already complete."
             return writeNote(meta: meta, summary: banner,
                              transcript: transcript, startedAt: startedAt,
@@ -145,7 +148,8 @@ struct Pipeline {
             switch entry.meta.stage {
             case "transcribe":
                 guard let lines = try? p.transcribeMerge(mic: entry.micWav,
-                                                         sys: entry.systemWav) else {
+                                                         sys: entry.systemWav,
+                                                         roster: entry.meta.meetingRoster) else {
                     Backlog.bump(entry)            // whisper still unavailable
                     continue
                 }
@@ -291,7 +295,8 @@ struct Pipeline {
     /// code-switching is enabled the dual-model pipeline replaces the single
     /// whisper pass; per-track cleaning + the timestamp merge are unchanged so
     /// the cleaner and summary see the same shape either way.
-    private func transcribeMerge(mic: URL, sys: URL) throws -> [Line] {
+    private func transcribeMerge(mic: URL, sys: URL,
+                                 roster: MeetingRoster = MeetingRoster()) throws -> [Line] {
         func cleaned(_ raw: [Transcriber.Segment], _ speaker: String)
             -> [(startMs: Int, text: String)] {
             guard config.cleanTranscript else {
@@ -346,7 +351,7 @@ struct Pipeline {
         // into turns, then put the punctuation back if whisper dropped into
         // its unpunctuated register. Both run before naming so the naming
         // prompt — and the summary built on it — see the readable transcript.
-        return named(refined(Self.merge(lines)))
+        return named(refined(Self.merge(lines)), roster: roster)
     }
 
     /// Coalesce segments into turns, then repunctuate when the transcript
@@ -411,11 +416,11 @@ struct Pipeline {
     /// Replaces placeholder labels with real names, when they can be
     /// established from the conversation. Anything that cannot be named keeps
     /// its placeholder.
-    private func named(_ lines: [Line]) -> [Line] {
+    private func named(_ lines: [Line], roster: MeetingRoster = MeetingRoster()) -> [Line] {
         var labels: [String] = []
         for l in lines where !labels.contains(l.speaker) { labels.append(l.speaker) }
         guard let naming = SpeakerNamer(config: config)
-                .name(labels: labels, transcript: render(lines)),
+                .name(labels: labels, transcript: render(lines), roster: roster),
               !naming.names.isEmpty else { return lines }
         Log.info(naming.summary)
         return lines.map {

@@ -37,6 +37,15 @@ enum Backlog {
         /// back to "Teams", the label those entries' queued notes were
         /// written under, so the upgrade-in-place name still matches.
         var source: String?
+        /// Who the meeting window said was in the call. Optional for the same
+        /// reason `source` is — entries queued before rosters existed decode
+        /// to nil and simply name speakers the old way on retry.
+        var roster: [String]?
+        var rosterSelf: String?
+
+        var meetingRoster: MeetingRoster {
+            MeetingRoster(others: roster ?? [], selfName: rosterSelf)
+        }
     }
 
     struct Entry {
@@ -95,6 +104,7 @@ enum Backlog {
     static func enqueueAudio(micWav: URL, systemWav: URL,
                              startedAt: Date, durationMins: String,
                              source: String,
+                             roster: MeetingRoster = MeetingRoster(),
                              copyingOriginals: Bool = false) {
         ensureRoot()
         let dir = URL(fileURLWithPath: root)
@@ -114,13 +124,16 @@ enum Backlog {
         }
         writeMeta(Meta(startedAt: startedAt.timeIntervalSince1970,
                        durationMins: durationMins, stage: "transcribe",
-                       attempts: 0, source: source), to: dir)
+                       attempts: 0, source: source,
+                       roster: roster.others.isEmpty ? nil : roster.others,
+                       rosterSelf: roster.selfName), to: dir)
         Log.info("Queued recording to backlog (transcription pending): \(dir.lastPathComponent)")
     }
 
     /// Queue a finished transcript whose summary failed (audio not needed).
     static func enqueueTranscript(startedAt: Date, durationMins: String,
-                                  transcript: String, source: String) {
+                                  transcript: String, source: String,
+                                  roster: MeetingRoster = MeetingRoster()) {
         ensureRoot()
         let dir = URL(fileURLWithPath: root)
             .appendingPathComponent(stamp.string(from: startedAt))
@@ -129,7 +142,9 @@ enum Backlog {
                               atomically: true, encoding: .utf8)
         writeMeta(Meta(startedAt: startedAt.timeIntervalSince1970,
                        durationMins: durationMins, stage: "summarize",
-                       attempts: 0, source: source), to: dir)
+                       attempts: 0, source: source,
+                       roster: roster.others.isEmpty ? nil : roster.others,
+                       rosterSelf: roster.selfName), to: dir)
         Log.info("Queued transcript to backlog (summary pending): \(dir.lastPathComponent)")
     }
 

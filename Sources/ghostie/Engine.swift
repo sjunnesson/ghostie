@@ -404,11 +404,16 @@ final class Engine: @unchecked Sendable {
                 // the count is visibly nonzero before the pipeline can start
                 // (otherwise swapIsSafe() has a microsecond window of "idle").
                 let sourceLabel = callSource?.rawValue ?? "Call"
+                // Read before clearing: the roster accumulates across the
+                // whole session and this is the last moment it is available.
+                let roster = self.detector.currentRoster()
+                self.detector.clearRoster()
                 self.gate.async {
                     self.processingCount += 1
                     self.settleStateLocked()
                     self.work.async {
-                        let note = Pipeline(config: Config.load()).process(result, startedAt: started, source: sourceLabel)
+                        let note = Pipeline(config: Config.load()).process(
+                            result, startedAt: started, source: sourceLabel, roster: roster)
                         if let note {
                             self.lastNote = note
                             self.callsProcessed += 1

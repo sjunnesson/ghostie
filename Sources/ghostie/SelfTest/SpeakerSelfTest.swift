@@ -221,6 +221,106 @@ func runSpeakerSelfTest() -> Bool {
     check("a configured userName names Me without a provider",
           selfOnly?.names == ["Me": "David"], "\(String(describing: selfOnly?.names))")
 
+    // ------------------------------------------------- Meeting roster (AX)
+    //
+    // The fixture mirrors the tree measured in Google Meet on 2026-08-29 (see
+    // AXParticipantRosterProvider) so the rules are pinned to real structure,
+    // not to what seemed plausible.
+    func node(_ role: String, _ title: String = "",
+              _ kids: [RosterNode] = []) -> RosterNode {
+        RosterNode(role: role, title: title, children: kids)
+    }
+    func row(_ name: String, isSelf: Bool = false, host: Bool = false) -> RosterNode {
+        var texts = [node("AXStaticText", name)]
+        if isSelf { texts.append(node("AXStaticText", "(You)")) }
+        if host { texts.append(node("AXStaticText", "Meeting host")) }
+        return node("AXGroup", name, texts)
+    }
+    let panel = node("AXGroup", "Side panel", [
+        node("AXHeading", "People | 2"),
+        node("AXButton", "Add people"),
+        node("AXGroup", "In call", [
+            node("AXList", "Participants", [
+                row("David Sjunnesson", isSelf: true, host: true),
+                row("Jose Chavarría"),
+                row("Paula Te"),
+            ])
+        ])
+    ])
+    let fromPanel = RosterHeuristics.roster(in: panel)
+    check("roster: the People panel yields every participant",
+          fromPanel.others == ["Jose Chavarría", "Paula Te"], "\(fromPanel)")
+    check("roster: (You) marks the local speaker, who is not an 'other'",
+          fromPanel.selfName == "David Sjunnesson")
+
+    let tiles = node("AXGroup", "", [
+        node("AXPopUpButton", "More options for Jose Chavarría"),
+        node("AXPopUpButton", "More options for Paula Te"),
+        node("AXButton", "Turn off microphone"),
+    ])
+    check("roster: video tiles yield names with the panel closed",
+          RosterHeuristics.roster(in: tiles).others == ["Jose Chavarría", "Paula Te"])
+    check("roster: an ordinary control is not mistaken for a tile",
+          RosterHeuristics.tileName(node("AXButton", "Turn off microphone")) == nil)
+
+    // A list of something else must not be read as a roster. This is the
+    // whole reason the rule requires the group title to repeat as a child
+    // label rather than just taking every AXGroup title it finds.
+    let chatList = node("AXList", "Messages", [
+        node("AXGroup", "Send a message", [node("AXStaticText", "Hello everyone")]),
+        node("AXGroup", "Reply", [node("AXStaticText", "Sounds good")]),
+    ])
+    check("roster: a list whose group titles are not echoed as labels is ignored",
+          RosterHeuristics.participantList(chatList) == nil)
+    check("roster: a non-list node is never a roster",
+          RosterHeuristics.participantList(node("AXGroup", "Participants")) == nil)
+    check("roster: an empty tree yields an empty roster",
+          RosterHeuristics.roster(in: node("AXGroup")).isEmpty)
+    check("roster: implausible names are filtered out",
+          RosterHeuristics.roster(in: node("AXGroup", "", [
+              node("AXPopUpButton", "More options for Speaker 2")])).others.isEmpty)
+    check("roster: merging unions and keeps first-seen order",
+          MeetingRoster(others: ["A"], selfName: nil)
+            .merged(with: MeetingRoster(others: ["B", "A"], selfName: "Me"))
+            == MeetingRoster(others: ["A", "B"], selfName: "Me"))
+
+    // --------------------------------------------- Roster-constrained naming
+    let team = ["Jose Chavarría", "Paula Te"]
+    check("rosterMatch: a first name resolves to the roster's own spelling",
+          SpeakerNamer.rosterMatch("Jose", in: team) == "Jose")
+    check("rosterMatch: diacritics and case are ignored",
+          SpeakerNamer.rosterMatch("josé", in: team) == "Jose")
+    check("rosterMatch: the meeting's spelling wins over the model's",
+          SpeakerNamer.rosterMatch("Paula", in: team) == "Paula")
+    check("rosterMatch: a name nobody in the meeting has is refused",
+          SpeakerNamer.rosterMatch("Paola", in: team) == nil)
+    check("rosterMatch: someone merely mentioned is refused",
+          SpeakerNamer.rosterMatch("Michael", in: team) == nil)
+    check("rosterMatch: a shared first name falls back to the full name",
+          SpeakerNamer.rosterMatch("Anna", in: ["Anna Berg", "Anna Lind"]) == "Anna Berg")
+    check("rosterMatch: an empty name matches nothing",
+          SpeakerNamer.rosterMatch("", in: team) == nil)
+
+    let roster2 = MeetingRoster(others: team, selfName: "David Sjunnesson")
+    check("completeFromRoster: the last label takes the last unused name",
+          SpeakerNamer.completeFromRoster(["Participant 1": "Jose"],
+                                          labels: ["Participant 1", "Participant 2"],
+                                          roster: roster2)["Participant 2"] == "Paula",
+          "\(SpeakerNamer.completeFromRoster(["Participant 1": "Jose"], labels: ["Participant 1", "Participant 2"], roster: roster2))")
+    check("completeFromRoster: two open labels are left alone",
+          SpeakerNamer.completeFromRoster([:],
+                                          labels: ["Participant 1", "Participant 2"],
+                                          roster: roster2).isEmpty)
+    check("completeFromRoster: one open label but two unused names does nothing",
+          SpeakerNamer.completeFromRoster(["Participant 1": "Jose"],
+                                          labels: ["Participant 1", "Participant 2"],
+                                          roster: MeetingRoster(others: team + ["Sam Ek"]))
+            .count == 1)
+    check("completeFromRoster: without a roster nothing is inferred",
+          SpeakerNamer.completeFromRoster(["Participant 1": "Jose"],
+                                          labels: ["Participant 1", "Participant 2"],
+                                          roster: MeetingRoster()).count == 1)
+
     print("speaker self-test: \(passed) passed, \(failed) failed")
     return failed == 0
 }

@@ -45,15 +45,25 @@ struct SpeakerNamer {
 
     /// Maps `labels` onto real names. Returns nil when naming is off or
     /// unavailable, which leaves every label untouched.
-    func name(labels: [String], transcript: String) -> Naming? {
+    ///
+    /// `roster`, when the meeting window gave us one, turns this from an open
+    /// question into a closed one: the answer has to come from the list of
+    /// people actually in the call, spelled the way the meeting spelled it.
+    func name(labels: [String], transcript: String,
+              roster: MeetingRoster = MeetingRoster()) -> Naming? {
         guard config.nameSpeakers, !labels.isEmpty else { return nil }
 
         // A configured name for the local speaker is a fact, not a guess — it
         // is applied whether or not the model can be reached.
         var resolved: [String: String] = [:]
         var ask = labels
-        if !config.userName.isEmpty, let me = labels.first(where: { $0 == "Me" }) {
-            resolved[me] = config.userName.trimmingCharacters(in: .whitespaces)
+        // Configured name first, then the roster's own "(You)" — both are
+        // read off something authoritative rather than inferred from speech.
+        let localName = !config.userName.isEmpty
+            ? config.userName.trimmingCharacters(in: .whitespaces)
+            : roster.selfName
+        if let localName, !localName.isEmpty, let me = labels.first(where: { $0 == "Me" }) {
+            resolved[me] = localName
             ask.removeAll { $0 == me }
         }
         guard !ask.isEmpty else { return Naming(names: resolved) }
@@ -66,6 +76,7 @@ struct SpeakerNamer {
                 system: Self.system,
                 user: Self.user(labels: ask, transcript: transcript,
                                 knownSelf: resolved["Me"],
+                                roster: roster,
                                 budget: max(Self.promptBudget,
                                             provider.maxTranscriptChars))) else {
             Log.info("Speaker naming skipped: the summarization model could not be reached.")
@@ -73,13 +84,29 @@ struct SpeakerNamer {
         }
         let spoken = Self.spokenWords(transcript)
         for (label, name) in Self.parse(reply, labels: ask) {
-            guard Self.isSpoken(name, in: spoken) else {
-                Log.info("Speaker naming: dropped \"\(name)\" for \(label) — that name is "
-                    + "never spoken in the transcript.")
-                continue
+            // With a roster, membership in it replaces the "was it spoken"
+            // test: the roster is the stronger claim, and it also settles
+            // spelling, which the transcript cannot when whisper wrote one
+            // name two ways.
+            if roster.others.isEmpty {
+                guard Self.isSpoken(name, in: spoken) else {
+                    Log.info("Speaker naming: dropped \"\(name)\" for \(label) — that name is "
+                        + "never spoken in the transcript.")
+                    continue
+                }
+                resolved[label] = name
+            } else if let match = Self.rosterMatch(name, in: roster.others) {
+                if match != name {
+                    Log.info("Speaker naming: \(label) → \"\(match)\" (the meeting's "
+                        + "spelling; the model said \"\(name)\").")
+                }
+                resolved[label] = match
+            } else {
+                Log.info("Speaker naming: dropped \"\(name)\" for \(label) — nobody by "
+                    + "that name is in the meeting roster.")
             }
-            resolved[label] = name
         }
+        resolved = Self.completeFromRoster(resolved, labels: labels, roster: roster)
         let (deduped, dropped) = Self.resolveCollisions(
             resolved, facts: resolved["Me"] != nil && !config.userName.isEmpty ? ["Me"] : [])
         if !dropped.isEmpty {
@@ -88,6 +115,63 @@ struct SpeakerNamer {
                 + "label(s), because a name on the wrong voice corrupts the summary built on it.")
         }
         return Naming(names: deduped)
+    }
+
+    /// The roster entry a model-supplied name refers to, rendered the way it
+    /// should appear in the transcript, or nil if the roster has no such
+    /// person.
+    ///
+    /// Matching is on the first token, folded for case and diacritics, which
+    /// is how people are addressed out loud: a roster of "Jose Chavarría"
+    /// accepts "Jose". The returned label is the roster's *own* first name, so
+    /// the meeting's spelling wins over whatever whisper or the model
+    /// produced. Full names are used when two people share a first name,
+    /// because "Anna" heading two speakers is the collision this whole guard
+    /// exists to prevent. Static + pure for the self-test.
+    static func rosterMatch(_ name: String, in roster: [String]) -> String? {
+        func first(_ s: String) -> String {
+            (s.split(whereSeparator: { !$0.isLetter && !$0.isNumber }).first).map {
+                String($0).folding(options: [.diacriticInsensitive, .caseInsensitive],
+                                   locale: nil)
+            } ?? ""
+        }
+        let key = first(name)
+        guard !key.isEmpty else { return nil }
+        let hits = roster.filter { first($0) == key }
+        guard let entry = hits.first else { return nil }
+        if hits.count > 1 { return entry }          // ambiguous first name → full name
+        // Unique: render the roster's own spelling of the first name.
+        guard let token = entry.split(whereSeparator: { !$0.isLetter && !$0.isNumber }).first
+        else { return entry }
+        return String(token)
+    }
+
+    /// Fills in the last label when the roster leaves exactly one possibility.
+    ///
+    /// With a roster this is deduction, not guessing: if every label but one
+    /// has a name and exactly one person in the meeting is still unaccounted
+    /// for, the remaining label is that person. It is what rescues the case
+    /// the model half-answers — on the 2026-08-28 call it names one speaker
+    /// confidently and returns a mis-spelling for the other, which the roster
+    /// check then drops. Deliberately narrow: two or more open labels, or two
+    /// or more unused names, and nothing is assigned. Static + pure.
+    static func completeFromRoster(_ resolved: [String: String],
+                                   labels: [String],
+                                   roster: MeetingRoster) -> [String: String] {
+        guard !roster.others.isEmpty else { return resolved }
+        let open = labels.filter { resolved[$0] == nil }
+        let used = Set(resolved.values)
+        let unused = roster.others.filter { entry in
+            !used.contains { rosterMatch($0, in: [entry]) != nil }
+        }
+        guard open.count == 1, unused.count == 1, let label = open.first,
+              let entry = unused.first, let name = rosterMatch(entry, in: roster.others)
+        else { return resolved }
+        var out = resolved
+        out[label] = name
+        Log.info("Speaker naming: \(label) → \"\(name)\" by elimination — the only "
+            + "person in the roster not already accounted for.")
+        return out
     }
 
     /// Every distinct word in the transcript, folded for comparison. Built
@@ -205,12 +289,19 @@ struct SpeakerNamer {
     """
 
     static func user(labels: [String], transcript: String, knownSelf: String?,
+                     roster: MeetingRoster = MeetingRoster(),
                      budget: Int = promptBudget) -> String {
         var head = transcript
         if head.count > budget { head = String(head.prefix(budget)) }
         var s = "Labels to identify: \(labels.joined(separator: ", "))\n"
         if let knownSelf {
             s += "\nAlready known: the local speaker (\"Me\") is \(knownSelf).\n"
+        }
+        if !roster.others.isEmpty {
+            s += "\nThe meeting's own participant list names these people, "
+                + "besides the local speaker: \(roster.others.joined(separator: ", ")). "
+                + "Every label is one of them. Use these spellings, and no name "
+                + "outside this list.\n"
         }
         s += "\nTranscript:\n\n\(head)"
         return s
