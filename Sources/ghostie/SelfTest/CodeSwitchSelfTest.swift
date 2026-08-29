@@ -1012,6 +1012,23 @@ func runCodeSwitchSelfTest() -> Bool {
               && abs(Foundation.exp(rpN?.logprobs["en"] ?? 0) - 0.40 / 0.97) < 1e-9,
               "got \(String(describing: rpN))")
 
+        // …and the flip side, which is why the ONNX LID is built WITHOUT the
+        // remap (`LanguageSegmenter.defaultIdentifier`). Over VoxLingua107's
+        // 107 classes, English audio leaves `en` clearly on top while four
+        // sibling Nordic classes each hold a little — and folding all four
+        // into `sv` out-votes it. Measured shape from the 2026-08-28
+        // all-English call: p(en)=0.52, Nordic mass 0.07 spread over no/nb/
+        // nn/da, p(sv)=0.00. Whisper's peakier head doesn't do this, so the
+        // fold stays on there and off here.
+        let englishSpread: [String: Double] = ["en": 0.20, "no": 0.09, "nb": 0.08,
+                                               "nn": 0.07, "da": 0.06, "sv": 0.004]
+        check("server posterior: folding four sibling classes out-votes a clear top-1",
+              ServerWhisperLID.restrictedPosterior(englishSpread, remap: fold,
+                                                   restrict: ["sv", "en"])?.top == "sv")
+        check("server posterior: without the fold the same spread stays English",
+              ServerWhisperLID.restrictedPosterior(englishSpread, remap: { $0 },
+                                                   restrict: ["sv", "en"])?.top == "en")
+
         // Real competing mass reaches the smoother: sv 0.5 / en 0.3 must
         // renormalize to 0.625 / 0.375, not collapse to top-1 + residual.
         let mixed: [String: Double] = ["sv": 0.5, "en": 0.3, "de": 0.15]
@@ -1068,6 +1085,72 @@ func runCodeSwitchSelfTest() -> Bool {
         check("splitForDetect: exactly maxMs is not split",
               LanguageSegmenter.splitForDetect(VADSegment(startMs: 0, endMs: 8_000),
                                                maxMs: 8_000).count == 1)
+    }
+
+    // Monolingual fast path: the sampled short-circuit that skips per-segment
+    // LID when a spread-out probe says the whole track is one language. A
+    // false positive routes a whole track to the wrong model, so these pin
+    // the "unanimous or nothing" contract rather than just the happy path.
+    do {
+        func probe(_ lang: String, margin: Double = 3.0) -> LanguageDetection {
+            let seg = VADSegment(startMs: 0, endMs: 2_000)
+            if lang == "?" {
+                return LanguageDetection(segment: seg, top: LanguageDetection.unknown,
+                                         confidence: 0, margin: 0, logprobs: [:])
+            }
+            let other = lang == "sv" ? "en" : "sv"
+            return LanguageDetection(segment: seg, top: lang, confidence: 0.95,
+                                     margin: margin,
+                                     logprobs: [lang: Foundation.log(0.95),
+                                                other: Foundation.log(0.05)])
+        }
+        func verdict(_ probes: [LanguageDetection]) -> String? {
+            LanguageSegmenter.monolingualVerdict(
+                probes,
+                minSamples: LanguageSegmenter.monoProbeMinSamples,
+                minMargin: LanguageSegmenter.monoProbeMinMargin,
+                maxUnknownFraction: LanguageSegmenter.monoProbeMaxUnknown)
+        }
+
+        check("monolingualVerdict: unanimous confident sample → that language",
+              verdict((0..<24).map { _ in probe("en") }) == "en")
+        check("monolingualVerdict: one dissenting probe vetoes the whole sample",
+              verdict((0..<23).map { _ in probe("en") } + [probe("sv")]) == nil)
+        check("monolingualVerdict: too few samples never decides",
+              verdict((0..<(LanguageSegmenter.monoProbeMinSamples - 1))
+                        .map { _ in probe("en") }) == nil)
+        check("monolingualVerdict: one weak-margin probe vetoes",
+              verdict((0..<23).map { _ in probe("en") } + [probe("en", margin: 0.2)]) == nil)
+        check("monolingualVerdict: a few unknowns still decide",
+              verdict((0..<20).map { _ in probe("sv") }
+                      + (0..<4).map { _ in probe("?") }) == "sv")
+        check("monolingualVerdict: too many unknowns disqualify the sample",
+              verdict((0..<12).map { _ in probe("sv") }
+                      + (0..<12).map { _ in probe("?") }) == nil)
+        check("monolingualVerdict: an all-unknown sample never decides",
+              verdict((0..<24).map { _ in probe("?") }) == nil)
+
+        // probeIndices: even spread, eligibility floor, no over-sampling.
+        let many = (0..<100).map { VADSegment(startMs: $0 * 3_000, endMs: $0 * 3_000 + 2_000) }
+        let idx = LanguageSegmenter.probeIndices(many, minDetectMs: 1_500, count: 24)
+        let gaps = zip(idx, idx.dropFirst()).map { $1 - $0 }
+        check("probeIndices: samples the requested count, in order, no repeats",
+              idx.count == 24 && idx == idx.sorted() && Set(idx).count == 24,
+              "got \(idx)")
+        check("probeIndices: spread evenly across the whole track",
+              idx.first! < 6 && idx.last! > 93 && gaps.allSatisfy { $0 >= 3 && $0 <= 5 },
+              "first \(idx.first!) last \(idx.last!) gaps \(Set(gaps).sorted())")
+        check("probeIndices: skips segments under the detect floor",
+              LanguageSegmenter.probeIndices(
+                [VADSegment(startMs: 0, endMs: 500),
+                 VADSegment(startMs: 1_000, endMs: 4_000),
+                 VADSegment(startMs: 5_000, endMs: 5_400)],
+                minDetectMs: 1_500, count: 24) == [1])
+        check("probeIndices: fewer eligible than requested returns them all",
+              LanguageSegmenter.probeIndices(Array(many.prefix(10)),
+                                             minDetectMs: 1_500, count: 24).count == 10)
+        check("probeIndices: count 0 samples nothing",
+              LanguageSegmenter.probeIndices(many, minDetectMs: 1_500, count: 0).isEmpty)
     }
 
     // Fine (sliding-window) LID pass: CUSUM change-point scan over synthetic

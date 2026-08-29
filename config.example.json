@@ -43,7 +43,8 @@
     "intraSegmentMarginThreshold": 0.15,
     "minDwellMs": 1500,
     "crossTrackPriorStrength": 0.75,
-    "priorLookbackMs": 8000
+    "priorLookbackMs": 8000,
+    "monolingualFastPath": true
   },
 
   "summaryProvider": "claude",

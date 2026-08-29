@@ -11,8 +11,11 @@ shows "VoxLingua107 ECAPA-TDNN (ONNX, …)" as the active language identifier
 One-time setup on the exporting machine (any Mac/Linux with Python 3.10+):
 
     python3 -m venv /tmp/vox-export && source /tmp/vox-export/bin/activate
-    pip install torch speechbrain onnx onnxruntime
+    pip install torch speechbrain onnx onnxscript onnxruntime
     python3 scripts/export-voxlingua-lid.py
+
+(`onnxscript` is what torch's current exporter runs on; without it the export
+dies on `ModuleNotFoundError: No module named 'onnxscript'`.)
 
 Model + weights: speechbrain/lang-id-voxlingua107-ecapa (Apache-2.0).
 The export is for local use; if you redistribute the .onnx, keep the
@@ -83,6 +86,26 @@ def main() -> int:
         dynamic_axes={"wav": {1: "samples"}},
         opset_version=args.opset,
     )
+
+    # Fold external weights back into the .onnx. Torch's current exporter
+    # splits anything over its size threshold into a sibling
+    # `lid-voxlingua107.onnx.data`, which Ghostie has no idea about: it checks
+    # (and, for the .dmg, bundles) the single path it was given, and
+    # `VoxLingua107LID.isReady` would say yes to a graph whose weights aren't
+    # there — then fail *structurally* on the first segment, which backlogs
+    # the whole call instead of falling back to the whisper LID. One
+    # self-contained file keeps that contract true.
+    try:
+        import onnx
+        if os.path.exists(onnx_path + ".data"):
+            model = onnx.load(onnx_path, load_external_data=True)
+            onnx.save(model, onnx_path, save_as_external_data=False)
+            os.remove(onnx_path + ".data")
+            print(f"Folded external weights into {onnx_path} "
+                  f"({os.path.getsize(onnx_path) / 1e6:.0f} MB, self-contained)")
+    except ImportError:
+        print("WARNING: onnx not installed — cannot check for external weights.",
+              file=sys.stderr)
 
     # Labels in output-index order. VoxLingua107 entries look like
     # "en: English" — Ghostie wants the bare ISO code.

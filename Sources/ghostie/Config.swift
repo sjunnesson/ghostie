@@ -594,6 +594,17 @@ struct CodeSwitchConfig: Codable {
     /// change point — half-second blips never break a sentence.
     var minDwellMs: Int = 1500
 
+    /// Sample a track before language-detecting every segment of it, and skip
+    /// the per-segment pass when the sample says the whole track is in one
+    /// language (see `LanguageSegmenter.monolingualVerdict`).
+    ///
+    /// Only ever engages under a *slow* identifier — the whisper LIDs at
+    /// ~1.2 s per segment, where a 56-minute call spends 20 minutes deciding
+    /// "this call was English". Under the ONNX VoxLingua107 LID (~10 ms) the
+    /// full pass costs seconds, so this stays out of the way and no accuracy
+    /// is traded. Set false to always run the full pass.
+    var monolingualFastPath: Bool = true
+
     /// 0.5 disables cross-track refinement (Pass 2 becomes a no-op); 1.0 makes
     /// the other track's recent language absolute. 0.75 flips ambiguous
     /// segments without overruling a confident local detection.
@@ -661,6 +672,7 @@ struct CodeSwitchConfig: Codable {
         case crossTrackPriorStrength, priorLookbackMs
         case snapSearchMs, snapMinMs, snapEnergyDb
         case verifyMarginDb
+        case monolingualFastPath
         // Removed in v2: `enabled` (now derived from installed-model count;
         // see Pipeline.swift). Removed in v3: `prompts`, `modelPerLanguage`
         // (folded into `languages` records). Old configs carrying any of them
@@ -712,6 +724,7 @@ struct CodeSwitchConfig: Codable {
         snapMinMs = g(.snapMinMs, d.snapMinMs)
         snapEnergyDb = g(.snapEnergyDb, d.snapEnergyDb)
         verifyMarginDb = g(.verifyMarginDb, d.verifyMarginDb)
+        monolingualFastPath = g(.monolingualFastPath, d.monolingualFastPath)
 
         // ---- v3 language records + migration -----------------------------
         //

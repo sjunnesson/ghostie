@@ -170,6 +170,24 @@ the same code drives the menu-bar app and the headless daemon.
   `~/.ghostie/models/` (shared by the Settings “Download models” button and
   `ghostie fetch-models`; variant→URL/filename mapping kept in lockstep with
   `setup.sh` and `CodeSwitchConfig.modelPath`).
+- **Which LID you get decides how long a call takes.** Per-segment detection is
+  the pipeline's most expensive stage under the whisper LIDs (~1.2 s/segment:
+  measured 2026-08-28, 20 min of a 30 min run on a 56-minute call). Install the
+  ONNX LID — `scripts/export-voxlingua-lid.py` writes
+  `~/.ghostie/models/lid-voxlingua107.onnx` (+ `.labels.json`), needs an ONNX
+  Runtime on disk, and `ghostie doctor` names the active identifier — and it
+  drops to ~10 ms/window (which is also what turns the fine sliding-window pass
+  on, via `isLowLatency`). The export must stay **one self-contained file**:
+  `isReady` checks that path alone, so weights in a sibling `.onnx.data` would
+  pass the readiness check and then fail structurally on the first segment,
+  backlogging the call instead of falling back to whisper.
+  `codeSwitch.monolingualFastPath` (default true) is the safety net for installs
+  without it: a spread-out sample of ≤24 segments
+  (`LanguageSegmenter.probeIndices` / `monolingualVerdict`, both pure + covered
+  by `selftest`) short-circuits the per-segment pass when *every* probe agrees
+  on one language. It is gated on `!identifier.isLowLatency` on purpose — it
+  trades recall for time, and that trade is only worth making when the full
+  pass costs tens of minutes. Don't ungate it.
 - **Summarization** — `Summarizer.swift` is a thin façade that dispatches to a
   `SummarizationProvider` based on `config.summaryProvider`. Two providers
   ship: `ClaudeSummarizationProvider` (shells out to `claude -p` using the

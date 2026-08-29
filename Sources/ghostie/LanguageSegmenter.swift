@@ -60,7 +60,19 @@ struct LanguageSegmenter {
         // is a cheap file-existence check and the whisper path runs unchanged.
         let voxPath = ProcessInfo.processInfo.environment["GHOSTIE_VOXLINGUA_MODEL"]
             ?? "\(Config.modelsDir)/lid-voxlingua107.onnx"
-        let vox = VoxLingua107LID(modelPath: voxPath, remap: nordicRemap)
+        // NOTE: deliberately **no** `nordicRemap` here. The remap compensates
+        // for whisper's language head, which genuinely confuses no/nb/nn/da
+        // with short Swedish. VoxLingua107 is a 107-way classifier with real,
+        // separately-trained Nordic classes, and `restrictedPosterior` folds
+        // *mass* — so summing four sibling classes into `sv` systematically
+        // out-votes the single `en` class on audio that is neither.
+        // Measured on the 2026-08-28 all-English call: the remap turned 0/20
+        // slices into 5/20 false Swedish at 8 s and 11/20 at 1.5 s, which is
+        // what split that call into 84 alternating en/sv runs and decoded
+        // English speech against the Swedish model. On genuinely Swedish
+        // audio it buys nothing at 8 s (sv wins 20/20 either way, p(sv)=0.76
+        // vs p(en)=0.00) and 3/20 at 1.5 s — nowhere near the cost.
+        let vox = VoxLingua107LID(modelPath: voxPath)
         if vox.isReady { return vox }
         let driver = Self.resolveDetectionModel(config: config, installed: installed)
         // Prefer the resident whisper-server head: one model load per call
@@ -191,21 +203,26 @@ struct LanguageSegmenter {
         // yields chunks > maxMs/2).
         let maxDetect = max(cs.maxDetectMs, 2 * cs.minDetectMs)
 
+        // Sampled monolingual short-circuit. Under a slow identifier the full
+        // pass below is the single most expensive stage in the whole pipeline
+        // (measured 2026-08-28: 20 min of a 30 min run, on a call that turned
+        // out to be English end to end), so ask a spread-out sample first.
+        if let mono = try monolingualShortCircuit(segs, pcm: pcm, whitelist: whitelist,
+                                                  maxDetect: maxDetect,
+                                                  bytesPerMs: bytesPerMs) {
+            return mono
+        }
+
         var dets: [LanguageDetection] = []
         for s in segs {
             if s.durationMs < cs.minDetectMs || pcm.isEmpty {
                 dets.append(unknownDetection(s)); continue
             }
             for chunk in Self.splitForDetect(s, maxMs: maxDetect) {
-                let lo = min(pcm.count, chunk.startMs * bytesPerMs)
-                let hi = min(pcm.count, lo + min(chunk.durationMs, 30_000) * bytesPerMs)
-                guard hi > lo else { dets.append(unknownDetection(chunk)); continue }
-                let slice = pcm.subdata(in: lo..<hi)
-                let posterior: [String: Double]
+                let coarse: LanguageDetection
                 do {
-                    posterior = try identifier.identify(pcm: slice,
-                                                        sampleRateHz: 16_000,
-                                                        restrict: whitelist)
+                    coarse = try coarseDetection(chunk, pcm: pcm, whitelist: whitelist,
+                                                 bytesPerMs: bytesPerMs)
                 } catch let e as ClassifiableLIDError where e.isStructural {
                     // The identifier itself can't run (missing binary/model) —
                     // fail the call so Pipeline backlogs it for a clean retry,
@@ -215,9 +232,6 @@ struct LanguageSegmenter {
                 } catch {
                     dets.append(unknownDetection(chunk)); continue
                 }
-                let coarse = Self.detection(from: posterior,
-                                            whitelist: whitelist,
-                                            segment: chunk)
                 // Fine pass: a switch can hide inside a long chunk (the
                 // coarse label averages it away), and an ambiguous coarse
                 // margin means the chunk may straddle one. Only under a
@@ -237,6 +251,118 @@ struct LanguageSegmenter {
             }
         }
         return dets
+    }
+
+    /// One LID call on one chunk, converted to a detection. Throws only what
+    /// the identifier throws (so the caller can tell a structural failure from
+    /// a soft one); a slice that lands outside the PCM comes back `unknown`.
+    private func coarseDetection(_ chunk: VADSegment, pcm: Data,
+                                 whitelist: [String],
+                                 bytesPerMs: Int) throws -> LanguageDetection {
+        let lo = min(pcm.count, chunk.startMs * bytesPerMs)
+        let hi = min(pcm.count, lo + min(chunk.durationMs, 30_000) * bytesPerMs)
+        guard hi > lo else { return unknownDetection(chunk) }
+        let posterior = try identifier.identify(pcm: pcm.subdata(in: lo..<hi),
+                                                sampleRateHz: 16_000,
+                                                restrict: whitelist)
+        return Self.detection(from: posterior, whitelist: whitelist, segment: chunk)
+    }
+
+    // MARK: Monolingual fast path
+
+    /// Segments to sample before deciding a track is monolingual, and the
+    /// floor below which the sample isn't worth trusting. 24 probes at ~1.2 s
+    /// (the whisper LIDs) is ~30 s — against ~10 min for the full pass on an
+    /// hour-long track.
+    static let monoProbeCount = 24
+    static let monoProbeMinSamples = 8
+    /// Every probe must clear this top1−top2 log-prob margin. exp(1.5) ≈ 4.5×,
+    /// i.e. no probe was anywhere near a coin flip.
+    static let monoProbeMinMargin = 1.5
+    /// …and at most this share of probes may come back `unknown`. A track the
+    /// LID keeps shrugging at is exactly the one not to generalise from.
+    static let monoProbeMaxUnknown = 1.0 / 3.0
+
+    /// Every segment labelled with the sample's aggregate posterior, or nil to
+    /// run the full per-segment pass.
+    ///
+    /// Gated on `!identifier.isLowLatency` on purpose: the trade this makes is
+    /// recall (a short stretch of the other language that no probe happened to
+    /// land in) for time, and it is only ever worth making when the full pass
+    /// costs tens of minutes. With the ONNX LID installed the full pass costs
+    /// seconds, this returns nil, and nothing is traded.
+    private func monolingualShortCircuit(_ segs: [VADSegment], pcm: Data,
+                                         whitelist: [String],
+                                         maxDetect: Int,
+                                         bytesPerMs: Int) throws -> [LanguageDetection]? {
+        guard cs.monolingualFastPath, !identifier.isLowLatency,
+              whitelist.count > 1, !pcm.isEmpty else { return nil }
+        let idx = Self.probeIndices(segs, minDetectMs: cs.minDetectMs,
+                                    count: Self.monoProbeCount)
+        guard idx.count >= Self.monoProbeMinSamples else { return nil }
+
+        var probes: [LanguageDetection] = []
+        for i in idx {
+            // Probe the head of the segment — the same slice the full pass
+            // would label it from (`splitForDetect` leaves the first chunk at
+            // the segment start).
+            let head = Self.splitForDetect(segs[i], maxMs: maxDetect)[0]
+            do {
+                probes.append(try coarseDetection(head, pcm: pcm, whitelist: whitelist,
+                                                  bytesPerMs: bytesPerMs))
+            } catch let e as ClassifiableLIDError where e.isStructural {
+                throw SegmenterError.whisperUnavailable
+            } catch {
+                probes.append(unknownDetection(head))
+            }
+        }
+
+        guard let lang = Self.monolingualVerdict(probes,
+                                                 minSamples: Self.monoProbeMinSamples,
+                                                 minMargin: Self.monoProbeMinMargin,
+                                                 maxUnknownFraction: Self.monoProbeMaxUnknown),
+              let agg = Self.aggregate(probes.filter { $0.top != LanguageDetection.unknown }
+                                              .map(\.logprobs))
+        else {
+            Log.info("Language probe: \(idx.count) samples were not unanimous — running the full per-segment pass.")
+            return nil
+        }
+        Log.info("Language probe: \(idx.count) samples across the track all read \(lang) — skipping per-segment detection.")
+        // Every segment carries the sample's aggregate posterior: it is the
+        // evidence we actually have, and it gives the smoother a real margin
+        // to collapse the track into one run with.
+        return segs.map { Self.detection(from: agg, whitelist: whitelist, segment: $0) }
+    }
+
+    /// Indices of up to `count` detect-eligible segments spread evenly across
+    /// `segs`, sampled at the midpoint of each bucket so the head and tail of
+    /// the track are both represented. Static + pure for the selftest.
+    static func probeIndices(_ segs: [VADSegment], minDetectMs: Int, count: Int) -> [Int] {
+        guard count > 0 else { return [] }
+        let eligible = segs.indices.filter { segs[$0].durationMs >= minDetectMs }
+        guard eligible.count > count else { return eligible }
+        return (0..<count).map { eligible[(2 * $0 + 1) * eligible.count / (2 * count)] }
+    }
+
+    /// The one language a probe sample proves the whole track is in, or nil.
+    ///
+    /// Deliberately unanimous-or-nothing: a false positive routes a whole
+    /// track to the wrong model and mistranscribes the other language with no
+    /// signal anywhere, which is far worse than the minutes the fast path
+    /// saves. Every usable probe must agree, every one of them must clear
+    /// `minMargin`, and too many `unknown`s disqualify the sample outright.
+    /// Static + pure for the selftest.
+    static func monolingualVerdict(_ probes: [LanguageDetection],
+                                   minSamples: Int,
+                                   minMargin: Double,
+                                   maxUnknownFraction: Double) -> String? {
+        guard probes.count >= minSamples else { return nil }
+        let known = probes.filter { $0.top != LanguageDetection.unknown }
+        guard !known.isEmpty,
+              Double(probes.count - known.count) / Double(probes.count) <= maxUnknownFraction,
+              Set(known.map(\.top)).count == 1,
+              known.allSatisfy({ $0.margin >= minMargin }) else { return nil }
+        return known[0].top
     }
 
     // MARK: Fine (sliding-window) LID pass
