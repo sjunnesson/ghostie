@@ -25,6 +25,7 @@ swift build -c release            # release build (what the scripts use)
 .build/release/ghostie test-record 15      # smoke-test the full pipeline
 .build/release/ghostie process <dir>       # re-run pipeline on a recording dir
 .build/release/ghostie fetch-models [v]    # download codeswitch models (KB v + large-v3 + VAD)
+.build/release/ghostie mic-probe [secs]   # is voice-processed mic capture working on this OS?
 ```
 
 There is no XCTest target and no linter. `swift build` warnings are expected to
@@ -83,7 +84,25 @@ the same code drives the menu-bar app and the headless daemon.
   voice-processing I/O so speaker output (the other participants) is
   echo-cancelled out of the Me track. If VP can't start (or
   `config.micEchoCancellation` is off) it falls back to the raw SCK
-  `.microphone` tap, which re-captures everything the speakers play. The Me/
+  `.microphone` tap, which re-captures everything the speakers play.
+  **Enabling voice processing turns the input node into a 9-channel stream**
+  (macOS 26.5; it used to be mono). `AVAudioConverter` asked to fold 9ch → 1ch
+  returns `noErr`, fills the buffer to the expected length and writes **all
+  zeros** — measured 131037/139200 non-zero samples in, 0/46357 out. That is
+  the entire "voice processing is dead on macOS 26" story: VP worked the whole
+  time and this converter discarded it, which tripped the silence watchdog and
+  dropped every call onto the raw tap (2026-08-28: 41% of the Me track
+  duplicated Participants). So `MicCapture.monoise` takes one channel itself
+  and leaves the converter only a rate/format change — **never ask
+  AVAudioConverter to change channel count here.** Channel 0 is the processed
+  voice; averaging the array back in would undo the echo cancellation.
+  `adaptChannelIfDead` moves to another channel if 0 goes silent while another
+  is live (Apple renumbered this layout once already), and a converted-to-
+  silence counter names the conversion in the log so this failure can never
+  again be mistaken for a dead microphone. `ghostie mic-probe [secs]` is the
+  diagnostic: it runs a plain tap and a voice-processed tap in the same
+  process, so "all zeros" can be told apart from denied microphone permission
+  — **run it first on a new macOS release.** The Me/
   far-end split is **track-based**, never inferred — diarization only ever runs
   *within* the Participants track. VP failure is not always a throw: a stopped
   graph keeps emitting zero-filled buffers, so `MicCapture` rebuilds on

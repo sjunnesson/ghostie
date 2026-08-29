@@ -79,6 +79,217 @@ func cmdTestRecord(_ config: Config, seconds: Double) {
     }
 }
 
+/// `ghostie mic-probe [seconds]` — exercise the voice-processing capture path
+/// and say plainly what came back.
+///
+/// The "Me" track has failed twice in ways that look identical from the
+/// outside: a graph that stops itself on a device swap (2026-08-24, 59 minutes
+/// of digital silence) and a voice-processing unit that starts, runs, and
+/// emits nothing but zeros (macOS 26). Both produce well-formed WAVs. This is
+/// the thing to run first on a new macOS release, before trusting a recording.
+func cmdMicProbe(_ config: Config, seconds: Double, mode: String = "both",
+                 mode2: String = "") {
+    // Who else is holding the input device? A second voice-processing client
+    // on the same mic is the leading explanation for a silent VP graph, and
+    // it is invisible unless you look.
+    let audio = CoreAudioActivityProvider(matchers: [])
+    let inputHolders = audio.snapshot().filter(\.isRunningInput)
+    if inputHolders.isEmpty {
+        print("Input device: no other process is currently recording.")
+    } else {
+        print("Input device is also in use by:")
+        for p in inputHolders {
+            print("  • pid \(p.pid)  \(p.bundleId ?? "(unknown bundle)")")
+        }
+    }
+
+    // Two captures, same process, same device: a plain input tap and the
+    // voice-processing one. The plain tap is the control — without it,
+    // "all zeros" is ambiguous, because macOS also hands out silence when
+    // microphone permission is denied, and this probe is often run from a
+    // terminal whose permission differs from Ghostie.app's.
+    struct Take {
+        var buffers = 0, nonZero = 0, samples = 0, peak = 0
+        var energy = 0.0
+        var failure: String?
+        var silent: Bool { buffers > 0 && nonZero == 0 }
+        var healthy: Bool { nonZero > 0 }
+        func line() -> String {
+            if let failure { return "could not start — \(failure)" }
+            if buffers == 0 { return "delivered nothing at all" }
+            let rms = samples == 0 ? 0 : (energy / Double(samples)).squareRoot()
+            let db = rms <= 0 ? "-inf" : String(format: "%.1f", 20 * log10(rms / 32768))
+            return "\(buffers) buffers, \(nonZero * 100 / max(1, samples))% non-zero, "
+                 + "peak \(peak), RMS \(db) dBFS"
+        }
+    }
+
+    func measure(voiceProcessing: Bool) -> Take {
+        var take = Take()
+        let lock = NSLock()
+        let engine = AVAudioEngine()
+        let input = engine.inputNode
+        do {
+            if voiceProcessing {
+                try input.setVoiceProcessingEnabled(true)
+                input.voiceProcessingOtherAudioDuckingConfiguration =
+                    AVAudioVoiceProcessingOtherAudioDuckingConfiguration(
+                        enableAdvancedDucking: false, duckingLevel: .min)
+            }
+            let fmt = input.outputFormat(forBus: 0)
+            guard fmt.sampleRate > 0, fmt.channelCount > 0 else {
+                take.failure = "no usable input format"; return take
+            }
+            input.installTap(onBus: 0, bufferSize: 1024, format: fmt) { buf, _ in
+                guard let ch = buf.floatChannelData else { return }
+                lock.withLock {
+                    take.buffers += 1
+                    for i in 0..<Int(buf.frameLength) {
+                        let v = Int(abs(ch[0][i]) * 32768)
+                        take.samples += 1
+                        if v != 0 { take.nonZero += 1 }
+                        if v > take.peak { take.peak = v }
+                        take.energy += Double(v) * Double(v)
+                    }
+                }
+            }
+            engine.prepare()
+            try engine.start()
+        } catch {
+            take.failure = error.localizedDescription
+            return take
+        }
+        Thread.sleep(forTimeInterval: seconds)
+        input.removeTap(onBus: 0)
+        engine.stop()
+        if voiceProcessing { try? input.setVoiceProcessingEnabled(false) }
+        return lock.withLock { take }
+    }
+
+    var plain = Take(), vp = Take()
+    if mode != "vp" {
+        print("\nPlain input tap (control), \(Int(seconds))s — say something…")
+        plain = measure(voiceProcessing: false)
+        print("  \(plain.line())")
+    }
+    if mode != "plain" {
+        print("\nVoice-processed tap (what Ghostie prefers), \(Int(seconds))s…")
+        vp = measure(voiceProcessing: true)
+        print("  \(vp.line())")
+    }
+    if mode == "vp" {
+        print("")
+        print(vp.healthy ? "VERDICT: voice processing produced signal cold."
+                         : "VERDICT: voice processing produced silence cold.")
+        return
+    }
+    if mode == "plain" { return }
+    if mode == "convert" {
+        // MicCapture's exact pipeline, instrumented either side of the
+        // converter: is the tap silent, or is the conversion zeroing it?
+        let engine = AVAudioEngine()
+        let input = engine.inputNode
+        try? input.setVoiceProcessingEnabled(true)
+        let inFormat = input.outputFormat(forBus: 0)
+        let outFormat = AVAudioFormat(commonFormat: .pcmFormatInt16,
+                                      sampleRate: 16_000, channels: 1,
+                                      interleaved: true)!
+        print("\n  tap format : \(inFormat)")
+        print("  out format : \(outFormat)")
+        guard let conv = AVAudioConverter(from: inFormat, to: outFormat) else {
+            print("  no converter"); return
+        }
+        if mode2 == "map", inFormat.channelCount > 1 {
+            conv.channelMap = [0]
+            print("  channelMap : [0]")
+        }
+        var preNZ = 0, postNZ = 0, preN = 0, postN = 0, errs = 0
+        let l = NSLock()
+        input.installTap(onBus: 0, bufferSize: 1024, format: inFormat) { buffer, _ in
+            var pre = 0, preC = 0
+            if let f = buffer.floatChannelData {
+                for i in 0..<Int(buffer.frameLength) { preC += 1; if f[0][i] != 0 { pre += 1 } }
+            } else if let i16 = buffer.int16ChannelData {
+                for i in 0..<Int(buffer.frameLength) { preC += 1; if i16[0][i] != 0 { pre += 1 } }
+            }
+            let ratio = outFormat.sampleRate / buffer.format.sampleRate
+            let cap = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 16
+            guard let out = AVAudioPCMBuffer(pcmFormat: outFormat, frameCapacity: cap) else { return }
+            var fed = false
+            var e: NSError?
+            conv.convert(to: out, error: &e) { _, st in
+                if fed { st.pointee = .noDataNow; return nil }
+                fed = true; st.pointee = .haveData; return buffer
+            }
+            var post = 0, postC = 0
+            if let ch = out.int16ChannelData {
+                for i in 0..<Int(out.frameLength) { postC += 1; if ch[0][i] != 0 { post += 1 } }
+            }
+            l.withLock {
+                preNZ += pre; preN += preC; postNZ += post; postN += postC
+                if e != nil { errs += 1 }
+            }
+        }
+        engine.prepare()
+        try? engine.start()
+        Thread.sleep(forTimeInterval: seconds)
+        input.removeTap(onBus: 0)
+        engine.stop()
+        try? input.setVoiceProcessingEnabled(false)
+        let (a, b, c, d, er) = l.withLock { (preNZ, preN, postNZ, postN, errs) }
+        print("  before converter: \(a)/\(b) non-zero")
+        print("  after  converter: \(c)/\(d) non-zero   (convert errors: \(er))")
+        return
+    }
+    if mode == "ghostie" {
+        // The real MicCapture class, converter and all — the thing that
+        // actually feeds the "Me" track.
+        var n = 0, nz = 0, bufs = 0
+        let l = NSLock()
+        let cap = MicCapture { chunk, _ in
+            l.withLock {
+                bufs += 1; n += chunk.count
+                for v in chunk where v != 0 { nz += 1 }
+            }
+        }
+        print("\nGhostie's MicCapture (VP + 16 kHz mono Int16 conversion)…")
+        do { try cap.start() } catch {
+            print("  could not start — \(error.localizedDescription)"); return
+        }
+        Thread.sleep(forTimeInterval: seconds)
+        cap.stop()
+        let (b, s2, z) = l.withLock { (bufs, n, nz) }
+        print("  \(b) buffers, \(s2) samples, \(s2 == 0 ? 0 : z * 100 / s2)% non-zero")
+        print("")
+        print(z > 0 ? "VERDICT: MicCapture produces signal."
+                    : "VERDICT: MicCapture produces silence while raw VP does not.")
+        return
+    }
+
+    print("")
+    switch (plain.healthy, vp.healthy) {
+    case (false, false):
+        print("VERDICT: neither path produced sound. That is almost certainly")
+        print("microphone permission, not voice processing — check System")
+        print("Settings ▸ Privacy & Security ▸ Microphone for whichever app is")
+        print("running this (Ghostie.app, or your terminal).")
+    case (true, false):
+        print("VERDICT: voice processing is broken on this macOS.")
+        print("The plain tap hears you; the voice-processing unit runs, emits")
+        print("buffers, and every sample is zero. Ghostie detects this at call")
+        print("start and falls back to the raw ScreenCaptureKit tap — the 'Me'")
+        print("track then also carries whatever the speakers play, which")
+        print("EchoSuppressor removes from the transcript afterwards.")
+    case (false, true):
+        print("VERDICT: odd — voice processing works but the plain tap did not.")
+        print("Worth re-running; if it repeats, the plain control is at fault,")
+        print("not Ghostie's capture path.")
+    case (true, true):
+        print("VERDICT: healthy — voice-processed capture produces signal, so")
+        print("the 'Me' track will be echo-cancelled at the source.")
+    }
+}
+
 /// `ghostie roster-probe` — what `AXParticipantRosterProvider` can see right
 /// now. Meant to be run while a browser meeting is on screen; prints nothing
 /// interesting otherwise, which is itself the answer.
@@ -734,6 +945,13 @@ case "icon":
     // Hidden: render the app icon PNG (used by scripts/build-app.sh).
     let out = args.count > 1 ? args[1] : "icon.png"
     exit(GhostIcon.writeAppIconPNG(to: out) ? 0 : 1)
+case "mic-probe":
+    // Hidden: does the echo-cancelled mic path actually produce sound on this
+    // machine, this OS, right now? Run it during a call to see what Ghostie
+    // sees. See cmdMicProbe.
+    cmdMicProbe(config, seconds: Double(args.count > 1 ? args[1] : "") ?? 6,
+                mode: args.count > 2 ? args[2] : "both",
+                mode2: args.count > 3 ? args[3] : "")
 case "roster-probe":
     // Hidden: read the meeting roster out of every running browser, once.
     // Run it during a real call to see what the AX rules find.
@@ -773,11 +991,13 @@ case "selftest":
     print("")
     let detectorOK = runDetectorStateMachineSelfTest()
     print("")
+    let micOK = runMicCaptureSelfTest()
+    print("")
     let wavOK = runWavLevelSelfTest()
     print("")
     let speakerOK = runSpeakerSelfTest()
     exit(cleanerOK && echoOK && refinerOK && codeSwitchOK && updaterOK && detectorOK
-         && wavOK && speakerOK ? 0 : 1)
+         && micOK && wavOK && speakerOK ? 0 : 1)
 case "settings":
     launchSettingsOnly()
 case "install-service":
