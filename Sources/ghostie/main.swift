@@ -730,6 +730,8 @@ case "selftest":
     print("")
     let echoOK = runEchoSuppressorSelfTest()
     print("")
+    let refinerOK = runTranscriptRefinerSelfTest()
+    print("")
     let codeSwitchOK = runCodeSwitchSelfTest()
     print("")
     let updaterOK = runUpdaterSelfTest()
@@ -739,8 +741,8 @@ case "selftest":
     let wavOK = runWavLevelSelfTest()
     print("")
     let speakerOK = runSpeakerSelfTest()
-    exit(cleanerOK && echoOK && codeSwitchOK && updaterOK && detectorOK && wavOK
-         && speakerOK ? 0 : 1)
+    exit(cleanerOK && echoOK && refinerOK && codeSwitchOK && updaterOK && detectorOK
+         && wavOK && speakerOK ? 0 : 1)
 case "settings":
     launchSettingsOnly()
 case "install-service":

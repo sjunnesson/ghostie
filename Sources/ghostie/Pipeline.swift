@@ -342,7 +342,28 @@ struct Pipeline {
         var lines = me.map { Line(startMs: $0.startMs, speaker: "Me", text: $0.text) }
         lines += part.map { Line(startMs: $0.startMs, speaker: partLabels[$0.startMs] ?? "Participants",
                                  text: $0.text) }
-        return named(Self.merge(lines))
+        // Readability, in order: join whisper's mid-sentence segment splits
+        // into turns, then put the punctuation back if whisper dropped into
+        // its unpunctuated register. Both run before naming so the naming
+        // prompt — and the summary built on it — see the readable transcript.
+        return named(refined(Self.merge(lines)))
+    }
+
+    /// Coalesce segments into turns, then repunctuate when the transcript
+    /// needs it. Skipped entirely by `cleanTranscript: false`, which is the
+    /// existing "give me exactly what whisper said" switch.
+    private func refined(_ lines: [Line]) -> [Line] {
+        guard config.cleanTranscript else { return lines }
+        let turns = TranscriptRefiner.coalesce(lines)
+        if turns.count != lines.count {
+            Log.info("Turn merge: \(lines.count) → \(turns.count) turns.")
+        }
+        guard config.restorePunctuation,
+              TranscriptRefiner.needsRestoration(turns) else { return turns }
+        let (restored, stats) = TranscriptRefiner.restore(
+            turns, provider: Summarizer(config: config).provider)
+        Log.info(stats.summary)
+        return restored
     }
 
     /// Splits the Participants track into individual speakers.

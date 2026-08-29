@@ -136,8 +136,19 @@ struct Config: Codable {
     var vadModel: String = "\(NSHomeDirectory())/.ghostie/models/ggml-silero-v5.1.2.bin"
 
     /// Run the post-transcription hallucination guard (dedup loops, noise
-    /// markers, training-data-leak phrases). Strongly recommended.
+    /// markers, training-data-leak phrases). Strongly recommended. Also gates
+    /// the readability pass — turn merging and punctuation restoration — so
+    /// `false` still means "give me exactly what whisper said".
     var cleanTranscript: Bool = true
+
+    /// Ask the configured summarization provider to put sentence punctuation
+    /// and capitalization back when whisper dropped into its unpunctuated
+    /// register (see `TranscriptRefiner`). Only runs when the transcript
+    /// actually needs it, and any line whose wording the reply changed keeps
+    /// whisper's original text. Costs one provider round-trip per 40 turns —
+    /// on the same provider the summary already uses, so it exposes nothing
+    /// the summary didn't.
+    var restorePunctuation: Bool = true
 
     /// Quality/speed trade-off for the single-language model auto-pick.
     /// `"best"` (the default) keeps the disk-driven order: the highest-quality
@@ -233,7 +244,7 @@ struct Config: Codable {
         case diarization, speakerModel, nameSpeakers, userName
         case whisperBinary, whisperServerBinary, whisperModel, language
         case initialPrompt, vadModel
-        case cleanTranscript, transcriptionQuality, codeSwitch
+        case cleanTranscript, restorePunctuation, transcriptionQuality, codeSwitch
         case summaryProvider, summaryModel, claudeBinary, ollamaUrl, ollamaModel
         case summaryTimeoutSeconds
         case workDir
@@ -306,6 +317,7 @@ struct Config: Codable {
             ? d.initialPrompt : prompt
         vadModel = g(.vadModel, d.vadModel)
         cleanTranscript = g(.cleanTranscript, d.cleanTranscript)
+        restorePunctuation = g(.restorePunctuation, d.restorePunctuation)
         transcriptionQuality = g(.transcriptionQuality, d.transcriptionQuality)
         codeSwitch = g(.codeSwitch, d.codeSwitch)
         summaryProvider = g(.summaryProvider, d.summaryProvider)

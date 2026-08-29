@@ -36,16 +36,18 @@ stay at zero (a recent commit silenced them deliberately).
 `main.swift`, living in `SelfTest/`): `runTranscriptCleanerSelfTest()`
 (exercises `TranscriptCleaner.clean` over silence loops, training-data leaks,
 noise-marker runs, interleaved drift, within-segment loops),
-`runEchoSuppressorSelfTest()` (exercises `EchoSuppressor.suppress` over
+`runTranscriptRefinerSelfTest()` (exercises `TranscriptRefiner` — coalescing
+rules, the `preservesWording` guard, reply parsing and batching, all against a
+stub provider), `runEchoSuppressorSelfTest()` (exercises `EchoSuppressor.suppress` over
 real-call echo fixtures — pure echo, mixed real+echo segments, ASR variance,
 plus the never-engage guards for headphone/solo calls), and
 `runCodeSwitchSelfTest()` (exercises the `Smoother` over synthetic
 `LanguageDetection`s — single-language collapse, mixed 3-run split,
 cross-track flip vs. isolated fall-back; **no audio or models needed**, so
 it's green everywhere). **Any change to `TranscriptCleaner.swift`,
-`EchoSuppressor.swift` or `Smoother.swift` must keep `ghostie selftest`
-green**; add a `check(...)` case in the relevant suite rather than building a
-separate harness. Optional end-to-end audio fixtures under `Tests/Fixtures`
+`TranscriptRefiner.swift`, `EchoSuppressor.swift` or `Smoother.swift` must keep
+`ghostie selftest` green**; add a `check(...)` case in the relevant suite
+rather than building a separate harness. Optional end-to-end audio fixtures under `Tests/Fixtures`
 are skipped cleanly when absent.
 
 ## Architecture
@@ -106,7 +108,8 @@ the same code drives the menu-bar app and the headless daemon.
   track that recorded nothing regardless of cause, on every route to a note,
   and puts a ⚠️ line in the meta block (which the summarizer also sees).
 - **`Pipeline.swift`** — transcribe both tracks → clean per track → diarize
-  Participants → cross-track echo guard → merge by timestamp → name speakers →
+  Participants → cross-track echo guard → merge by timestamp → coalesce into
+  turns + restore punctuation (`TranscriptRefiner`) → name speakers →
   summarize → write
   `<notesFolder>/<date>_<Source>-Call.md` (+ transcript), where Source is
   the detected app ("Teams"/"Zoom"/"Meet", generic "Call" when unknown). The
@@ -127,6 +130,23 @@ the same code drives the menu-bar app and the headless daemon.
   hallucination-resistant decoding flags (set explicitly so a future
   whisper-cli default change can't silently regress quality). Parses
   `<prefix>.json`.
+- **`TranscriptRefiner.swift`** — the readability pass, run in `Pipeline` after
+  the merge and before naming (so naming and the summary see it), gated by
+  `cleanTranscript`. `coalesce` is pure: whisper closes a segment every few
+  seconds regardless of where the sentence ends and `merge` only sorts, so one
+  sentence arrives as three lines — it joins consecutive same-speaker lines
+  while the previous one hasn't ended a sentence. `restore` (config
+  `restorePunctuation`) repairs whisper's *other* habit: large-v3 drifts into a
+  lowercase, unpunctuated register and stays there for many minutes (2026-08-28:
+  12% of turns ended a sentence, vs 96% for a reference recording of the same
+  call; longest run 83 lines). It reproduces with plain `whisper-cli` defaults,
+  so no decoding flag fixes it — the repair has to be downstream. `restore`
+  asks the already-configured summarization provider and then **verifies it
+  only punctuated**: `preservesWording` compares normalized word sequences and
+  any line whose wording changed keeps whisper's original. Never weaken that
+  check — a transcript missing commas is a nuisance, one quietly rewritten by a
+  language model is a record you cannot cite and nothing downstream would
+  notice. Covered by `selftest`.
 - **`TranscriptCleaner.swift`** — the per-track hallucination guard. Deliberately
   conservative (a single legitimate "Okay." survives). Covered by `selftest`.
 - **Code-switching (N-language, e.g. sv↔en)** — active whenever ≥2 languages

@@ -15,6 +15,7 @@
   "initialPrompt": "The following is a professional Microsoft Teams business call with clear punctuation and capitalization.",
   "vadModel": "/Users/YOU/.ghostie/models/ggml-silero-v5.1.2.bin",
   "cleanTranscript": true,
+  "restorePunctuation": true,
 
   "diarization": true,
   "speakerModel": "",
