@@ -103,7 +103,7 @@ enum UpdateAvailability {
 
 enum UpdateError: LocalizedError {
     case offline(String)
-    case rateLimited
+    case rateLimited(retryAfter: Date?)
     case http(Int)
     case badManifest(String)
     case noUsableAsset
@@ -115,7 +115,12 @@ enum UpdateError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .offline(let d):       return "Couldn't reach the update server (\(d))."
-        case .rateLimited:          return "GitHub rate limit hit — try again later."
+        case .rateLimited(let until):
+            // Per-IP, not per-user: say so, or people read it as a punishment.
+            guard let until, until > Date() else {
+                return "GitHub's hourly limit for this network is used up — try again shortly."
+            }
+            return "GitHub's hourly limit for this network is used up — it frees up at \(Self.clockTime(until))."
         case .http(let c):          return "Update check failed (HTTP \(c))."
         case .badManifest(let d):   return "Unreadable release manifest (\(d))."
         case .noUsableAsset:        return "The latest release has no verifiable Ghostie build."
@@ -129,6 +134,14 @@ enum UpdateError: LocalizedError {
             return "Can't replace \(p) — move Ghostie to a writable location (drag it to /Applications) and update again."
         }
     }
+
+    /// Local wall-clock, no date — the reset is always within the hour.
+    private static func clockTime(_ d: Date) -> String {
+        let f = DateFormatter()
+        f.dateStyle = .none
+        f.timeStyle = .short
+        return f.string(from: d)
+    }
 }
 
 // MARK: - Updater
@@ -138,6 +151,9 @@ final class Updater: NSObject, URLSessionDownloadDelegate {
     static let teamID = "6V9RN6W28J"
     static let canonicalFeed =
         "https://api.github.com/repos/sjunnesson/ghostie/releases/latest"
+    /// Our own mirror of the identical JSON, refreshed hourly by the website
+    /// (`ghostieWebsite/src/app/updates.json/route.ts`).
+    static let mirrorFeed = "https://ghostie.vitgranen.com/updates.json"
     static let releasesPage =
         URL(string: "https://github.com/sjunnesson/ghostie/releases")!
     static let assetPrefix = "Ghostie"
@@ -228,12 +244,76 @@ final class Updater: NSObject, URLSessionDownloadDelegate {
         return run("/usr/bin/xcrun", ["stapler", "validate", path]).status == 0
     }
 
-    static func feedURL(_ config: Config) -> URL {
+    /// Feeds to try, in order.
+    ///
+    /// GitHub's anonymous API allows 60 requests an hour *per IP address*,
+    /// shared with every other client on the network. Behind an office NAT or
+    /// a carrier-grade one that budget is routinely spent by strangers, and
+    /// the check then fails with a 403 no matter how rarely Ghostie asks —
+    /// measured 2026-09-02, quota at zero almost continuously with nothing on
+    /// the machine contributing. So ask our own domain first: one hourly fetch
+    /// there serves every user. GitHub stays as the fallback for when the site
+    /// is down.
+    ///
+    /// The mirror is discovery only, never a trust root. `verifyAndSwap` still
+    /// gates every install on the published SHA-256 *and* on Apple's notarized
+    /// Developer ID signature for `teamID`, so a manifest that lied about
+    /// `browser_download_url` still couldn't get anything installed.
+    ///
+    /// An explicit override replaces the chain outright — pointing the updater
+    /// at a fixture feed must not silently fall back to the real one.
+    static func feedURLs(_ config: Config) -> [URL] {
         let env = ProcessInfo.processInfo.environment["GHOSTIE_UPDATE_FEED"]
-        if let env, !env.isEmpty, let u = URL(string: env) { return u }
+        if let env, !env.isEmpty, let u = URL(string: env) { return [u] }
         let o = config.updateFeedOverride?.trimmingCharacters(in: .whitespaces) ?? ""
-        if !o.isEmpty, let u = URL(string: o) { return u }
-        return URL(string: canonicalFeed)!
+        if !o.isEmpty, let u = URL(string: o) { return [u] }
+        return [mirrorFeed, canonicalFeed].compactMap { URL(string: $0) }
+    }
+
+    /// Classify a non-200 check response. Pure, so the selftest can feed it
+    /// header dictionaries.
+    ///
+    /// An exhausted budget reaches us three ways: a 403 with
+    /// `X-RateLimit-Remaining: 0` (the hourly per-IP budget), a 403 carrying
+    /// `Retry-After` (a secondary/abuse limit), and a plain 429. Only the
+    /// first was recognised before, so the other two surfaced as a bare
+    /// "HTTP 403" the user could do nothing with.
+    ///
+    /// `Retry-After` may be an HTTP-date rather than delta-seconds; we read
+    /// only the seconds form and fall through to `X-RateLimit-Reset`, which
+    /// GitHub always sends on the hourly limit.
+    static func classify(status: Int, headers: [String: String],
+                         now: Date = Date()) -> UpdateError {
+        func header(_ name: String) -> String? {
+            for (k, v) in headers where k.caseInsensitiveCompare(name) == .orderedSame {
+                let t = v.trimmingCharacters(in: .whitespaces)
+                return t.isEmpty ? nil : t
+            }
+            return nil
+        }
+        let retryAfter = header("Retry-After")
+        let when: Date? = {
+            if let retryAfter, let secs = Double(retryAfter), secs >= 0 {
+                return now.addingTimeInterval(secs)
+            }
+            if let reset = header("X-RateLimit-Reset"), let epoch = Double(reset), epoch > 0 {
+                return Date(timeIntervalSince1970: epoch)
+            }
+            return nil
+        }()
+        let exhausted = header("X-RateLimit-Remaining") == "0"
+        if status == 429 || (status == 403 && (exhausted || retryAfter != nil)) {
+            return .rateLimited(retryAfter: when)
+        }
+        return .http(status)
+    }
+
+    static func headerStrings(_ r: HTTPURLResponse) -> [String: String] {
+        var out: [String: String] = [:]
+        for (k, v) in r.allHeaderFields {
+            if let k = k as? String, let v = v as? String { out[k] = v }
+        }
+        return out
     }
 
     // MARK: Check
@@ -246,42 +326,76 @@ final class Updater: NSObject, URLSessionDownloadDelegate {
             DispatchQueue.main.async { completion(.success(.skippedUnsupportedBuild)) }
             return
         }
-        var req = URLRequest(url: Updater.feedURL(config))
-        req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
-        req.setValue("Ghostie-Updater", forHTTPHeaderField: "User-Agent")
-        req.timeoutInterval = 20
-        let task = URLSession.shared.dataTask(with: req) { data, resp, err in
+        Self.fetchFirstUsableFeed(Updater.feedURLs(config)) { result in
             let done: (Result<UpdateAvailability, Error>) -> Void = { r in
                 DispatchQueue.main.async { completion(r) }
             }
-            if let err = err as? URLError {
-                done(.failure(UpdateError.offline(err.localizedDescription))); return
-            }
-            if let err = err {
-                done(.failure(UpdateError.offline(err.localizedDescription))); return
-            }
-            if let http = resp as? HTTPURLResponse, http.statusCode != 200 {
-                if http.statusCode == 403,
-                   (http.value(forHTTPHeaderField: "X-RateLimit-Remaining") == "0") {
-                    done(.failure(UpdateError.rateLimited)); return
-                }
-                done(.failure(UpdateError.http(http.statusCode))); return
-            }
-            guard let data = data else {
-                done(.failure(UpdateError.badManifest("empty response"))); return
-            }
-            do {
-                let release = try Updater.parseLatestJSON(data)
+            switch result {
+            case .failure(let e):
+                done(.failure(e))
+            case .success(let release):
                 let current = Updater.runningVersion()
                 Self.recordCheckTime()
-                if Updater.compare(running: current, latest: release.version) {
-                    done(.success(.available(release, current: current)))
-                } else {
-                    done(.success(.upToDate(current: current)))
-                }
-            } catch { done(.failure(error)) }
+                done(.success(Updater.compare(running: current, latest: release.version)
+                              ? .available(release, current: current)
+                              : .upToDate(current: current)))
+            }
         }
-        task.resume()
+    }
+
+    /// Walk the feed chain and return the first feed that yields a usable
+    /// release. A feed that fails for *any* reason is skipped — offline,
+    /// rate-limited, or a mirror stale enough to be missing the asset — so a
+    /// broken mirror degrades to the old GitHub-only behaviour instead of
+    /// blocking the check. Only the last feed's error reaches the user, since
+    /// GitHub is the authoritative one.
+    private static func fetchFirstUsableFeed(
+        _ feeds: [URL],
+        completion: @escaping (Result<ReleaseInfo, Error>) -> Void) {
+        guard let feed = feeds.first else {
+            completion(.failure(UpdateError.badManifest("no update feed configured")))
+            return
+        }
+        let rest = Array(feeds.dropFirst())
+        fetchFeed(feed) { result in
+            switch result {
+            case .success(let release):
+                completion(.success(release))
+            case .failure(let e):
+                guard !rest.isEmpty else { completion(.failure(e)); return }
+                Log.info("Update feed \(feed.host ?? feed.absoluteString) unusable "
+                         + "(\(e.localizedDescription)) — falling back.")
+                fetchFirstUsableFeed(rest, completion: completion)
+            }
+        }
+    }
+
+    private static func fetchFeed(_ url: URL,
+                                  completion: @escaping (Result<ReleaseInfo, Error>) -> Void) {
+        var req = URLRequest(url: url)
+        req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        req.setValue("Ghostie-Updater", forHTTPHeaderField: "User-Agent")
+        req.timeoutInterval = 20
+        // Deliberately the default protocol cache policy. Freshness is handled
+        // by the feeds themselves (the mirror sends `max-age=0` so clients
+        // always revalidate against the CDN), and leaving it alone lets
+        // URLSession revalidate GitHub with `If-None-Match` — a 304 costs
+        // nothing against the very rate limit this whole chain exists to dodge.
+        URLSession.shared.dataTask(with: req) { data, resp, err in
+            if let err = err {
+                completion(.failure(UpdateError.offline(err.localizedDescription))); return
+            }
+            if let http = resp as? HTTPURLResponse, http.statusCode != 200 {
+                completion(.failure(Updater.classify(status: http.statusCode,
+                                                     headers: Updater.headerStrings(http))))
+                return
+            }
+            guard let data = data else {
+                completion(.failure(UpdateError.badManifest("empty response"))); return
+            }
+            do    { completion(.success(try Updater.parseLatestJSON(data))) }
+            catch { completion(.failure(error)) }
+        }.resume()
     }
 
     private static func recordCheckTime() {

@@ -244,7 +244,7 @@ final class UpdatesPane: NSView {
                                        accessibilityDescription: nil)?
                 .withSymbolConfiguration(.init(pointSize: 22, weight: .semibold))
             heroSymbol.contentTintColor = Theme.danger
-            heroTitle.stringValue = "Couldn't reach GitHub"
+            heroTitle.stringValue = "Couldn't check for updates"
             heroSub.stringValue = e
             checkBtn.title = "Try again"
         }
