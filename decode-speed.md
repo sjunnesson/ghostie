@@ -91,6 +91,19 @@ machinery needed to map results back — `toOriginal` is per-span already, and
 `silencePadMs` already separates spliced spans so whisper doesn't run words
 together across a cut.
 
+> **Correction, 2026-09-09 — done, but not that way.** Building the spans from
+> `run.segments` saved nothing: `121 min of run → 121 min of speech (1% less
+> audio to decode)`. Those segments come from `LanguageSegmenter.segments`,
+> which are whisper's *transcription* segments over VAD-filtered audio rather
+> than silero's speech regions — they run straight across the silences they
+> look like they exclude. The 44.6%/54.4% above was measured with an energy
+> profile, i.e. against something the code wasn't using. `AudioStitcher.spans`
+> is built on the track's loudness envelope instead, which is what was
+> actually measured. Delivered **28% less audio on Me and 45% on
+> Participants**, and decode time tracked it exactly: 8m03s → 5m43s and 8m08s
+> → ~4m. The lesson is narrow and worth keeping: *measure the thing the code
+> will use, not a model of it.*
+
 Risks, in order:
 
 - **Timestamp remap.** More spans means more entries in the offset table and
@@ -108,6 +121,14 @@ Risks, in order:
 
 This lever alone: 30m09s → **~22m**. Not a halving, but it is the one with no
 fidelity cost and it makes every later decode experiment 2× faster to run.
+
+**Measured, 2026-09-09 (Levers 1 + 3 together): 30m09s → 21m18s.** And it is
+not only free of fidelity cost, it is a fidelity *improvement*: whisper
+produced 958 Me segments instead of 1252 and 553 Participants instead of 717,
+because the segments it is no longer producing were the ones it was inventing
+over silence. The transcript came out with *more* real words (17,747 vs
+17,592), token overlap held at 83.6%, the worst 5-minute bucket improved from
+0.91 to 0.93, and speaker agreement went from 99.8% to 99.9%.
 
 ## Lever 2 — a smaller decode model (the halving, and the risk)
 
@@ -136,19 +157,47 @@ an experiment, in this order:
    outcome — `codeSwitch.languages` is already per-language, so English can use
    turbo and Swedish keep KB-Whisper with no new mechanism at all.
 
+> **Result, 2026-09-09 — turbo is rejected.** It delivers the halving:
+> **30m09s → 15m23s**, decode 5m43s → 2m27s (Me) and ~4m → 2m00s
+> (Participants), and it *passes the token bar* at 83.9% overlap with the
+> reference — identical to large-v3 — with 99.9% speaker agreement.
+>
+> It fails on proper nouns, exactly as predicted, and the token metric cannot
+> see it: four wrong names in 17,660 words is 0.02%. On this call, against
+> large-v3 on the same audio:
+>
+> | | large-v3 | turbo |
+> |---|---|---|
+> | "Charlotta" | 2 | **0** — written "Charlotte", and dropped once |
+> | "Porus" (the user's own brand) | 1 | **0** — "Porus dot systems" gone entirely |
+> | "Akshan" | 5 | **1** — "Aksha", and "me and Akshan" → **"me in Action"** |
+> | Gonzalo / Sven / Alva / CID | 4 / 5 / 3 / 3 | 3 / 4 / 2 / 2 |
+>
+> A name in an action item turning into a common noun is the specific failure
+> a meeting note cannot absorb — the whole claim of the tool is that you can
+> cite it. Sentences closed also fell 75% → 66%.
+>
+> **Keep turbo installed and available, don't default to it.** Anyone who
+> wants the speed and can live with the names sets it per language, which
+> needs no code:
+> `codeSwitch.languages[] = {"code": "en", "model": "…/ggml-large-v3-turbo-q5_0.bin"}`.
+> Swedish was never tested, because there is no reason to: KB-Whisper decodes
+> it and is unaffected.
+
 If turbo fails the bar, the fallback ladder, cheapest first:
 
 - **Beam search.** `-bo 5 -bs 5` in both `Transcriber` and
-  `CodeSwitchTranscriber` is roughly 3–5× the cost of greedy. `-bo 2 -bs 2`
-  typically recovers most of that for a small accuracy cost. Same experiment,
-  same bar. Note the flags are deliberate anti-hallucination settings
-  (`CLAUDE.md`), so this trade must be scored on hallucination count — the
-  silence gate's `decoded from silence` counter is now a direct readout of it.
+  `CodeSwitchTranscriber` is the pinned anti-hallucination setting.
+  **Measured 2026-09-09 on 10 minutes of the reference audio: 31.3s at
+  `-bo 5 -bs 5`, 27.0s at `-bo 2 -bs 2`, 23.0s greedy.** So the whole ladder
+  is worth 27% of the decode stage at its most aggressive rung — about 1
+  minute of the 21 — in exchange for the decoding flags that exist to stop
+  whisper inventing text. **Rejected**: too little speed for a real risk.
 - **`transcriptionQuality` becomes real.** It currently only picks a model on
   the single-language path and does nothing under code-switching, which is
   where everyone actually is. Making it choose large-v3 vs turbo per language
-  turns this whole lever into a user-facing setting rather than a decision
-  taken for them.
+  would turn this into a user-facing setting rather than a decision taken for
+  them — worth doing if anyone ever asks for the turbo trade, not before.
 
 ## Lever 3 — stop punctuating what is already punctuated (~2 min)
 
@@ -165,6 +214,11 @@ protocol.
 
 Expected **7m28s → ~5m**, and proportionally fewer requests, which also lowers
 the rate-limit pressure that forced concurrency down from 4 to 3.
+
+**Measured, 2026-09-09:** 361 of 852 blocks (42%) skipped on the first run;
+after Lever 1 removed the silence-decoded segments there were 589 blocks and
+119 skipped. Sentences closed went 72% → 75%, so nothing was lost by not
+sending them.
 
 Risk: a block that *looks* punctuated but is capitalized wrongly gets skipped.
 Acceptable — the pass exists for the run-on register, and the guard means the
@@ -189,6 +243,24 @@ worst case is a line left as whisper wrote it.
 turbo and the beam-search fallback both fail the reference bar, the honest
 answer is that 20 minutes is the floor for this architecture and the next real
 gain is the one below.
+
+## What actually happened
+
+| | measured | verdict |
+|---|---|---|
+| baseline (v1.8.0) | 30m09s, 83.9% overlap | |
+| **Levers 1 + 3** | **21m18s, 83.6% overlap** | **shipped** |
+| + Lever 2 (turbo) | 15m23s, 83.9% overlap | **rejected — proper nouns** |
+| + beam reduction | ~1 min of 21 | rejected — not worth the risk |
+
+**The floor for this architecture is ~21 minutes, and that is where it now
+sits.** Levers 1 and 3 also *improved* the transcript rather than costing
+anything: 155 more real words, worst 5-minute bucket 0.91 → 0.93, speaker
+agreement 99.8% → 99.9%, sentences closed 72% → 75%. The halving to 15
+minutes exists and is one config line away, but it is paid for in names, and
+that is not a trade this tool should make by default.
+
+The next real gain is the section below.
 
 ## The other answer: don't wait until the call ends
 
