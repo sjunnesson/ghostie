@@ -27,7 +27,8 @@ struct ClaudeSummarizationProvider: SummarizationProvider {
 
     private var timeout: TimeInterval { max(60, config.summaryTimeoutSeconds) }
 
-    func complete(system: String, user userContent: String) throws -> String {
+    func complete(system: String, user userContent: String,
+                  purpose: String = "Summarizing") throws -> String {
         let binary = claudeBinary
         guard !binary.isEmpty,
               FileManager.default.isExecutableFile(atPath: binary) else {
@@ -56,7 +57,7 @@ struct ClaudeSummarizationProvider: SummarizationProvider {
         proc.standardOutput = outPipe
         proc.standardError = errPipe
 
-        Log.info("Summarizing via `claude -p` (\(config.summaryModel))…")
+        Log.info("\(purpose) via `claude -p` (\(config.summaryModel))…")
         do {
             try proc.run()
         } catch {

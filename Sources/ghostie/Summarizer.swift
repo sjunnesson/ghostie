@@ -15,6 +15,25 @@ struct Summarizer {
         }
     }
 
+    /// The provider for the mechanical passes — today, punctuation restoration.
+    ///
+    /// The same backend on a different model. Restoring punctuation is the
+    /// highest-volume caller in the pipeline and asks for no judgement, and
+    /// `TranscriptRefiner.preservesWording` throws away anything a model did
+    /// beyond punctuating, so a lighter tier here cannot corrupt a transcript
+    /// — it can only leave a line as whisper wrote it. Falls back to
+    /// `provider` whenever there is nothing to switch to: an Ollama install
+    /// (one local model, and the alias would mean nothing to it), an empty
+    /// setting, or a setting that names the summary model anyway.
+    var punctuationProvider: SummarizationProvider {
+        let model = config.punctuationModel.trimmingCharacters(in: .whitespaces)
+        guard config.summaryProvider != "ollama",
+              !model.isEmpty, model != config.summaryModel else { return provider }
+        var tuned = config
+        tuned.summaryModel = model
+        return ClaudeSummarizationProvider(config: tuned)
+    }
+
     var isConfigured: Bool { provider.isConfigured }
 
     /// Single-shot when the transcript fits the provider's context budget;

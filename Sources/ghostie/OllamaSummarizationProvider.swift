@@ -41,7 +41,44 @@ struct OllamaSummarizationProvider: SummarizationProvider {
     /// path in `Summarizer` rather than silently overflowing the window.
     var maxTranscriptChars: Int { 24_000 }
 
-    func complete(system: String, user userContent: String) throws -> String {
+    /// The `/api/chat` request body.
+    ///
+    /// `think: false` matters more than it looks. Every current small model
+    /// worth running locally for this — the Qwen3 family especially — reasons
+    /// before answering unless told not to, and the two jobs sent here are
+    /// exactly the ones where that is pure waste: restoring punctuation and
+    /// writing a note from a transcript that is already in front of it. Left
+    /// on, a 4B model spends its speed advantage thinking, and the reasoning
+    /// it emits can push the reply out of the shape `TranscriptRefiner.parse`
+    /// requires, costing the batch its punctuation as well as the time.
+    ///
+    /// Models with no thinking mode reject the field outright, which is why
+    /// `complete` retries once without it rather than assuming either way.
+    /// Static + pure so `selftest` can check the shape without a server.
+    static func requestBody(model: String, system: String, user: String,
+                            think: Bool?) -> [String: Any] {
+        var body: [String: Any] = [
+            "model": model,
+            "messages": [
+                ["role": "system", "content": system],
+                ["role": "user",   "content": user]
+            ],
+            "stream": false,
+            "options": ["temperature": 0.2]
+        ]
+        if let think { body["think"] = think }
+        return body
+    }
+
+    /// Whether an Ollama error body is complaining about `think` rather than
+    /// about the request itself.
+    static func mentionsThinking(_ data: Data) -> Bool {
+        guard let s = String(data: data, encoding: .utf8)?.lowercased() else { return false }
+        return s.contains("think")
+    }
+
+    func complete(system: String, user userContent: String,
+                  purpose: String = "Summarizing") throws -> String {
         guard !config.ollamaModel.isEmpty else {
             throw NSError(domain: "ghostie", code: 10, userInfo: [
                 NSLocalizedDescriptionKey:
@@ -56,33 +93,41 @@ struct OllamaSummarizationProvider: SummarizationProvider {
             ])
         }
 
-        let body: [String: Any] = [
-            "model": config.ollamaModel,
-            "messages": [
-                ["role": "system", "content": system],
-                ["role": "user",   "content": userContent]
-            ],
-            "stream": false,
-            "options": ["temperature": 0.2]
-        ]
         let payload: Data
         do {
-            payload = try JSONSerialization.data(withJSONObject: body)
+            payload = try JSONSerialization.data(
+                withJSONObject: Self.requestBody(model: config.ollamaModel,
+                                                 system: system, user: userContent,
+                                                 think: false))
         } catch {
             throw NSError(domain: "ghostie", code: 12, userInfo: [
                 NSLocalizedDescriptionKey: "Could not serialize Ollama request: \(error.localizedDescription)"
             ])
         }
 
-        var req = URLRequest(url: baseURL.appendingPathComponent("api/chat"))
-        req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.httpBody = payload
-        req.timeoutInterval = summarizeTimeout
+        func request(_ body: Data) -> URLRequest {
+            var req = URLRequest(url: baseURL.appendingPathComponent("api/chat"))
+            req.httpMethod = "POST"
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.httpBody = body
+            req.timeoutInterval = summarizeTimeout
+            return req
+        }
 
-        Log.info("Summarizing via Ollama (\(config.ollamaModel) at \(baseURL.absoluteString))…")
+        Log.info("\(purpose) via Ollama (\(config.ollamaModel) at \(baseURL.absoluteString))…")
 
-        let result = Self.syncDataTask(request: req, timeout: summarizeTimeout)
+        var result = Self.syncDataTask(request: request(payload), timeout: summarizeTimeout)
+        // A model with no thinking mode rejects the field rather than
+        // ignoring it. Ask again without it before giving up — the point of
+        // sending it is speed, never a requirement.
+        if case .success(let (data, http)) = result, http.statusCode == 400,
+           Self.mentionsThinking(data),
+           let plain = try? JSONSerialization.data(
+                withJSONObject: Self.requestBody(model: config.ollamaModel,
+                                                 system: system, user: userContent,
+                                                 think: nil)) {
+            result = Self.syncDataTask(request: request(plain), timeout: summarizeTimeout)
+        }
         switch result {
         case .failure(let err):
             throw NSError(domain: "ghostie", code: 13, userInfo: [

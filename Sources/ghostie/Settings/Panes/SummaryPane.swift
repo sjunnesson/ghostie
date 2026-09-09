@@ -121,39 +121,57 @@ final class SummaryPane: NSView {
             leadingSymbol: "terminal", leadingTint: Theme.text2,
             control: StatusBadgeView(kind: claudeReady ? .ok : .warn,
                                      label: claudeReady ? "Signed in" : "Missing")))
-        // Rows come from `ClaudeModels`, which offers *tier aliases* rather than
-        // pinned version ids — an alias resolves to whatever is current, so this
-        // picker doesn't fall behind Anthropic's releases the way the old
-        // hardcoded version list did. Whatever is configured is always one of
-        // the rows, so the picker can't display one model while another is set.
-        let (entries, selected) = ClaudeModels.menu(configured: cfgState.summaryModel)
-        let modelPopup = NSPopUpButton(frame: .zero, pullsDown: false)
-        for entry in entries {
-            modelPopup.addItem(withTitle: ClaudeModels.title(for: entry))
-        }
-        modelPopup.selectItem(at: selected)
-        let modelTarget = ToggleTarget { [weak self] in
-            guard let self else { return }
-            let i = modelPopup.indexOfSelectedItem
-            guard i >= 0, i < entries.count else { return }
-            switch entries[i] {
-            case .alias(let id), .pinned(let id):
-                self.applySummaryModel(id)
-            case .custom:
-                // Restore the selection first: if the prompt is cancelled the
-                // picker must go back to showing what's actually configured.
-                modelPopup.selectItem(at: selected)
-                if let id = self.promptForModelID() { self.applySummaryModel(id) }
-            }
-        }
-        modelPopup.target = modelTarget
-        modelPopup.action = #selector(ToggleTarget.fire)
-        objc_setAssociatedObject(modelPopup, &ToggleTarget.key, modelTarget, .OBJC_ASSOCIATION_RETAIN)
-        modelPopup.widthAnchor.constraint(equalToConstant: 220).isActive = true
         card.addRow(RowBuilder.row(
             label: "Which Claude writes the note",
             sub: ClaudeModels.summary(for: cfgState.summaryModel),
-            control: modelPopup), last: true)
+            control: modelPicker(configured: cfgState.summaryModel,
+                                 apply: { [weak self] in self?.applySummaryModel($0) })))
+        // A second, deliberately cheaper tier for the punctuation pass. The
+        // two jobs are not alike: that one is mechanical, runs 9-14 requests
+        // to the note's one, and `preservesWording` discards anything the
+        // model changed beyond punctuation — so the downside of a light model
+        // here is a line left as whisper wrote it, not a rewritten record.
+        card.addRow(RowBuilder.row(
+            label: "Which Claude repairs punctuation",
+            sub: cfgState.punctuationModel == cfgState.summaryModel
+                ? "The same model that writes the note."
+                : ClaudeModels.summary(for: cfgState.punctuationModel),
+            control: modelPicker(configured: cfgState.punctuationModel,
+                                 apply: { [weak self] in self?.applyPunctuationModel($0) })),
+                    last: true)
+    }
+
+    /// One model popup. Rows come from `ClaudeModels`, which offers *tier
+    /// aliases* rather than pinned version ids — an alias resolves to whatever
+    /// is current, so this picker doesn't fall behind Anthropic's releases the
+    /// way the old hardcoded version list did. Whatever is configured is
+    /// always one of the rows, so the picker can't display one model while
+    /// another is set.
+    private func modelPicker(configured: String,
+                             apply: @escaping (String) -> Void) -> NSPopUpButton {
+        let (entries, selected) = ClaudeModels.menu(configured: configured)
+        let popup = NSPopUpButton(frame: .zero, pullsDown: false)
+        for entry in entries { popup.addItem(withTitle: ClaudeModels.title(for: entry)) }
+        popup.selectItem(at: selected)
+        let target = ToggleTarget { [weak self] in
+            guard let self else { return }
+            let i = popup.indexOfSelectedItem
+            guard i >= 0, i < entries.count else { return }
+            switch entries[i] {
+            case .alias(let id), .pinned(let id):
+                apply(id)
+            case .custom:
+                // Restore the selection first: if the prompt is cancelled the
+                // picker must go back to showing what's actually configured.
+                popup.selectItem(at: selected)
+                if let id = self.promptForModelID(current: configured) { apply(id) }
+            }
+        }
+        popup.target = target
+        popup.action = #selector(ToggleTarget.fire)
+        objc_setAssociatedObject(popup, &ToggleTarget.key, target, .OBJC_ASSOCIATION_RETAIN)
+        popup.widthAnchor.constraint(equalToConstant: 220).isActive = true
+        return popup
     }
 
     private func applySummaryModel(_ id: String) {
@@ -165,13 +183,19 @@ final class SummaryPane: NSView {
         refreshProviderCard()
     }
 
+    private func applyPunctuationModel(_ id: String) {
+        guard id != cfgState.punctuationModel else { return }
+        cfgState.punctuationModel = id
+        changes { c in c.punctuationModel = id }
+        refreshProviderCard()
+    }
+
     /// Prompt for an exact model id, for pinning a specific version (or
     /// reaching a model with no tier alias). Deliberately not validated against
     /// a list — a list is what went stale in the first place; a wrong id
     /// surfaces as a clear failure from `claude -p` on the next call.
-    private func promptForModelID() -> String? {
-        let field = NSTextField(string: ClaudeModels.isAlias(cfgState.summaryModel)
-                                ? "" : cfgState.summaryModel)
+    private func promptForModelID(current: String) -> String? {
+        let field = NSTextField(string: ClaudeModels.isAlias(current) ? "" : current)
         field.placeholderString = "claude-sonnet-5"
         field.translatesAutoresizingMaskIntoConstraints = false
         field.widthAnchor.constraint(equalToConstant: 320).isActive = true

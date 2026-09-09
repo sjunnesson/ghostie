@@ -13,14 +13,29 @@ enum TranscriptCleaner {
 
     struct Stats {
         var original = 0
+        var afterSilenceGate = 0
         var afterKnownHallucinations = 0
         var afterDedup = 0
         var afterInterleaved = 0
         var afterNoiseMarkers = 0
         var afterTrailingTrim = 0
+        /// Segments dropped because their own span of the track was silent.
+        var silenced = 0
+        /// Set when the gate found so many silent segments that the
+        /// timestamps, not the transcript, are the likelier fault — nothing
+        /// is dropped in that case and the count is reported instead.
+        var silenceGateStoodDown = 0
         var removed: Int { max(0, original - afterTrailingTrim) }
         var summary: String {
-            "transcript guard: \(original) → \(afterTrailingTrim) segments (\(removed) hallucinated removed)"
+            var s = "transcript guard: \(original) → \(afterTrailingTrim) segments "
+                + "(\(removed) hallucinated removed"
+            if silenced > 0 { s += ", \(silenced) of them decoded from silence" }
+            s += ")"
+            if silenceGateStoodDown > 0 {
+                s += " — silence gate stood down: \(silenceGateStoodDown) segments "
+                    + "landed on silent audio, too many to be hallucinations"
+            }
+            return s
         }
     }
 
@@ -138,6 +153,18 @@ enum TranscriptCleaner {
         return words.last.map { noiseWords.contains($0.lowercased()) } ?? false
     }
 
+    /// Whether `segment` was decoded from a span of `audio` that carried
+    /// nothing. Requires a real end timestamp and a span the recording
+    /// actually covers: "past the end of the WAV" is missing evidence, not
+    /// silence, and must never read as one.
+    static func isSilent(_ segment: Transcriber.Segment,
+                         in audio: WavLevel.Envelope,
+                         floor: Double = silenceFloor) -> Bool {
+        guard let endMs = segment.endMs, endMs > segment.startMs,
+              audio.covers(fromMs: segment.startMs, toMs: endMs) else { return false }
+        return audio.activeFraction(fromMs: segment.startMs, toMs: endMs) <= floor
+    }
+
     /// Normalized longest-common-substring ratio (fast similarity measure),
     /// matching whisper-guard's consecutive-dedup heuristic.
     private static func similarity(_ a: String, _ b: String) -> Double {
@@ -158,13 +185,72 @@ enum TranscriptCleaner {
 
     struct Seg { let startMs: Int; var text: String }
 
+    /// A segment has to have *some* audible fraction of its own span to count
+    /// as speech that happened. Zero means not one window of it — at 50 ms
+    /// resolution, against `WavLevel.activeThreshold` (≈ −42 dBFS) — carried
+    /// anything, over a span whisper itself chose.
+    ///
+    /// A share, not a peak, because whisper does not give a hallucination a
+    /// short span. Measured by decoding 20 slices of the 2026-09-08 call and
+    /// scoring every segment against a reference recording: each invented
+    /// "Thank you." came back with an exactly 30.00-second span, one of which
+    /// contained a lone sample of 91, so a peak test caught none of them. On
+    /// those 172 segments this rule drops 4 of the 87 with no counterpart in
+    /// the reference — all four the 30-second "Thank you." spans — and 1 of
+    /// the 85 that have one, an "um". Allowing 1% active instead of 0 doubles
+    /// the catch and still costs only that one, but zero is the rule that can
+    /// be stated without a threshold anyone has to defend: nothing was there.
+    static let silenceFloor = 0.0
+
+    /// Above this share of gateable segments, the gate refuses to fire. A
+    /// third of a call cannot be hallucinated onto silence; a timestamp base
+    /// that disagrees with the audio (a stitched decode mapped back wrongly,
+    /// a truncated WAV) looks exactly like this and would otherwise delete a
+    /// real transcript quietly, which is the one outcome worth engineering
+    /// against.
+    static let maxSilentFraction = 0.35
+
+    /// …but a share is only evidence of a systematic mismatch once there are
+    /// enough segments for it to mean anything. Below this, a run of silent
+    /// segments is just a quiet recording with a few invented lines in it —
+    /// which is exactly what the gate is for — and refusing to fire would
+    /// make the guard useless on every short call.
+    static let minSegmentsToJudgeSilentFraction = 20
+
     /// Runs the guard pipeline (fixed order — it matters for correctness).
     static func clean(_ input: [(startMs: Int, text: String)])
         -> (segments: [Seg], stats: Stats) {
+        clean(input.map { Transcriber.Segment(startMs: $0.startMs, text: $0.text) })
+    }
+
+    /// As above, with the track's audio available: segments whose own span of
+    /// the recording carried nothing are dropped before any text-level rule
+    /// runs. Whisper decodes silence as readily as speech and writes
+    /// plausible sentences onto it; no amount of reading the text can tell
+    /// those from the real thing, and the audio can.
+    static func clean(_ input: [Transcriber.Segment],
+                      audio: WavLevel.Envelope? = nil)
+        -> (segments: [Seg], stats: Stats) {
         var stats = Stats()
         stats.original = input.count
-        var segs = input.map { Seg(startMs: $0.startMs, text: $0.text) }
-            .filter { !$0.text.trimmingCharacters(in: .whitespaces).isEmpty }
+        var spans = input.filter { !$0.text.trimmingCharacters(in: .whitespaces).isEmpty }
+
+        // 0. Drop what was decoded from silence.
+        if let audio {
+            // By index, not by timestamp: two segments can legitimately share
+            // a start, and only the one that is actually silent may go.
+            let gateable = spans.indices.filter { spans[$0].endMs != nil }
+            let silent = Set(gateable.filter { isSilent(spans[$0], in: audio) })
+            if gateable.count >= minSegmentsToJudgeSilentFraction,
+               Double(silent.count) / Double(gateable.count) > maxSilentFraction {
+                stats.silenceGateStoodDown = silent.count
+            } else if !silent.isEmpty {
+                spans = spans.indices.filter { !silent.contains($0) }.map { spans[$0] }
+                stats.silenced = silent.count
+            }
+        }
+        var segs = spans.map { Seg(startMs: $0.startMs, text: $0.text) }
+        stats.afterSilenceGate = segs.count
 
         // 1. Drop training-data-leak hallucinations (YouTube/Amara/URLs).
         segs = segs.filter { !isKnownHallucination($0.text) }

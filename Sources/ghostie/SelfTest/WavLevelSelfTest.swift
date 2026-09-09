@@ -92,6 +92,27 @@ func runWavLevelSelfTest() -> Bool {
     check("nil inputs are not reported",
           Pipeline.trackHealthWarning(mic: nil, sys: nil) == nil)
 
+    // ---- Envelope: the per-span probe the transcript guard reads
+    if let talking = write("env-talking.wav", seconds: 6, sample: speech),
+       let silent = write("env-silent.wav", seconds: 6, sample: { _ in 0 }),
+       let env = WavLevel.envelope(talking),
+       let quietEnv = WavLevel.envelope(silent) {
+        check("envelope: covers the whole track", abs(env.seconds - 6) < 0.2,
+              "got \(env.seconds)s")
+        check("envelope: finds speech in a spoken span",
+              env.peak(fromMs: 1_000, toMs: 2_000) > 1_000)
+        check("envelope: reports zeros on a silent track",
+              quietEnv.peak(fromMs: 1_000, toMs: 2_000) == 0)
+        check("envelope: a span past the end is not covered",
+              !quietEnv.covers(fromMs: 10_000, toMs: 11_000)
+              && quietEnv.covers(fromMs: 1_000, toMs: 2_000))
+        check("envelope: an empty or reversed span reads as nothing",
+              env.peak(fromMs: 2_000, toMs: 2_000) == 0
+              && env.peak(fromMs: 3_000, toMs: 1_000) == 0)
+    } else {
+        check("envelope fixtures", false, "could not write or read fixtures")
+    }
+
     print("WavLevel self-test: \(passed) passed, \(failed) failed")
     return failed == 0
 }

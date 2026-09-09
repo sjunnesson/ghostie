@@ -36,10 +36,12 @@ stay at zero (a recent commit silenced them deliberately).
 `ghostie selftest` is the only automated test. Its suites (wired in
 `main.swift`, living in `SelfTest/`): `runTranscriptCleanerSelfTest()`
 (exercises `TranscriptCleaner.clean` over silence loops, training-data leaks,
-noise-marker runs, interleaved drift, within-segment loops),
+noise-marker runs, interleaved drift, within-segment loops, and the
+digital-silence gate including its stand-down),
 `runTranscriptRefinerSelfTest()` (exercises `TranscriptRefiner` — coalescing
-rules, the `preservesWording` guard, reply parsing and batching, all against a
-stub provider), `runEchoSuppressorSelfTest()` (exercises `EchoSuppressor.suppress` over
+rules including backchannel crossing, `blocks`/`split` and their timestamp
+provenance, sentence splitting, the `preservesWording` guard, reply parsing and
+concurrent batching, all against a stub provider), `runEchoSuppressorSelfTest()` (exercises `EchoSuppressor.suppress` over
 real-call echo fixtures — pure echo, mixed real+echo segments, ASR variance,
 plus the never-engage guards for headphone/solo calls), and
 `runCodeSwitchSelfTest()` (exercises the `Smoother` over synthetic
@@ -117,7 +119,14 @@ the same code drives the menu-bar app and the headless daemon.
   clustering cannot ignore) and are backfilled from their neighbours instead.
   The 0.70 merge threshold is measured, not guessed — see the doc comment.
   Entirely optional: no ONNX runtime or no model means the far end keeps one
-  "Participants" label.
+  "Participants" label. `diarize` returns nil **only** when there was too
+  little to judge on; audio that was clustered and held one voice comes back
+  as an `Assignment` with `speakerCount == 1`, so the transcript can say
+  "Participant 1" (a person) rather than "Participants" (a track). That
+  distinction is not cosmetic: on the 2026-09-08 Meet call the far end was one
+  person labelled "Participants" for two hours and the summary wrote *"a close
+  friend (labeled 'Participants')"* into its prose, having no way to tell a
+  track name from a name.
 - **`Detection/AXParticipantRosterProvider.swift`** — reads who is in the
   meeting off the meeting window over AX, so naming picks from a closed set
   instead of guessing. Verified against Google Meet in Chrome (2026-08-29):
@@ -165,10 +174,14 @@ the same code drives the menu-bar app and the headless daemon.
 - **`WavLevel.swift`** — post-hoc signal probe on the finished WAVs. Catches a
   track that recorded nothing regardless of cause, on every route to a note,
   and puts a ⚠️ line in the meta block (which the summarizer also sees).
-- **`Pipeline.swift`** — transcribe both tracks → clean per track → diarize
-  Participants → cross-track echo guard → merge by timestamp → coalesce into
-  turns + restore punctuation (`TranscriptRefiner`) → name speakers →
-  summarize → write
+  `probe` asks that about the whole file; **`envelope`** answers it per span
+  (one streamed pass → peak per 50 ms window) and is what
+  `TranscriptCleaner`'s silence gate reads.
+- **`Pipeline.swift`** — transcribe both tracks → clean per track (with each
+  track's `WavLevel.envelope`, so the guard can drop what was decoded from
+  silence) → diarize Participants → cross-track echo guard → merge by
+  timestamp → blocks + restore punctuation + split into turns
+  (`TranscriptRefiner`) → name speakers → summarize → write
   `<notesFolder>/<date>_<Source>-Call.md` (+ transcript), where Source is
   the detected app ("Teams"/"Zoom"/"Meet", generic "Call" when unknown). The
   name must stay a pure function of `startedAt` + the source stored in
@@ -204,9 +217,39 @@ the same code drives the menu-bar app and the headless daemon.
   any line whose wording changed keeps whisper's original. Never weaken that
   check — a transcript missing commas is a nuisance, one quietly rewritten by a
   language model is a record you cannot cite and nothing downstream would
-  notice. Covered by `selftest`.
+  notice. Its batches are independent, so they run
+  `maxConcurrentBatches` (4) at a time through the `Sink` lock rather than in
+  series — 14 batches at ~90 s each were 21 of the 62 post-processing minutes
+  on the 2026-09-08 call. Two rules exist because that call's turns still
+  ended mid-clause 46% of the time (reference recording: 3%):
+  **`coalesce` crosses a backchannel** — a ≤`maxInterjectionWords` (3) line
+  from the other speaker does not end the sentence it lands inside; the
+  interjection keeps its own place and timestamp, and only the reading order
+  inside a few seconds shifts — and **`blocks` → `restore` → `split`** replaces
+  a single capped `coalesce`: the model is shown `blockWords` (120) blocks,
+  because a sentence boundary is invisible until punctuation is back and a
+  40-word cut lands mid-clause, then `split` cuts one turn per sentence at the
+  boundaries that came back, carrying each piece's real timestamp from
+  `Block.sources`. A block nothing punctuated falls through `split` cut at the
+  word budget — exactly the old shape. Covered by `selftest`.
 - **`TranscriptCleaner.swift`** — the per-track hallucination guard. Deliberately
   conservative (a single legitimate "Okay." survives). Covered by `selftest`.
+  Its first stage is not a text rule at all: given the track's
+  `WavLevel.Envelope`, a segment none of whose own span rose above
+  `WavLevel.activeThreshold` (≈ −42 dBFS) is dropped, because words cannot
+  come from nothing. Whisper decodes silence as readily as speech — Google
+  Meet sends nothing while the far side is quiet, and the 2026-09-08 call came
+  back with 26 "Thank you." turns written onto those holes, each one also
+  splitting a real sentence on the other track. **Use the active *share*, not
+  the peak**: whisper gives a hallucination the whole quiet stretch (every one
+  of those turns had an exactly 30.00 s span), and a single stray sample of 91
+  inside 30 seconds defeated a peak test — the first version of this gate
+  shipped that way and caught nothing. Above `maxSilentFraction` (35%) of
+  gateable segments, and only once there are `minSegmentsToJudgeSilentFraction`
+  (20) of them, the gate **stands down and logs**: a third of a call cannot be
+  hallucinated, but a timestamp base that disagrees with the audio looks
+  identical and would otherwise delete a real transcript in silence. Segments
+  without an `endMs`, and spans past the end of the WAV, are never judged.
 - **Code-switching (N-language, e.g. sv↔en)** — active whenever ≥2 languages
   resolve to an installed model; there is no `codeSwitch.enabled` flag.
   `codeSwitch.languages` is an array of **`LanguageSetting` records**
@@ -263,7 +306,16 @@ the same code drives the menu-bar app and the headless daemon.
   without it: a spread-out sample of ≤24 segments
   (`LanguageSegmenter.probeIndices` / `monolingualVerdict`, both pure + covered
   by `selftest`) short-circuits the per-segment pass when *every* probe agrees
-  on one language. It is gated on `!identifier.isLowLatency` on purpose — it
+  on one language. Unanimity is on the **label**; confidence is judged across
+  the sample (median margin ≥ `monoProbeMinMargin`, no probe below
+  `monoProbeWeakMargin`) rather than probe by probe, because one soft reading
+  of the right language is not evidence of a second one — the old per-probe
+  floor turned `24×en (margin 0.67–6.91)` into a 26-minute full pass that
+  concluded English. Unanimous-or-nothing means one stray sample costs the whole
+  track a full pass, so the log now carries `probeSummary` (what each probe
+  read, with margins) and the full pass reports its own duration and verdict —
+  without those two lines there was no evidence to tune the rule on, and the
+  2026-09-08 call spent 25 minutes proving the majority the probes already had. It is gated on `!identifier.isLowLatency` on purpose — it
   trades recall for time, and that trade is only worth making when the full
   pass costs tens of minutes. Don't ungate it.
 - **Summarization** — `Summarizer.swift` is a thin façade that dispatches to a
@@ -277,6 +329,18 @@ the same code drives the menu-bar app and the headless daemon.
   `SummarizerPrompt.swift` so both providers produce notes with the same
   structure. Provider selection is honored strictly — a failure backlogs the
   transcript, it never silently falls back to the other provider.
+  **One provider, optionally two models**: `Summarizer.provider` writes the
+  note on `summaryModel`; `Summarizer.punctuationProvider` restores
+  punctuation on `punctuationModel`, which **defaults to empty — the same
+  model**. Splitting is safe (`preservesWording` verifies that pass, so a
+  weaker model there can only leave a line as whisper wrote it), but measured
+  on 24 real blocks × 3 trials through `claude -p`, **Haiku took 225 s to
+  Sonnet's 32 s** — the cheap tier is the slow one here, and this pass is on
+  the critical path. Don't re-default it to a lighter tier without re-running
+  that measurement. Only the Claude provider reads `punctuationModel` (the
+  value is a Claude tier alias); Ollama runs its one local model for both. `complete(system:user:purpose:)` carries the stage
+  name into the log so a run of punctuation batches no longer reports itself
+  as "Summarizing".
 - **`Backlog.swift`** — durable retry queue at `~/.ghostie/backlog/`. Two
   stages: `transcribe` (audio kept) and `summarize` (transcript kept, audio
   dropped so it's never re-transcribed). A note is always written immediately

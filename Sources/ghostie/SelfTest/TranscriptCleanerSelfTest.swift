@@ -131,6 +131,87 @@ func runTranscriptCleanerSelfTest() -> Bool {
         out.filter { $0 == "Statusen är grön." }.count == 3
     }
 
+    // MARK: the silence gate — words cannot come from zeros
+
+    /// A synthetic track: `loud` marks which 1-second slots carry audio.
+    func envelope(_ loud: Set<Int>, seconds: Int) -> WavLevel.Envelope {
+        WavLevel.Envelope(windowMs: 50,
+                          peaks: (0..<(seconds * 20)).map { loud.contains($0 / 20) ? 9_000 : 0 })
+    }
+    func span(_ startMs: Int, _ endMs: Int, _ text: String) -> Transcriber.Segment {
+        Transcriber.Segment(startMs: startMs, text: text, endMs: endMs)
+    }
+    func plain(_ name: String, _ ok: Bool, _ detail: @autoclosure () -> String = "") {
+        if ok { passed += 1; print("  ✓ \(name)") }
+        else { failed += 1; print("  ✗ \(name)  \(detail())") }
+    }
+
+    // The 2026-09-08 shape: a far-end track that is digitally silent whenever
+    // nobody over there is talking, and a "Thank you." decoded onto one of
+    // the holes.
+    let realSpeech = [span(0, 2_000, "So how did the reorg land"),
+                      span(2_000, 4_000, "It closed the whole department"),
+                      span(6_000, 7_000, "Thank you."),
+                      span(10_000, 12_000, "And then they offered me a package")]
+    let track = envelope([0, 1, 2, 3, 10, 11], seconds: 13)
+    let gated = TranscriptCleaner.clean(realSpeech, audio: track)
+    plain("silence gate: a segment decoded from zeros is dropped",
+          gated.segments.count == 3 && !gated.segments.contains { $0.text == "Thank you." }
+          && gated.stats.silenced == 1,
+          "got \(gated.segments.map(\.text))")
+
+    plain("silence gate: real speech on the same track is untouched",
+          gated.segments.map(\.text) == ["So how did the reorg land",
+                                         "It closed the whole department",
+                                         "And then they offered me a package"])
+
+    plain("silence gate: without audio nothing is dropped",
+          TranscriptCleaner.clean(realSpeech).segments.count == 4)
+
+    plain("silence gate: a segment with no end timestamp is never judged",
+          TranscriptCleaner.clean(
+            [Transcriber.Segment(startMs: 6_000, text: "Thank you.")],
+            audio: track).segments.count == 1)
+
+    plain("silence gate: a span past the end of the WAV is missing evidence, not silence",
+          TranscriptCleaner.clean([span(20_000, 22_000, "still talking")],
+                                  audio: track).segments.count == 1)
+
+    // A hallucination gets a *long* span — whisper hands the whole quiet
+    // stretch to one invented line — and a lone blip inside it must not
+    // rescue it. This is the case a peak test got wrong on the real call.
+    let longHole = envelope([0, 1, 29], seconds: 30)
+    plain("silence gate: one blip in a 25-second span does not make it speech",
+          TranscriptCleaner.clean([span(2_000, 27_000, "Thank you.")],
+                                  audio: longHole).stats.silenced == 1,
+          "gate did not fire on a near-empty 25 s span")
+
+    plain("silence gate: a segment that overlaps real speech is kept",
+          TranscriptCleaner.clean([span(0, 3_000, "So how did the reorg land")],
+                                  audio: longHole).stats.silenced == 0)
+
+    // Timestamps that disagree with the audio look exactly like a fully
+    // hallucinated call. That is the case to refuse, not to act on.
+    // Deliberately unalike, so only the gate could remove any of them.
+    let distinct = ["the reorg closed our department", "so I took the package instead",
+                    "Anne starts her new role in March", "we fly to Bologna on Sunday",
+                    "the day rate lands around twenty five hundred",
+                    "their valuation assumes tripling revenue", "no bot ever joins the call",
+                    "Milo was held back a year", "the grant application was rejected",
+                    "she is fundraising through the autumn", "the severance runs six months",
+                    "we talked about the hackathon idea", "Bologna is two weeks of teaching",
+                    "the convertible note was thirty thousand", "she missed the German grant",
+                    "clinical trial referrals pay per lead", "the subscription model comes next",
+                    "impostor syndrome came up a lot", "we should be sounding boards",
+                    "he is speaking at the conference"]
+    let allSilent = distinct.enumerated().map { span($0.offset * 1_000,
+                                                     $0.offset * 1_000 + 900, $0.element) }
+    let standDown = TranscriptCleaner.clean(allSilent, audio: envelope([], seconds: 30))
+    plain("silence gate: stands down rather than delete a whole transcript",
+          standDown.segments.count == distinct.count && standDown.stats.silenced == 0
+          && standDown.stats.silenceGateStoodDown == distinct.count,
+          standDown.stats.summary)
+
     print("\ntranscript-cleaner self-test: \(passed) passed, \(failed) failed")
     return failed == 0
 }

@@ -62,9 +62,14 @@ struct SpeakerDiarizer {
     }
 
     /// `segments` must be time-ordered; `samples` is the whole track as ±1
-    /// mono 16 kHz floats. Returns nil when the track is too short, nothing
-    /// could be embedded, or everything landed on one speaker — every one of
-    /// which means "keep the existing single label".
+    /// mono 16 kHz floats.
+    ///
+    /// Returns nil only when there was not enough to judge on — too short a
+    /// track, too few segments, nothing that could be embedded. Audio that
+    /// *was* clustered and turned out to hold one voice comes back as an
+    /// `Assignment` with `speakerCount == 1`, because "one person spoke here"
+    /// is a finding and "I could not tell" is not, and the transcript labels
+    /// the two differently.
     func diarize(segments: [Transcriber.Segment],
                  samples: [Float],
                  embedder: SpeakerEmbedder) -> Assignment? {
@@ -109,7 +114,7 @@ struct SpeakerDiarizer {
         if fillUnlabelled { speakers = fillGaps(speakers) }
 
         let ids = Set(speakers.compactMap { $0 })
-        guard ids.count > 1 else { return nil }
+        guard !ids.isEmpty else { return nil }
 
         // Renumber so speaker 0 is whoever speaks first — "Participant 1"
         // should be the person who opened the call, not an arbitrary index.

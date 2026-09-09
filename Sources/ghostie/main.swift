@@ -554,6 +554,13 @@ func cmdDoctor(_ config: Config) {
         let claudePath = config.claudeBinary.isEmpty ? Config.findClaudeBinary() : config.claudeBinary
         row(s.isConfigured, "Claude Code CLI (`claude -p`)",
             s.isConfigured ? claudePath : "not found — install Claude Code and run `claude` once to log in")
+        // Two models, two jobs — worth stating, because the punctuation pass
+        // is the one that makes most of the requests.
+        let punctuation = config.punctuationModel.trimmingCharacters(in: .whitespaces)
+        row(true, "models",
+            "notes: \(config.summaryModel) — punctuation: "
+                + (punctuation.isEmpty || punctuation == config.summaryModel
+                    ? "\(config.summaryModel) (same)" : punctuation))
     }
     // Languages: rendered straight off `LanguageSetup`, the same struct the
     // Settings pane draws — doctor and the UI can't disagree about what will
@@ -800,7 +807,7 @@ func cmdDiarizeProbe(_ config: Config, wavPath: String, segmentMs: Int) {
     diarizer.fillUnlabelled = ProcessInfo.processInfo.environment["GHOSTIE_DIARIZE_NOFILL"] == nil
     guard let a = diarizer.diarize(segments: segments, samples: floats,
                                    embedder: embedder) else {
-        print("verdict: a single speaker (or too little audio to split)")
+        print("verdict: too little audio to judge on")
         return
     }
     print(a.summary)

@@ -27,8 +27,72 @@ enum WavLevel {
         var isDigitalSilence: Bool { peak == 0 }
     }
 
-    /// Peak below this in a 100 ms window counts as "nothing here" (≈ −42 dBFS).
-    private static let activeThreshold = 256
+    /// A track's loudness over time, one peak magnitude per window.
+    ///
+    /// `probe` answers "was this track ever connected to anything"; this
+    /// answers the same question about one *span* of it, which is what the
+    /// transcript needs. Whisper decodes whatever WAV it is handed, silence
+    /// included, and invents plausible speech there — on the 2026-09-08 call
+    /// it wrote 26 "Thank you." turns onto stretches of `participants.wav`
+    /// that were exact zeros (Google Meet stops sending audio when nobody on
+    /// the far side is talking). Words cannot come from zeros, so a segment
+    /// whose own span never rose above the noise floor did not happen.
+    struct Envelope {
+        let windowMs: Int
+        /// Largest absolute sample in each window, in Int16 units.
+        let peaks: [Int]
+        var seconds: Double { Double(peaks.count * windowMs) / 1000 }
+
+        /// Loudest sample in `[fromMs, toMs)`, or 0 when the span is empty or
+        /// lies past the end of the track. Windows that merely *overlap* the
+        /// span count: a whisper timestamp is accurate to a few hundred
+        /// milliseconds at best, and the whole point is to be slow to call
+        /// something silent.
+        func peak(fromMs: Int, toMs: Int) -> Int {
+            guard let range = windows(fromMs: fromMs, toMs: toMs) else { return 0 }
+            return peaks[range].max() ?? 0
+        }
+
+        /// Share of the span's windows carrying anything above `threshold`.
+        ///
+        /// This, not `peak`, is what tells a decoded utterance from a decoded
+        /// silence — because whisper does not give a hallucination a short
+        /// span. Measured on the 2026-09-08 call: every invented "Thank you."
+        /// came back with an *exactly 30.00 s* span covering the whole quiet
+        /// stretch, and one stray sample of 91 somewhere in those 30 seconds
+        /// is enough to defeat a peak test. Over a span that long the
+        /// question worth asking is not "was anything ever loud" but "was
+        /// anything loud for any part of it".
+        func activeFraction(fromMs: Int, toMs: Int,
+                            threshold: Int = activeThreshold) -> Double {
+            guard let range = windows(fromMs: fromMs, toMs: toMs) else { return 0 }
+            let active = peaks[range].reduce(0) { $0 + ($1 >= threshold ? 1 : 0) }
+            return Double(active) / Double(range.count)
+        }
+
+        /// Window indices overlapping `[fromMs, toMs)`, or nil when the span
+        /// is empty or falls outside the track.
+        private func windows(fromMs: Int, toMs: Int) -> ClosedRange<Int>? {
+            guard !peaks.isEmpty, toMs > fromMs else { return nil }
+            let first = max(0, fromMs / windowMs)
+            let last = min(peaks.count - 1, (toMs - 1) / windowMs)
+            return first <= last ? first...last : nil
+        }
+
+        /// Whether `[fromMs, toMs)` is inside the recording at all. A span
+        /// past the end reads as silent for want of data, which is not the
+        /// same claim and must not be treated as one.
+        func covers(fromMs: Int, toMs: Int) -> Bool {
+            guard !peaks.isEmpty, toMs > fromMs, fromMs >= 0 else { return false }
+            return toMs <= peaks.count * windowMs
+        }
+    }
+
+    /// Peak below this in a window counts as "nothing here" (≈ −42 dBFS).
+    /// A live-but-idle microphone, a quiet room and a muted-but-connected
+    /// participant all sit above it; conference audio that is simply not
+    /// being sent sits below.
+    static let activeThreshold = 256
     private static let sampleRate = 16_000
     private static let windowSamples = sampleRate / 10
     private static let readChunkBytes = 1 << 20
@@ -85,6 +149,49 @@ enum WavLevel {
                      peak: peak,
                      activeFraction: totalWindows == 0
                         ? 0 : Double(activeWindows) / Double(totalWindows))
+    }
+
+    /// One streamed pass producing a peak-per-`windowMs` profile of the track.
+    ///
+    /// 50 ms is short enough that a two-word segment spans several windows and
+    /// long enough that a 126-minute call costs ~150 k `Int`s. Returns nil for
+    /// anything that is not a readable PCM WAV, which callers must treat as
+    /// "no evidence" rather than as silence.
+    static func envelope(_ url: URL, windowMs: Int = 50) -> Envelope? {
+        guard windowMs > 0,
+              let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+        guard let dataOffset = try? dataChunkOffset(handle) else { return nil }
+        try? handle.seek(toOffset: dataOffset)
+
+        let perWindow = max(1, sampleRate * windowMs / 1000)
+        var peaks: [Int] = []
+        var windowPeak = 0
+        var windowFill = 0
+        var carry: UInt8?
+
+        while true {
+            guard let chunk = try? handle.read(upToCount: readChunkBytes),
+                  !chunk.isEmpty else { break }
+            var bytes = chunk
+            if let c = carry { bytes.insert(c, at: bytes.startIndex); carry = nil }
+            if bytes.count % 2 == 1 { carry = bytes.removeLast() }
+            bytes.withUnsafeBytes { raw in
+                for i in 0..<(raw.count / 2) {
+                    let magnitude = Int(raw.loadUnaligned(fromByteOffset: i * 2,
+                                                          as: Int16.self).magnitude)
+                    if magnitude > windowPeak { windowPeak = magnitude }
+                    windowFill += 1
+                    if windowFill == perWindow {
+                        peaks.append(windowPeak)
+                        windowPeak = 0
+                        windowFill = 0
+                    }
+                }
+            }
+        }
+        if windowFill > 0 { peaks.append(windowPeak) }
+        return peaks.isEmpty ? nil : Envelope(windowMs: windowMs, peaks: peaks)
     }
 
     /// Walks the RIFF chunk list to the start of `data`. Ghostie's own writer

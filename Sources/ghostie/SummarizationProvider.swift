@@ -27,10 +27,18 @@ protocol SummarizationProvider {
     /// throws. Errors should use the `"ghostie"` `NSError` domain so the
     /// existing Pipeline + Backlog error handling treats every provider's
     /// failures identically.
-    func complete(system: String, user: String) throws -> String
+    /// `purpose` names the stage this request belongs to, for the log — the
+    /// same provider serves the summary, punctuation restoration and speaker
+    /// naming, and a run of identical "summarizing…" lines during a
+    /// punctuation pass is a log that misreports what the machine is doing.
+    func complete(system: String, user: String, purpose: String) throws -> String
 }
 
 extension SummarizationProvider {
+    func complete(system: String, user: String) throws -> String {
+        try complete(system: system, user: user, purpose: "Summarizing")
+    }
+
     /// Single-shot analyst summary; `Summarizer` calls this when the
     /// transcript fits `maxTranscriptChars`.
     func summarize(transcript: String, meta: String) throws -> String {

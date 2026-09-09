@@ -53,6 +53,26 @@ enum ClaudeModels {
     /// pinned to whatever happened to be current on the day they installed.
     static let defaultModel = "sonnet"
 
+    /// …and the default for the mechanical pass: empty, meaning "whatever
+    /// writes the note".
+    ///
+    /// The argument for a lighter tier here is sound — restoring punctuation
+    /// is high-volume (9–14 requests against the summary's one), asks for no
+    /// judgement, and `TranscriptRefiner.preservesWording` discards anything
+    /// the model did beyond punctuating, so a weak model can only fail to
+    /// improve a line, never rewrite one. The measurement is the problem.
+    /// On 24 real blocks (1470 words) from the 2026-09-08 call, three trials
+    /// each through `claude -p`: **Haiku 225 s median, Sonnet 32 s** — seven
+    /// times slower, for the same wording preservation (72/72 vs 70/72) and
+    /// slightly less punctuation (19.6 vs 21.0 marks per 100 words). Scaled
+    /// to a whole call that is ~11 minutes against ~6, and this pass sits on
+    /// the critical path to the note.
+    ///
+    /// So the setting exists and the picker offers every tier, but the
+    /// default is not to split: on this machine, through this CLI, the
+    /// cheaper tier is the slower one.
+    static let defaultPunctuationModel = ""
+
     // MARK: Picker contents
 
     /// What a menu row stands for.

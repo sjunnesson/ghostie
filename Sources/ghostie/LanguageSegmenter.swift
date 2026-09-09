@@ -214,6 +214,7 @@ struct LanguageSegmenter {
         }
 
         var dets: [LanguageDetection] = []
+        let fullPassStart = Date()
         for s in segs {
             if s.durationMs < cs.minDetectMs || pcm.isEmpty {
                 dets.append(unknownDetection(s)); continue
@@ -250,6 +251,14 @@ struct LanguageSegmenter {
                 }
             }
         }
+        // What the pass cost, and what it concluded — the two facts needed to
+        // judge whether the fast path's unanimity rule is too strict.
+        let languages = Set(dets.map(\.top).filter { $0 != LanguageDetection.unknown })
+        let verdict = languages.count == 1
+            ? "all \(languages.first ?? "?")"
+            : languages.sorted().joined(separator: "+") + " present"
+        let elapsed = String(format: "%.0f", Date().timeIntervalSince(fullPassStart))
+        Log.info("Language pass: \(segs.count) segments in \(elapsed) s, \(verdict).")
         return dets
     }
 
@@ -276,9 +285,22 @@ struct LanguageSegmenter {
     /// hour-long track.
     static let monoProbeCount = 24
     static let monoProbeMinSamples = 8
-    /// Every probe must clear this top1−top2 log-prob margin. exp(1.5) ≈ 4.5×,
-    /// i.e. no probe was anywhere near a coin flip.
+    /// The sample's *median* top1−top2 log-prob margin must clear this.
+    /// exp(1.5) ≈ 4.5×, i.e. the typical probe was nowhere near a coin flip.
     static let monoProbeMinMargin = 1.5
+    /// …and no individual probe may fall below this. exp(0.5) ≈ 1.6×: still
+    /// leaning the same way, just not hard.
+    ///
+    /// This used to be one test — *every* probe had to clear 1.5 — which made
+    /// a single soft reading veto the whole track. Measured on the 2026-09-08
+    /// call, where the log records what the sample actually saw:
+    /// `24×en (margin 0.67–6.91)`. All 24 probes read English, 23 of them
+    /// emphatically, and the one at 0.67 sent a two-hour recording through
+    /// the full per-segment pass — 26 minutes, which then concluded English.
+    /// A probe that reads `en` weakly is not evidence of a second language;
+    /// a probe that reads `sv` is, and unanimity on the label — the guard
+    /// that actually protects against mis-routing a track — is untouched.
+    static let monoProbeWeakMargin = 0.5
     /// …and at most this share of probes may come back `unknown`. A track the
     /// LID keeps shrugging at is exactly the one not to generalise from.
     static let monoProbeMaxUnknown = 1.0 / 3.0
@@ -324,14 +346,43 @@ struct LanguageSegmenter {
               let agg = Self.aggregate(probes.filter { $0.top != LanguageDetection.unknown }
                                               .map(\.logprobs))
         else {
-            Log.info("Language probe: \(idx.count) samples were not unanimous — running the full per-segment pass.")
+            Log.info("Language probe: \(Self.probeSummary(probes)) — not unanimous, "
+                + "running the full per-segment pass (the expensive one; "
+                + "installing the ONNX LID makes it seconds).")
             return nil
         }
-        Log.info("Language probe: \(idx.count) samples across the track all read \(lang) — skipping per-segment detection.")
+        Log.info("Language probe: \(Self.probeSummary(probes)) — all read \(lang), "
+            + "skipping per-segment detection.")
         // Every segment carries the sample's aggregate posterior: it is the
         // evidence we actually have, and it gives the smoother a real margin
         // to collapse the track into one run with.
         return segs.map { Self.detection(from: agg, whitelist: whitelist, segment: $0) }
+    }
+
+    /// What the probe sample actually saw, as one line: which languages, how
+    /// many each, and the margin range behind them.
+    ///
+    /// The verdict is unanimous-or-nothing, so a single stray sample sends a
+    /// whole track through the full pass — 25 minutes on the 2026-09-08 call,
+    /// which then came back with one English run and confirmed the majority
+    /// the probes already had. Without this line the log said only "not
+    /// unanimous", so there was no way to tell a near-miss from a genuinely
+    /// mixed track, and therefore no evidence to tune the rule on. Static +
+    /// pure for the selftest.
+    static func probeSummary(_ probes: [LanguageDetection]) -> String {
+        guard !probes.isEmpty else { return "no usable samples" }
+        let byLang = Dictionary(grouping: probes, by: \.top)
+        return byLang.keys.sorted { (byLang[$0]!.count, $1) > (byLang[$1]!.count, $0) }
+            .map { lang -> String in
+                let group = byLang[lang]!
+                guard lang != LanguageDetection.unknown,
+                      let lo = group.map(\.margin).min(),
+                      let hi = group.map(\.margin).max() else {
+                    return "\(group.count)×unknown"
+                }
+                return String(format: "%d×%@ (margin %.2f–%.2f)", group.count, lang, lo, hi)
+            }
+            .joined(separator: ", ")
     }
 
     /// Indices of up to `count` detect-eligible segments spread evenly across
@@ -346,23 +397,39 @@ struct LanguageSegmenter {
 
     /// The one language a probe sample proves the whole track is in, or nil.
     ///
-    /// Deliberately unanimous-or-nothing: a false positive routes a whole
-    /// track to the wrong model and mistranscribes the other language with no
-    /// signal anywhere, which is far worse than the minutes the fast path
-    /// saves. Every usable probe must agree, every one of them must clear
-    /// `minMargin`, and too many `unknown`s disqualify the sample outright.
+    /// Deliberately unanimous-or-nothing **on the label**: a false positive
+    /// routes a whole track to the wrong model and mistranscribes the other
+    /// language with no signal anywhere, which is far worse than the minutes
+    /// the fast path saves. Every usable probe must name the same language,
+    /// and too many `unknown`s disqualify the sample outright.
+    ///
+    /// Confidence is judged across the sample rather than probe by probe: the
+    /// median margin carries `minMargin`, and no single probe may sit below
+    /// `weakMargin`. One quiet or noisy slice reading the right language
+    /// weakly says nothing about whether a second language is present — see
+    /// `monoProbeWeakMargin` for what the old per-probe rule cost.
     /// Static + pure for the selftest.
     static func monolingualVerdict(_ probes: [LanguageDetection],
                                    minSamples: Int,
                                    minMargin: Double,
-                                   maxUnknownFraction: Double) -> String? {
+                                   maxUnknownFraction: Double,
+                                   weakMargin: Double = monoProbeWeakMargin) -> String? {
         guard probes.count >= minSamples else { return nil }
         let known = probes.filter { $0.top != LanguageDetection.unknown }
         guard !known.isEmpty,
               Double(probes.count - known.count) / Double(probes.count) <= maxUnknownFraction,
               Set(known.map(\.top)).count == 1,
-              known.allSatisfy({ $0.margin >= minMargin }) else { return nil }
+              known.allSatisfy({ $0.margin >= weakMargin }),
+              median(known.map(\.margin)) >= minMargin else { return nil }
         return known[0].top
+    }
+
+    /// Median of a non-empty list; 0 for an empty one.
+    static func median(_ values: [Double]) -> Double {
+        guard !values.isEmpty else { return 0 }
+        let v = values.sorted()
+        return v.count % 2 == 1 ? v[v.count / 2]
+            : (v[v.count / 2 - 1] + v[v.count / 2]) / 2
     }
 
     // MARK: Fine (sliding-window) LID pass

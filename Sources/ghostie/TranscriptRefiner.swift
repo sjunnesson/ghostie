@@ -32,6 +32,28 @@ enum TranscriptRefiner {
 
     // MARK: - 1. Coalescing (pure)
 
+    /// A turn, plus where each of its source lines started. `split` needs the
+    /// second half: once punctuation comes back, a block is re-cut at sentence
+    /// boundaries and every piece has to carry the timestamp of the line its
+    /// first word actually came from, not the block's.
+    struct Block {
+        var line: Pipeline.Line
+        /// Word offset → source line start, in order, first entry at offset 0.
+        var sources: [(wordOffset: Int, startMs: Int)]
+        /// Start of the last source line folded into this block.
+        var lastLineStartMs: Int
+        /// Words in the block, by the same whitespace count `split` uses.
+        var words: Int
+        var speaker: String { line.speaker }
+
+        /// The timestamp for a piece of this block beginning at `word`.
+        func startMs(atWord word: Int) -> Int {
+            var ms = line.startMs
+            for s in sources where s.wordOffset <= word { ms = s.startMs }
+            return ms
+        }
+    }
+
     /// A turn ends when the speaker changes, when the previous line already
     /// closed a sentence, when the two lines are too far apart to be one
     /// utterance, or when the turn has grown past `maxTurnWords`.
@@ -50,28 +72,194 @@ enum TranscriptRefiner {
     /// 22.8 words). Higher caps drift toward paragraphs nobody reads.
     static func coalesce(_ lines: [Pipeline.Line],
                          maxJoinGapMs: Int = 15_000,
-                         maxTurnWords: Int = 40) -> [Pipeline.Line] {
-        var out: [Pipeline.Line] = []
-        var wordsInTurn = 0
-        var previousStart = 0
+                         maxTurnWords: Int = 40,
+                         maxInterjectionWords: Int = maxInterjectionWords,
+                         maxInterjectionGapMs: Int = 10_000) -> [Pipeline.Line] {
+        blocks(lines, maxJoinGapMs: maxJoinGapMs, maxTurnWords: maxTurnWords,
+               maxInterjectionWords: maxInterjectionWords,
+               maxInterjectionGapMs: maxInterjectionGapMs).map(\.line)
+    }
+
+    /// Words a line may have and still count as a backchannel rather than a
+    /// turn. "Yeah." / "Mm-hmm." / "Okay okay." are listening noises: they do
+    /// not end the sentence they land in the middle of, and treating them as
+    /// speaker changes is what cut 106 of the 511 unfinished turns on the
+    /// 2026-09-08 call. 3 is deliberately below the length of the shortest
+    /// real contribution on that call ("How old is she now?").
+    static let maxInterjectionWords = 3
+
+    /// Turns per provider request, and the block size those turns are built
+    /// at. See `restore` for the first; the second is larger than any turn
+    /// anyone wants to read on purpose — sentence boundaries are invisible
+    /// until punctuation comes back, so cutting at 40 words first would put
+    /// arbitrary breaks mid-clause that nothing downstream could distinguish
+    /// from real ones. `split` cuts the readable turns afterwards, at the
+    /// sentences the model just restored.
+    static let blockWords = 120
+
+    /// `coalesce`, keeping each turn's provenance. See `Block`.
+    ///
+    /// The one rule here that reorders anything: a turn may absorb a line that
+    /// arrives *after* a short interjection from the other speaker, as long as
+    /// the turn was still mid-sentence. The interjection keeps its own place
+    /// and timestamp, so the record stays chronological to within the few
+    /// seconds of the backchannel — and the sentence it interrupted stays a
+    /// sentence, which is the whole point of the pass.
+    static func blocks(_ lines: [Pipeline.Line],
+                       maxJoinGapMs: Int = 15_000,
+                       maxTurnWords: Int = 40,
+                       maxInterjectionWords: Int = maxInterjectionWords,
+                       maxInterjectionGapMs: Int = 10_000) -> [Block] {
+        var out: [Block] = []
+
+        /// Folds `line` into the block at `i`, if that block will have it.
+        func absorb(_ line: Pipeline.Line, into i: Int, words: Int,
+                    within budget: Int) -> Bool {
+            guard out[i].line.speaker == line.speaker,
+                  !endsSentence(out[i].line.text),
+                  line.startMs - out[i].lastLineStartMs <= budget,
+                  out[i].words + words <= maxTurnWords else { return false }
+            out[i].sources.append((wordOffset: out[i].words, startMs: line.startMs))
+            out[i].line = Pipeline.Line(startMs: out[i].line.startMs,
+                                        speaker: out[i].line.speaker,
+                                        text: join(out[i].line.text, line.text))
+            out[i].words += words
+            out[i].lastLineStartMs = line.startMs
+            return true
+        }
+
         for line in lines {
             let words = wordCount(line.text)
-            if let current = out.last,
-               current.speaker == line.speaker,
-               line.startMs - previousStart <= maxJoinGapMs,
-               !endsSentence(current.text),
-               wordsInTurn + words <= maxTurnWords {
-                out[out.count - 1] = Pipeline.Line(
-                    startMs: current.startMs,
-                    speaker: current.speaker,
-                    text: join(current.text, line.text))
-                wordsInTurn += words
-            } else {
-                out.append(line)
-                wordsInTurn = words
-            }
-            previousStart = line.startMs
+            // The line before this one, same speaker: the ordinary join.
+            if let i = out.indices.last,
+               absorb(line, into: i, words: words, within: maxJoinGapMs) { continue }
+            // The line before *that*, with only a backchannel in between.
+            if out.count >= 2, maxInterjectionWords > 0,
+               out[out.count - 1].speaker != line.speaker,
+               out[out.count - 1].words <= maxInterjectionWords,
+               absorb(line, into: out.count - 2, words: words,
+                      within: maxInterjectionGapMs) { continue }
+            out.append(Block(line: line,
+                             sources: [(wordOffset: 0, startMs: line.startMs)],
+                             lastLineStartMs: line.startMs,
+                             words: words))
         }
+        return out
+    }
+
+    /// Cuts punctuated blocks back into readable turns at the sentence
+    /// boundaries `restore` just put back, carrying each piece's real
+    /// timestamp over from the block it came from.
+    ///
+    /// `restored` must be `blocks`' own lines, in order and in the same
+    /// number — that is `restore`'s contract, and a mismatch means something
+    /// restructured the transcript, in which case the blocks are returned
+    /// untouched rather than re-cut against the wrong provenance.
+    ///
+    /// A block the model never punctuated (rejected, or unreachable) has no
+    /// sentence boundaries to cut at, so it falls out of here whole — exactly
+    /// the shape `coalesce` at `maxTurnWords` produced before this pass
+    /// existed.
+    static func split(_ restored: [Pipeline.Line], blocks: [Block],
+                      maxTurnWords: Int = 40) -> [Pipeline.Line] {
+        guard restored.count == blocks.count else { return restored }
+        var out: [Pipeline.Line] = []
+        for (line, block) in zip(restored, blocks) {
+            var word = 0
+            for piece in sentencePieces(line.text, maxWords: maxTurnWords) {
+                out.append(Pipeline.Line(startMs: block.startMs(atWord: word),
+                                         speaker: line.speaker, text: piece))
+                word += wordCount(piece)
+            }
+        }
+        // Back into time order. `coalesce` crossed a backchannel to keep a
+        // sentence whole, which left that block's later sentences sitting
+        // before the interjection they came after; now that each sentence
+        // carries its own timestamp, the interjection can go back where it
+        // happened — between two whole sentences instead of inside one.
+        // Stable, so pieces sharing a start keep the order they were said in.
+        return out.enumerated()
+            .sorted { ($0.element.startMs, $0.offset) < ($1.element.startMs, $1.offset) }
+            .map(\.element)
+    }
+
+    /// `text` cut into readable turns: one sentence each.
+    ///
+    /// A turn per sentence is the shape a reference recording of the
+    /// 2026-09-08 call has (1286 turns, 14 words each) and the shape that
+    /// makes a timestamp useful — every line points at the moment its own
+    /// words were said. Two exceptions, in this order:
+    ///
+    /// - a piece under `minPieceWords` is folded back into the one before it,
+    ///   which is also what absorbs the abbreviations ("Mr.", "e.g.") that
+    ///   look like sentence ends, as long as that keeps it inside the budget;
+    /// - a piece still over `maxWords` has no sentence boundary to cut at —
+    ///   an unpunctuated block, or one the model declined to punctuate — and
+    ///   is cut at the budget instead, which is exactly what `coalesce` did
+    ///   before this pass existed.
+    static func sentencePieces(_ text: String, maxWords: Int,
+                               minPieceWords: Int = 3) -> [String] {
+        var pieces: [String] = []
+        for sentence in splitSentences(text) {
+            if let last = pieces.last, wordCount(sentence) < minPieceWords,
+               wordCount(last) + wordCount(sentence) <= maxWords {
+                pieces[pieces.count - 1] = join(last, sentence)
+            } else {
+                pieces.append(sentence)
+            }
+        }
+        return pieces.flatMap { budgeted($0, maxWords: maxWords) }
+    }
+
+    /// `text` in chunks of at most `maxWords` whitespace-separated words.
+    private static func budgeted(_ text: String, maxWords: Int) -> [String] {
+        let words = text.split(whereSeparator: { $0 == " " || $0 == "\n" || $0 == "\t" })
+        guard maxWords > 0, words.count > maxWords else { return [text] }
+        return stride(from: 0, to: words.count, by: maxWords).map {
+            words[$0..<min($0 + maxWords, words.count)].joined(separator: " ")
+        }
+    }
+
+    /// Tokens whose trailing period is part of the word. Speech transcripts
+    /// are thin on abbreviations, but "Mr. Smith" splitting into two turns is
+    /// the kind of small wrongness a reader notices immediately. Initials
+    /// ("J. Smith") are handled by the single-letter rule instead of listing
+    /// the alphabet.
+    static let abbreviations: Set<String> = [
+        "mr", "mrs", "ms", "dr", "prof", "st", "jr", "sr", "vs", "no", "fig",
+        "inc", "ltd", "co", "etc", "e.g", "i.e", "approx", "dept", "est"
+    ]
+
+    /// Sentence-terminator scan: a break is a `.?!…` run, any closing quotes
+    /// or brackets after it, and then whitespace. Nothing else counts, so
+    /// decimals and mid-word periods are safe, and a period closing a known
+    /// abbreviation or an initial does not break either.
+    static func splitSentences(_ text: String) -> [String] {
+        let closers: Set<Character> = ["\"", "'", "\u{201D}", "\u{2019}", ")", "]", "\u{00BB}"]
+        var out: [String] = []
+        var current = ""
+        let chars = Array(text)
+        var i = 0
+        while i < chars.count {
+            current.append(chars[i])
+            if ".?!\u{2026}".contains(chars[i]) {
+                var j = i + 1
+                while j < chars.count, ".?!\u{2026}".contains(chars[j]) || closers.contains(chars[j]) {
+                    current.append(chars[j]); j += 1
+                }
+                if (j >= chars.count || chars[j].isWhitespace),
+                   !endsAbbreviation(current) {
+                    let piece = current.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !piece.isEmpty { out.append(piece) }
+                    current = ""
+                }
+                i = j
+                continue
+            }
+            i += 1
+        }
+        let tail = current.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !tail.isEmpty { out.append(tail) }
         return out
     }
 
@@ -83,6 +271,16 @@ enum TranscriptRefiner {
         while let last = s.last, closers.contains(last) { s = s.dropLast() }
         guard let last = s.last else { return false }
         return ".?!…".contains(last)
+    }
+
+    /// Whether the text so far ends in an abbreviation or an initial rather
+    /// than a finished sentence.
+    private static func endsAbbreviation(_ text: String) -> Bool {
+        guard let token = text.split(whereSeparator: { $0 == " " || $0 == "\n" || $0 == "\t" })
+            .last?.lowercased() else { return false }
+        let word = token.trimmingCharacters(in: CharacterSet(charactersIn: ".?!\u{2026}\"')]"))
+        return word.count == 1 && word.first?.isLetter == true
+            || abbreviations.contains(word)
     }
 
     private static func join(_ a: String, _ b: String) -> String {
@@ -103,6 +301,12 @@ enum TranscriptRefiner {
 
     struct Stats {
         var attempted = false
+        /// Batches whose request failed outright (timeout, non-zero exit, a
+        /// rate limiter). Their turns keep whisper's text, and — unlike a
+        /// rejected reply — nothing about the transcript says so, which is
+        /// why this is counted and reported.
+        var failedBatches = 0
+        var totalBatches = 0
         /// Punctuation marks per 100 words, before and after. This — not the
         /// share of turns ending in a full stop — is what the pass changes: a
         /// turn cut at `maxTurnWords` ends mid-sentence, and correctly comes
@@ -118,6 +322,10 @@ enum TranscriptRefiner {
             var s = "punctuation: \(restored)/\(total) turns repunctuated "
                 + "(\(densityBefore) → \(densityAfter) marks per 100 words)"
             if rejected > 0 { s += ", \(rejected) rejected for changed wording" }
+            if failedBatches > 0 {
+                s += " — \(failedBatches) of \(totalBatches) batches failed even on retry "
+                    + "and kept whisper's text"
+            }
             return s
         }
     }
@@ -141,6 +349,16 @@ enum TranscriptRefiner {
     /// any model's response budget, and a batch whose reply can't be aligned
     /// only costs those turns their punctuation, never their words.
     static let batchTurns = 80
+    /// …but never more than this many characters of transcript per request,
+    /// whatever the provider's context would allow. `batchTurns` alone sized
+    /// a request when a turn was capped at 40 words; blocks are three times
+    /// that, and 80 of them would be a ~10 000-word request answered by a
+    /// ~10 000-word reply — one truncation or one rewritten word and 80 blocks
+    /// lose their punctuation together. 12 000 chars (~2 000 words) is the
+    /// size the batches that worked on the 2026-08-28 and 2026-09-08 calls
+    /// actually were. A provider with a smaller context still wins: the two
+    /// budgets are taken together.
+    static let maxBatchChars = 12_000
     /// Hard ceiling on requests for one call, so a pathological transcript
     /// can't run up an unbounded provider bill.
     static let maxBatches = 40
@@ -176,45 +394,130 @@ enum TranscriptRefiner {
         // batch may spend. Claude's 600 k never binds and `batchSize` decides;
         // Ollama's 24 k does, so a local install sends smaller batches instead
         // of overflowing its context and losing the whole thing.
-        let charBudget = max(2_000, provider.maxTranscriptChars / 3)
-        var out = lines
+        let charBudget = min(maxBatchChars, max(2_000, provider.maxTranscriptChars / 3))
+
+        // Cut the whole transcript into batches first. They are independent —
+        // one batch's punctuation never depends on another's — so the walk is
+        // sequential and the requests are not.
+        var batches: [(offset: Int, slice: [Pipeline.Line])] = []
         var index = 0
-        var batch = 0
-        while index < lines.count, batch < maxBatches {
+        while index < lines.count, batches.count < maxBatches {
             let slice = Array(lines[index..<min(index + max(1, batchSize), lines.count)])
                 .prefixWithinBudget(charBudget)
-            let texts = slice.map(\.text)
-            guard let payload = try? JSONSerialization.data(
-                    withJSONObject: texts, options: []),
-                  let user = String(data: payload, encoding: .utf8) else {
-                index += slice.count; batch += 1; continue
-            }
-            guard let reply = try? provider.complete(system: system, user: user) else {
-                // The provider is unreachable; every remaining batch would
-                // fail the same way, so stop rather than time out 40 times.
-                Log.info("Punctuation restoration skipped: the summarization model could not be reached.")
-                break
-            }
-            if let restored = parse(reply, expecting: slice.count) {
+            guard !slice.isEmpty else { break }
+            batches.append((index, slice))
+            index += slice.count
+        }
+
+        let sink = Sink(lines: lines)
+        let queue = DispatchQueue(label: "ghostie.punctuation", attributes: .concurrent)
+        let inFlight = DispatchSemaphore(value: maxConcurrentBatches)
+        let group = DispatchGroup()
+        for (n, batch) in batches.enumerated() {
+            let texts = batch.slice.map(\.text)
+            guard let payload = try? JSONSerialization.data(withJSONObject: texts,
+                                                            options: []),
+                  let user = String(data: payload, encoding: .utf8) else { continue }
+            inFlight.wait()
+            // Several batches failing is evidence the provider is unreachable
+            // or refusing the load; the ones already running finish, no new
+            // ones start.
+            guard !sink.providerIsDown else { inFlight.signal(); break }
+            queue.async(group: group) {
+                defer { inFlight.signal() }
+                let label = "Restoring punctuation (batch \(n + 1)/\(batches.count))"
+                /// One round-trip that produced a reply of the right shape.
+                /// A request that throws and a reply that cannot be aligned
+                /// are the same thing from here: no usable answer.
+                func attempt(_ purpose: String) -> [String]? {
+                    guard let reply = try? provider.complete(system: system, user: user,
+                                                             purpose: purpose)
+                    else { return nil }
+                    return parse(reply, expecting: batch.slice.count)
+                }
+                var restored = attempt(label)
+                if restored == nil {
+                    Thread.sleep(forTimeInterval: batchRetryDelay)
+                    restored = attempt(label + ", retry")
+                }
+                guard let restored else {
+                    sink.batchFailed(max: maxBatchFailures)
+                    return
+                }
                 for (offset, candidate) in restored.enumerated() {
-                    let original = slice[offset]
+                    let original = batch.slice[offset]
                     guard preservesWording(original.text, candidate) else {
-                        stats.rejected += 1; continue
+                        sink.reject(1); continue
                     }
                     guard candidate != original.text else { continue }
-                    out[index + offset] = Pipeline.Line(startMs: original.startMs,
-                                                        speaker: original.speaker,
-                                                        text: candidate)
-                    stats.restored += 1
+                    sink.accept(at: batch.offset + offset,
+                                Pipeline.Line(startMs: original.startMs,
+                                              speaker: original.speaker,
+                                              text: candidate))
                 }
-            } else {
-                stats.rejected += slice.count
             }
-            index += slice.count
-            batch += 1
         }
+        group.wait()
+        if sink.providerIsDown {
+            Log.warn("Punctuation restoration stopped early: \(sink.failures) batches failed "
+                + "— the summarization model is unreachable or refusing the load. "
+                + "Those turns keep whisper's text.")
+        }
+        let out = sink.result
+        stats.restored = sink.restored
+        stats.rejected = sink.rejected
+        stats.failedBatches = sink.failures
+        stats.totalBatches = batches.count
         stats.densityAfter = punctuationDensity(out)
         return (out, stats)
+    }
+
+    /// Batches in flight at once. Each one is a whole provider round-trip —
+    /// on the 2026-09-08 call, 14 of them at ~90 s apiece spent 21 minutes of
+    /// a 62-minute post-processing run waiting in series.
+    ///
+    /// Three, not four: at four, that same call came back with roughly a
+    /// third of its blocks unpunctuated because several batches failed at
+    /// once, and the summary request that followed timed out too — the
+    /// signature of a burst a rate limiter is refusing, not of a dead
+    /// provider. Speed here is worth having only while the work survives.
+    static let maxConcurrentBatches = 3
+
+    /// One retry per batch, after a short pause. A batch that fails alone is
+    /// almost always transient (a timeout, a throttle); a provider that is
+    /// genuinely gone fails the retry too and `maxBatchFailures` stops the run.
+    static let batchRetryDelay: TimeInterval = 3
+
+    /// Distinct batches that may fail before the rest are abandoned. Under
+    /// concurrency a single failure is not evidence the provider is gone —
+    /// which is what the first version of this assumed, quietly dropping
+    /// every remaining batch's punctuation on one timeout.
+    static let maxBatchFailures = 3
+
+    /// The mutable half of `restore`, made explicit because the batches write
+    /// to it from several threads at once. Every write is to a distinct index
+    /// of `lines`, but Swift arrays are not safe to mutate concurrently even
+    /// then, so all of it goes through one lock.
+    private final class Sink: @unchecked Sendable {
+        private let lock = NSLock()
+        private var lines: [Pipeline.Line]
+        private var down = false
+        private(set) var restored = 0
+        private(set) var rejected = 0
+        private(set) var failures = 0
+
+        init(lines: [Pipeline.Line]) { self.lines = lines }
+
+        var result: [Pipeline.Line] { lock.lock(); defer { lock.unlock() }; return lines }
+        var providerIsDown: Bool { lock.lock(); defer { lock.unlock() }; return down }
+        /// Records a batch that failed twice; `max` of them stops the run.
+        func batchFailed(max: Int) {
+            lock.lock(); failures += 1; if failures >= max { down = true }; lock.unlock()
+        }
+        func reject(_ n: Int) { lock.lock(); rejected += n; lock.unlock() }
+        func accept(at i: Int, _ line: Pipeline.Line) {
+            lock.lock(); lines[i] = line; restored += 1; lock.unlock()
+        }
     }
 
     /// The reply, as exactly `expecting` strings, or nil. A model that

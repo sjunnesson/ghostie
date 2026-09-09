@@ -187,6 +187,17 @@ struct Config: Codable {
     /// when someone deliberately pins one. See `ClaudeModels`.
     var summaryModel: String = ClaudeModels.defaultModel
 
+    /// Which Claude restores punctuation, when that is a different one from
+    /// `summaryModel`. Empty (the default) means "the same model that writes
+    /// the note" — see `ClaudeModels.defaultPunctuationModel` for the timings
+    /// behind that default.
+    ///
+    /// Only the Claude provider reads this: the value is a Claude tier alias
+    /// and would mean nothing to Ollama, which runs the one model it has.
+    /// See `ClaudeModels.defaultPunctuationModel` for why the two jobs are
+    /// worth splitting.
+    var punctuationModel: String = ClaudeModels.defaultPunctuationModel
+
     /// Path to the `claude` binary. Auto-detected if empty. Summarization uses
     /// your existing Claude Code login (subscription/OAuth) — no API key.
     /// Only used when `summaryProvider == "claude"`.
@@ -203,10 +214,16 @@ struct Config: Codable {
     /// `summaryProvider == "ollama"`.
     var ollamaModel: String = ""
 
-    /// Wall-clock cap on one summarization request, both providers. The 300 s
-    /// default matches the old hardcoded watchdog; raise it for big local
-    /// Ollama models on slow hardware. Clamped to >= 60 at use.
-    var summaryTimeoutSeconds: Double = 300
+    /// Wall-clock cap on one summarization request, both providers. Clamped
+    /// to >= 60 at use.
+    ///
+    /// 600, not the 300 the old hardcoded watchdog used: a two-hour call is a
+    /// ~120 000-character transcript, and on 2026-09-09 one took 305 s to
+    /// summarize and was killed five seconds short — the note was written
+    /// with a "summary queued" banner and the whole thing went to the backlog
+    /// to be paid for again. The cap is there to stop a hung `claude` waiting
+    /// forever, not to bound how long a long call may take.
+    var summaryTimeoutSeconds: Double = 600
 
     // MARK: Updates (in-app OTA — see Updater.swift)
 
@@ -245,7 +262,8 @@ struct Config: Codable {
         case whisperBinary, whisperServerBinary, whisperModel, language
         case initialPrompt, vadModel
         case cleanTranscript, restorePunctuation, transcriptionQuality, codeSwitch
-        case summaryProvider, summaryModel, claudeBinary, ollamaUrl, ollamaModel
+        case summaryProvider, summaryModel, punctuationModel, claudeBinary
+        case ollamaUrl, ollamaModel
         case summaryTimeoutSeconds
         case workDir
         case autoCheckUpdates, lastUpdateCheck, updateFeedOverride
@@ -265,6 +283,9 @@ struct Config: Codable {
         "The following is a professional Microsoft Teams business call with clear punctuation and capitalization."
     private static let preZoomNotesFolder =
         "\(NSHomeDirectory())/Documents/Teams Call Notes"
+    /// The old summarization watchdog, likewise persisted by Settings into
+    /// every config that never chose it.
+    private static let oldSummaryTimeoutSeconds: Double = 300
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -322,10 +343,16 @@ struct Config: Codable {
         codeSwitch = g(.codeSwitch, d.codeSwitch)
         summaryProvider = g(.summaryProvider, d.summaryProvider)
         summaryModel = g(.summaryModel, d.summaryModel)
+        punctuationModel = g(.punctuationModel, d.punctuationModel)
         claudeBinary = g(.claudeBinary, d.claudeBinary)
         ollamaUrl = g(.ollamaUrl, d.ollamaUrl)
         ollamaModel = g(.ollamaModel, d.ollamaModel)
-        summaryTimeoutSeconds = g(.summaryTimeoutSeconds, d.summaryTimeoutSeconds)
+        // Fold: 300 was the old default and Settings wrote it into configs
+        // that never chose it. It is too short for a two-hour call, so that
+        // exact value upgrades; any other number is a deliberate edit.
+        let timeout = g(.summaryTimeoutSeconds, d.summaryTimeoutSeconds)
+        summaryTimeoutSeconds = timeout == Config.oldSummaryTimeoutSeconds
+            ? d.summaryTimeoutSeconds : timeout
         workDir = g(.workDir, d.workDir)
         autoCheckUpdates = g(.autoCheckUpdates, d.autoCheckUpdates)
         lastUpdateCheck = g(.lastUpdateCheck, d.lastUpdateCheck)

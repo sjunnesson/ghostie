@@ -1119,8 +1119,28 @@ func runCodeSwitchSelfTest() -> Bool {
         check("monolingualVerdict: too few samples never decides",
               verdict((0..<(LanguageSegmenter.monoProbeMinSamples - 1))
                         .map { _ in probe("en") }) == nil)
-        check("monolingualVerdict: one weak-margin probe vetoes",
+        check("monolingualVerdict: a probe near a coin flip still vetoes",
               verdict((0..<23).map { _ in probe("en") } + [probe("en", margin: 0.2)]) == nil)
+
+        // The 2026-09-08 shape, read straight off the log line the fast path
+        // now prints: 24×en, margins 0.67–6.91. Every probe read English and
+        // the old per-probe floor still sent the call through 26 minutes of
+        // per-segment detection.
+        check("monolingualVerdict: one softly-agreeing probe does not veto the sample",
+              verdict((0..<23).map { _ in probe("en", margin: 6.0) }
+                      + [probe("en", margin: 0.67)]) == "en")
+
+        check("monolingualVerdict: a sample that is weak throughout still vetoes",
+              verdict((0..<24).map { _ in probe("en", margin: 0.6) }) == nil)
+
+        check("monolingualVerdict: dissent vetoes however confident the rest are",
+              verdict((0..<23).map { _ in probe("en", margin: 6.9) }
+                      + [probe("sv", margin: 0.6)]) == nil)
+
+        check("median: even and odd counts",
+              LanguageSegmenter.median([1, 2, 3]) == 2
+              && LanguageSegmenter.median([1, 2, 3, 4]) == 2.5
+              && LanguageSegmenter.median([]) == 0)
         check("monolingualVerdict: a few unknowns still decide",
               verdict((0..<20).map { _ in probe("sv") }
                       + (0..<4).map { _ in probe("?") }) == "sv")
@@ -1337,6 +1357,100 @@ func runCodeSwitchSelfTest() -> Bool {
         print("  · Tests/Fixtures present — audio end-to-end checks would run here")
     } else {
         print("  · (audio fixtures absent — skipping end-to-end codeswitch checks)")
+    }
+
+    // ---- The split summary/punctuation model
+    do {
+        let dec = JSONDecoder()
+        func decode(_ json: String) -> Config? {
+            try? dec.decode(Config.self, from: Data(json.utf8))
+        }
+
+        // The highest-stakes case: `Config.loadRaw()` swallows a decoder throw
+        // with `try?`, so a new key that is not optional resets a user's whole
+        // config in silence. Every config written before this key existed must
+        // still load, with everything else intact.
+        let old = decode(#"{"summaryProvider":"claude","summaryModel":"opus","userName":"David"}"#)
+        check("punctuationModel: a config written before the key still loads",
+              old != nil && old?.summaryModel == "opus" && old?.userName == "David")
+        check("punctuationModel: and picks up the default",
+              old?.punctuationModel == ClaudeModels.defaultPunctuationModel)
+        check("punctuationModel: the shipped default does not split the models",
+              ClaudeModels.defaultPunctuationModel.isEmpty)
+
+        // A two-hour call needs longer than the old 300 s watchdog: one took
+        // 305 s and was killed, queueing the note with no summary.
+        check("summaryTimeout: the persisted old default upgrades",
+              decode(#"{"summaryTimeoutSeconds":300}"#)?.summaryTimeoutSeconds == 600)
+        check("summaryTimeout: a number the user actually chose is kept",
+              decode(#"{"summaryTimeoutSeconds":120}"#)?.summaryTimeoutSeconds == 120)
+        check("punctuationModel: an explicit value is honored",
+              decode(#"{"punctuationModel":"claude-haiku-4-5-20251001"}"#)?.punctuationModel
+                == "claude-haiku-4-5-20251001")
+
+        func summarizer(_ provider: String, summary: String,
+                        punctuation: String) -> Summarizer {
+            var c = Config()
+            c.summaryProvider = provider
+            c.summaryModel = summary
+            c.punctuationModel = punctuation
+            c.claudeBinary = "/usr/bin/true"     // resolvable, never run here
+            return Summarizer(config: c)
+        }
+        func model(of p: SummarizationProvider) -> String? {
+            (p as? ClaudeSummarizationProvider)?.config.summaryModel
+        }
+
+        let split = summarizer("claude", summary: "sonnet", punctuation: "haiku")
+        check("punctuationProvider: punctuation goes to its own model",
+              model(of: split.punctuationProvider) == "haiku")
+        check("punctuationProvider: the note still goes to the summary model",
+              model(of: split.provider) == "sonnet")
+        check("punctuationProvider: an empty setting falls back to the summary model",
+              model(of: summarizer("claude", summary: "opus",
+                                   punctuation: "").punctuationProvider) == "opus")
+        check("punctuationProvider: Ollama keeps its one local model",
+              summarizer("ollama", summary: "sonnet",
+                         punctuation: "haiku").punctuationProvider
+                is OllamaSummarizationProvider)
+    }
+
+    // ---- Ollama request shape: thinking off for the mechanical passes
+    do {
+        let body = OllamaSummarizationProvider.requestBody(
+            model: "qwen3.5:4b-mlx", system: "S", user: "U", think: false)
+        check("ollama: the request turns thinking off",
+              body["think"] as? Bool == false && body["model"] as? String == "qwen3.5:4b-mlx")
+        check("ollama: the retry omits the field entirely",
+              OllamaSummarizationProvider.requestBody(
+                model: "m", system: "S", user: "U", think: nil)["think"] == nil)
+        check("ollama: system and user ride in that order",
+              (body["messages"] as? [[String: String]])?.map { $0["role"] ?? "" }
+                == ["system", "user"])
+        check("ollama: a 400 about thinking is recognised, an unrelated one is not",
+              OllamaSummarizationProvider.mentionsThinking(
+                Data(#"{"error":"model does not support thinking"}"#.utf8))
+              && !OllamaSummarizationProvider.mentionsThinking(
+                Data(#"{"error":"model not found"}"#.utf8)))
+    }
+
+    // ---- probeSummary: what the fast path saw, in the log
+    do {
+        func probe(_ top: String, _ margin: Double) -> LanguageDetection {
+            LanguageDetection(segment: VADSegment(startMs: 0, endMs: 1_000),
+                              top: top, confidence: 0.9, margin: margin,
+                              logprobs: [:])
+        }
+        let mixed = [probe("en", 3.0), probe("en", 2.0), probe("sv", 0.4),
+                     probe(LanguageDetection.unknown, 0)]
+        let summary = LanguageSegmenter.probeSummary(mixed)
+        check("probeSummary: names every language, commonest first, with margins",
+              summary.hasPrefix("2×en (margin 2.00–3.00)")
+              && summary.contains("1×sv (margin 0.40–0.40)")
+              && summary.contains("1×unknown"),
+              summary)
+        check("probeSummary: an empty sample says so",
+              LanguageSegmenter.probeSummary([]) == "no usable samples")
     }
 
     print("\ncode-switching self-test: \(passed) passed, \(failed) failed")

@@ -297,14 +297,23 @@ struct Pipeline {
     /// the cleaner and summary see the same shape either way.
     private func transcribeMerge(mic: URL, sys: URL,
                                  roster: MeetingRoster = MeetingRoster()) throws -> [Line] {
-        func cleaned(_ raw: [Transcriber.Segment], _ speaker: String)
-            -> [(startMs: Int, text: String)] {
+        // One streamed pass per track, so the cleaner can ask whether a
+        // segment's own span of the recording carried any audio at all. Only
+        // built when the guard is on — it is the only thing that reads it.
+        func envelope(_ wav: URL) -> WavLevel.Envelope? {
+            guard config.cleanTranscript else { return nil }
+            return WavLevel.envelope(wav)
+        }
+
+        func cleaned(_ raw: [Transcriber.Segment], _ speaker: String,
+                     audio: WavLevel.Envelope?) -> [(startMs: Int, text: String)] {
             guard config.cleanTranscript else {
                 return raw.map { (startMs: $0.startMs, text: $0.text) }
             }
-            let (out, stats) = TranscriptCleaner.clean(
-                raw.map { (startMs: $0.startMs, text: $0.text) })
-            if stats.removed > 0 { Log.info("\(speaker): \(stats.summary)") }
+            let (out, stats) = TranscriptCleaner.clean(raw, audio: audio)
+            if stats.removed > 0 || stats.silenceGateStoodDown > 0 {
+                Log.info("\(speaker): \(stats.summary)")
+            }
             return out.map { (startMs: $0.startMs, text: $0.text) }
         }
 
@@ -323,12 +332,14 @@ struct Pipeline {
                 + active.joined(separator: "+") + ").")
             let cst = CodeSwitchTranscriber(config: config, installed: installed)
             let (meSegs, partSegs) = try cst.transcribeBoth(me: mic, participants: sys)
-            me = cleaned(meSegs, "Me")
-            part = cleaned(partSegs, "Participants")
+            me = cleaned(meSegs, "Me", audio: envelope(mic))
+            part = cleaned(partSegs, "Participants", audio: envelope(sys))
         } else {
             let transcriber = Transcriber(config: config)
-            me = cleaned(try transcriber.transcribe(mic, speaker: "Me"), "Me")
-            part = cleaned(try transcriber.transcribe(sys, speaker: "Participants"), "Participants")
+            me = cleaned(try transcriber.transcribe(mic, speaker: "Me"),
+                         "Me", audio: envelope(mic))
+            part = cleaned(try transcriber.transcribe(sys, speaker: "Participants"),
+                           "Participants", audio: envelope(sys))
         }
 
         let partLabels = diarizeParticipants(part, wav: sys)
@@ -365,10 +376,22 @@ struct Pipeline {
         }
         guard config.restorePunctuation,
               TranscriptRefiner.needsRestoration(turns) else { return turns }
+
+        // Punctuation is the only thing that makes a sentence boundary
+        // visible, so the model is shown blocks several turns long rather
+        // than the readable turns above: a 40-word cut lands mid-clause and
+        // no later pass can tell it from a real one. `split` cuts the turns
+        // afterwards, at the sentences that came back.
+        let blocks = TranscriptRefiner.blocks(
+            lines, maxTurnWords: TranscriptRefiner.blockWords)
         let (restored, stats) = TranscriptRefiner.restore(
-            turns, provider: Summarizer(config: config).provider)
+            blocks.map(\.line), provider: Summarizer(config: config).punctuationProvider)
         Log.info(stats.summary)
-        return restored
+        let out = TranscriptRefiner.split(restored, blocks: blocks)
+        let ended = Int(TranscriptRefiner.terminalFraction(out) * 100)
+        Log.info("Turn split: \(blocks.count) blocks → \(out.count) turns "
+            + "(\(ended)% end a sentence).")
+        return out
     }
 
     /// Splits the Participants track into individual speakers.
@@ -380,8 +403,17 @@ struct Pipeline {
     /// side is this", is already answered by the capture itself.
     ///
     /// Returns a label per segment start time. Empty on every unavailable or
-    /// inconclusive path, which leaves the single "Participants" label in
-    /// place: no model, no ONNX runtime, a short track, or one speaker.
+    /// inconclusive path — no model, no ONNX runtime, a short track — which
+    /// leaves the plural "Participants" label in place, because a track
+    /// nobody could split may still hold a roomful of people.
+    ///
+    /// A track that *was* split, even into one voice, is labelled
+    /// "Participant N" instead. That difference is the whole reason this
+    /// returns what it does: on the 2026-09-08 Meet call the far end was one
+    /// person and the transcript called them "Participants" for two hours,
+    /// and the summary then wrote *"a close friend (labeled 'Participants')"*
+    /// into its prose — the model had no way to know it was reading a track
+    /// name rather than a name.
     private func diarizeParticipants(_ segments: [(startMs: Int, text: String)],
                                      wav: URL) -> [Int: String] {
         guard config.diarization, segments.count > 1 else { return [:] }
@@ -401,7 +433,8 @@ struct Pipeline {
                 segments: input,
                 samples: SpeakerDiarizer.floatSamples(pcm),
                 embedder: embedder) else {
-            Log.info("Diarization: one speaker on the Participants track.")
+            Log.info("Diarization: too little on the Participants track to judge on "
+                + "— keeping the generic label.")
             return [:]
         }
         Log.info(a.summary + String(format: " in %.0fs", Date().timeIntervalSince(t0)))
