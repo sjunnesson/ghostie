@@ -458,12 +458,26 @@ enum TranscriptRefiner {
                 let label = "Restoring punctuation (batch \(n + 1)/\(batches.count))"
                 /// One round-trip that produced a reply of the right shape.
                 /// A request that throws and a reply that cannot be aligned
-                /// are the same thing from here: no usable answer.
+                /// are the same thing from here: no usable answer — but not
+                /// for the same reason, and `why` keeps them apart. Without
+                /// it the log says a batch failed and nothing about whether
+                /// the provider timed out, refused the load, or answered with
+                /// something that couldn't be aligned, which is the
+                /// difference between diagnosing the next one and guessing.
+                var why = "no reply"
                 func attempt(_ purpose: String) -> [String]? {
-                    guard let reply = try? provider.complete(system: system, user: user,
-                                                             purpose: purpose)
-                    else { return nil }
-                    return parse(reply, expecting: batch.slice.count)
+                    do {
+                        let reply = try provider.complete(system: system, user: user,
+                                                          purpose: purpose)
+                        guard let parsed = parse(reply, expecting: batch.slice.count) else {
+                            why = "reply could not be aligned to \(batch.slice.count) turns"
+                            return nil
+                        }
+                        return parsed
+                    } catch {
+                        why = error.localizedDescription
+                        return nil
+                    }
                 }
                 var restored = attempt(label)
                 if restored == nil {
@@ -471,7 +485,7 @@ enum TranscriptRefiner {
                     restored = attempt(label + ", retry")
                 }
                 guard let restored else {
-                    sink.batchFailed(max: maxBatchFailures)
+                    sink.batchFailed(max: maxBatchFailures, why: why)
                     return
                 }
                 for (offset, candidate) in restored.enumerated() {
@@ -488,10 +502,11 @@ enum TranscriptRefiner {
             }
         }
         group.wait()
-        if sink.providerIsDown {
-            Log.warn("Punctuation restoration stopped early: \(sink.failures) batches failed "
-                + "— the summarization model is unreachable or refusing the load. "
-                + "Those turns keep whisper's text.")
+        if sink.failures > 0 {
+            let detail = sink.reasons.map { "\"\($0)\"" }.joined(separator: ", ")
+            Log.warn("Punctuation: \(sink.failures) of \(batches.count) batches failed twice "
+                + "(\(detail)) — those turns keep whisper's text."
+                + (sink.providerIsDown ? " Remaining batches were not attempted." : ""))
         }
         let out = sink.result
         stats.restored = sink.restored
@@ -535,14 +550,20 @@ enum TranscriptRefiner {
         private(set) var restored = 0
         private(set) var rejected = 0
         private(set) var failures = 0
+        private(set) var reasons: [String] = []
 
         init(lines: [Pipeline.Line]) { self.lines = lines }
 
         var result: [Pipeline.Line] { lock.lock(); defer { lock.unlock() }; return lines }
         var providerIsDown: Bool { lock.lock(); defer { lock.unlock() }; return down }
         /// Records a batch that failed twice; `max` of them stops the run.
-        func batchFailed(max: Int) {
-            lock.lock(); failures += 1; if failures >= max { down = true }; lock.unlock()
+        func batchFailed(max: Int, why: String) {
+            lock.lock()
+            failures += 1
+            // Distinct reasons only: five batches timing out is one fact.
+            if !reasons.contains(why) { reasons.append(why) }
+            if failures >= max { down = true }
+            lock.unlock()
         }
         func reject(_ n: Int) { lock.lock(); rejected += n; lock.unlock() }
         func accept(at i: Int, _ line: Pipeline.Line) {

@@ -146,7 +146,15 @@ the same code drives the menu-bar app and the headless daemon.
   Teams/Zoom, panel never opened, AX denied) and costs nothing. The rules are
   pure over `RosterNode` and covered by `selftest`.
 - **`SpeakerNamer.swift`** — replaces placeholder labels with names read off
-  the transcript by the configured summarization provider. Every failure path
+  the transcript by the configured summarization provider. The local speaker
+  is settled before any of that: `config.userName`, else the roster's own
+  "(You)", else **`accountName()`** — the first name on this Mac's account,
+  when `NSFullUserName()` differs from the login name and passes
+  `isPlausibleName`. Leaving that label as "Me" is not neutral: the summary is
+  written *for* that person, and a model handed a transcript saying "Me" 558
+  times writes it back into the prose ("This call is between 'Me' (a founder
+  building Ludwig) and Andrea", 2026-09-09). Telling the model not to helps
+  and does not settle it — the same prompt, retested, produced "You (Me)". Every failure path
   keeps the placeholder, because a wrongly named speaker corrupts the summary
   built on it. Three guards, all pure + covered by `selftest`:
   `isPlausibleName` rejects roles, descriptions and anything with a digit;

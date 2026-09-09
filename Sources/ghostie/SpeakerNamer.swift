@@ -57,11 +57,13 @@ struct SpeakerNamer {
         // is applied whether or not the model can be reached.
         var resolved: [String: String] = [:]
         var ask = labels
-        // Configured name first, then the roster's own "(You)" — both are
-        // read off something authoritative rather than inferred from speech.
+        // Configured name first, then the roster's own "(You)", then the
+        // account this Mac belongs to — all three are read off something
+        // authoritative rather than inferred from speech, in decreasing order
+        // of how much the user chose them.
         let localName = !config.userName.isEmpty
             ? config.userName.trimmingCharacters(in: .whitespaces)
-            : roster.selfName
+            : (roster.selfName ?? Self.accountName())
         if let localName, !localName.isEmpty, let me = labels.first(where: { $0 == "Me" }) {
             resolved[me] = localName
             ask.removeAll { $0 == me }
@@ -115,6 +117,35 @@ struct SpeakerNamer {
                 + "label(s), because a name on the wrong voice corrupts the summary built on it.")
         }
         return Naming(names: deduped)
+    }
+
+    /// The first name on this Mac's account, when that looks like a name.
+    ///
+    /// The local speaker is the one person whose name the machine already
+    /// knows, and leaving them as "Me" is not a neutral placeholder: the
+    /// summary is written *for* them, and a model handed a transcript where
+    /// "Me" appears 558 times writes "Me" back into its prose. The 2026-09-09
+    /// note opened *"This call is between 'Me' (a founder building Ludwig)
+    /// and Andrea"*. Telling the model not to do that helps and does not
+    /// settle it — the same prompt, retested, produced "You (Me)".
+    ///
+    /// `NSFullUserName()` is "David Sjunnesson" on a Mac someone set up as
+    /// themselves and the short login name on one they didn't, so the two are
+    /// compared and the short name rejected. `isPlausibleName` then throws
+    /// out "Admin", "User", "MacBook Pro" and anything with a digit in it.
+    /// The first component only: the far end is labelled "Andrea", not
+    /// "Andrea Rossi", and a transcript reads badly when the two sides are
+    /// named to different depths.
+    ///
+    /// Settings still wins — this is what an *unset* `userName` should mean,
+    /// not a replacement for setting one.
+    static func accountName() -> String? {
+        let full = NSFullUserName().trimmingCharacters(in: .whitespaces)
+        let login = NSUserName().trimmingCharacters(in: .whitespaces)
+        guard !full.isEmpty, full.caseInsensitiveCompare(login) != .orderedSame,
+              let first = full.split(separator: " ").first.map(String.init),
+              isPlausibleName(first) else { return nil }
+        return first
     }
 
     /// The roster entry a model-supplied name refers to, rendered the way it

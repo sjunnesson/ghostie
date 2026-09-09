@@ -321,6 +321,25 @@ func runSpeakerSelfTest() -> Bool {
                                           labels: ["Participant 1", "Participant 2"],
                                           roster: MeetingRoster()).count == 1)
 
+    // accountName: the Mac's own record of who this is, for when userName is
+    // unset. Environment-dependent by nature, so what is pinned is the shape
+    // of the rule, not this machine's answer.
+    do {
+        let name = SpeakerNamer.accountName()
+        check("accountName: a first name or nothing, never a placeholder",
+              name == nil || (SpeakerNamer.isPlausibleName(name!)
+                              && !name!.contains(" ")),
+              "got \(String(describing: name))")
+        check("accountName: never the short login name",
+              name == nil || name!.caseInsensitiveCompare(NSUserName()) != .orderedSame)
+        // The guard that matters: what macOS hands back on a machine nobody
+        // personalised must not become a speaker label.
+        check("isPlausibleName rejects role words used as account names",
+              !SpeakerNamer.isPlausibleName("User")
+              && !SpeakerNamer.isPlausibleName("Guest")
+              && !SpeakerNamer.isPlausibleName("Participant"))
+    }
+
     print("speaker self-test: \(passed) passed, \(failed) failed")
     return failed == 0
 }
