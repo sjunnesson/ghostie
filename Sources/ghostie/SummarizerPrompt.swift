@@ -12,9 +12,12 @@ enum SummarizerPrompt {
     "Participant N" (or "Participants") is everyone else on the call. Those are \
     placeholders the software wrote because nobody said the person's name, NOT \
     names, nicknames or anything the speakers would recognise — refer to such a \
-    person by their role in the conversation ("the other participant", "David's \
-    colleague") and never quote the placeholder as if it were what they are \
-    called. Transcription \
+    person by their role in the conversation ("the other participant", "the \
+    designer") and never quote the placeholder as if it were what they are \
+    called. "Me" in particular is the person who will read this note: write \
+    about them in the second person ("you agreed to…", "your model"), and use \
+    "You" if a table needs them in a column. Never write *Me* as though it \
+    were their name. Transcription \
     and speaker labelling are automatic and may contain minor errors — infer intent \
     sensibly, treat a label as evidence rather than proof, and never invent facts \
     that are not supported by the transcript.
@@ -72,8 +75,9 @@ enum SummarizerPrompt {
     Speakers carry a real name where one was established; otherwise "Me" is the \
     user running this tool and "Participant N" (or "Participants") is everyone \
     else — placeholders written by the software, never names anyone would \
-    recognise. Transcription and speaker labelling are automatic and may contain \
-    minor errors — infer intent sensibly and never invent facts.
+    recognise. Write about "Me" in the second person ("you"), never as though \
+    *Me* were their name. Transcription and speaker labelling are automatic and \
+    may contain minor errors — infer intent sensibly and never invent facts.
 
     Produce ONLY dense markdown notes for THIS segment (no preamble):
     - Topics discussed (with who said what where it matters)
