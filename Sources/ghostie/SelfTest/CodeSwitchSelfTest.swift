@@ -1308,6 +1308,98 @@ func runCodeSwitchSelfTest() -> Bool {
         } catch {
             check("stitch: round trip threw", false, "\(error)")
         }
+
+        // Speech-bounded decode: splice each run down to the parts that carry
+        // speech. This is where half the decode time goes on a real call — a
+        // monolingual call is one run covering everything, silence included.
+        func run(_ lo: Int, _ hi: Int) -> LanguageRun {
+            LanguageRun(language: "en", startMs: lo, endMs: hi, segments: [])
+        }
+        /// An envelope from a description of which 50 ms windows are loud.
+        func voice(_ loud: [(Int, Int)], seconds: Int) -> WavLevel.Envelope {
+            var peaks = [Int](repeating: 0, count: seconds * 20)
+            for (lo, hi) in loud {
+                for w in (lo / 50)..<min(peaks.count, hi / 50) { peaks[w] = 9_000 }
+            }
+            return WavLevel.Envelope(windowMs: 50, peaks: peaks)
+        }
+        func spans(_ r: LanguageRun, _ v: WavLevel.Envelope?) -> [(startMs: Int, endMs: Int)] {
+            AudioStitcher.spans(for: r, voice: v)
+        }
+
+        check("spans: no envelope keeps the pre-v1.9 whole-run behaviour",
+              spans(run(0, 10_000), nil).map { [$0.startMs, $0.endMs] } == [[0, 10_000]])
+
+        check("spans: a run with no voice in it at all falls back to the whole run",
+              spans(run(0, 10_000), voice([], seconds: 10))
+                .map { [$0.startMs, $0.endMs] } == [[0, 10_000]])
+
+        let two = spans(run(0, 20_000), voice([(2_000, 3_000), (9_000, 10_000)], seconds: 20))
+        check("spans: speech is kept with padding either side",
+              two.map { [$0.startMs, $0.endMs] } == [[1_700, 3_300], [8_700, 10_300]],
+              "got \(two)")
+
+        check("spans: a pause shorter than the bridge does not cut a sentence",
+              spans(run(0, 20_000), voice([(2_000, 3_000), (3_500, 4_000)], seconds: 20))
+                .map { [$0.startMs, $0.endMs] } == [[1_700, 4_300]])
+
+        check("spans: a pause longer than the bridge does cut",
+              spans(run(0, 20_000), voice([(2_000, 3_000), (5_000, 6_000)], seconds: 20)).count == 2)
+
+        // snapBoundaries can move a run edge into speech; decoding that audio
+        // under both languages would double a sentence.
+        check("spans: speech is clipped to its run, never decoded twice",
+              spans(run(0, 2_500), voice([(2_000, 4_000)], seconds: 10))
+                .map { [$0.startMs, $0.endMs] } == [[1_700, 2_500]])
+
+        do {
+            // One run over 3 s with speech at 1.0–1.2 s: the spliced WAV is
+            // that span plus padding, and timestamps still map home.
+            let s2 = try stitcher.stitch(pcm: pcm, runs: [run(0, 3_000)], to: dest,
+                                         silencePadMs: 500,
+                                         voice: voice([(1_000, 1_200)], seconds: 3))
+            check("stitch: speech-bounded splicing emits one entry per span",
+                  s2.table.entries.count == 1 && s2.table.entries[0].originalStartMs == 700,
+                  "got \(s2.table.entries)")
+            check("stitch: timestamps inside the span map home",
+                  s2.table.toOriginal(0) == 700 && s2.table.toOriginal(799) == 1_499,
+                  "got \(String(describing: s2.table.toOriginal(0)))")
+            let payload2 = try AudioStitcher.readPCM(s2.url)
+            check("stitch: only the speech is in the WAV (0.8 s of 3 s)",
+                  payload2.count == 800 * 32, "got \(payload2.count) bytes")
+        } catch {
+            check("stitch: speech-bounded round trip threw", false, "\(error)")
+        }
+
+        do {
+            // The scale a real call hits: ~1000 spans in one run, so
+            // toOriginal has to binary search rather than scan.
+            let loud = (0..<1_000).map { ($0 * 3_000, $0 * 3_000 + 500) }
+            let many = spans(run(0, 3_000_000), voice(loud, seconds: 3_000))
+            check("spans: 1000 separated utterances stay 1000 spans", many.count == 1_000,
+                  "got \(many.count)")
+            var stitched = 0
+            var entries: [AudioStitcher.OffsetEntry] = []
+            for span in many {
+                let width = span.endMs - span.startMs
+                entries.append(AudioStitcher.OffsetEntry(stitchedStartMs: stitched,
+                                                         stitchedEndMs: stitched + width,
+                                                         originalStartMs: span.startMs))
+                stitched += width
+            }
+            let table = AudioStitcher.OffsetTable(entries: entries)
+            check("spans: every one of 1000 spans maps back to its own start",
+                  many.enumerated().allSatisfy { i, span in
+                      table.toOriginal(entries[i].stitchedStartMs) == span.startMs
+                  })
+            // 1000 × (500 ms of speech + 300 ms padding either side) of a
+            // 50-minute run: a bit over a third, and the rest never decoded.
+            // 1000 × (500 ms of speech + 300 ms padding either side) of a
+            // 50-minute run — a bit over a third, the rest never decoded. The
+            // first span starts at 0, so its leading padding is clipped away.
+            check("spans: splicing 1000 short utterances out of 50 min keeps ~37%",
+                  stitched == 1_000 * 1_100 - 300, "kept \(stitched) ms")
+        }
     }
 
     // Pipeline.merge: deterministic cross-track ordering. Equal timestamps

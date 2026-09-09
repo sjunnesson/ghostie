@@ -274,6 +274,9 @@ struct CodeSwitchTranscriber {
     private func decode(runs: [LanguageRun], pcm: Data,
                         callID: String, tag: String) throws -> [Transcriber.Segment] {
         guard !runs.isEmpty else { return [] }
+        // The track's loudness over time, so each run is spliced down to the
+        // parts that carry speech. One pass over PCM already in memory.
+        let voice = cs.decodeSpeechOnly ? WavLevel.envelope(pcm: pcm) : nil
         let scratch = URL(fileURLWithPath: "\(NSHomeDirectory())/.ghostie/scratch")
             .appendingPathComponent(callID)
         try? FileManager.default.createDirectory(at: scratch,
@@ -295,8 +298,21 @@ struct CodeSwitchTranscriber {
         for lang in active where byLang[lang] != nil {
             guard let langRuns = byLang[lang], !langRuns.isEmpty else { continue }
             let dest = scratch.appendingPathComponent("\(tag)-\(lang).wav")
-            let stitched = try stitcher.stitch(pcm: pcm, runs: langRuns,
-                                               to: dest, silencePadMs: cs.silencePadMs)
+            let stitched = try stitcher.stitch(pcm: pcm, runs: langRuns, to: dest,
+                                               silencePadMs: cs.silencePadMs,
+                                               voice: voice)
+            if let voice {
+                let spanned = langRuns.reduce(0) { total, run in
+                    total + AudioStitcher.spans(for: run, voice: voice)
+                        .reduce(0) { $0 + ($1.endMs - $1.startMs) }
+                }
+                let full = langRuns.reduce(0) { $0 + ($1.endMs - $1.startMs) }
+                if full > 0, spanned < full {
+                    Log.info("Speech-bounded decode (\(tag)-\(lang)): "
+                        + "\(full / 60_000) min of run → \(spanned / 60_000) min of speech "
+                        + "(\(100 - spanned * 100 / full)% less audio to decode).")
+                }
+            }
             let segs = try whisperDecode(stitched.url, language: lang)
             for s in segs {
                 if let orig = stitched.table.toOriginal(s.startMs) {

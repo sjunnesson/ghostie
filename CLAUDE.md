@@ -284,13 +284,32 @@ the same code drives the menu-bar app and the headless daemon.
   `VADSegment`/`LanguageDetection`/`LanguageRun`/`LanguageTimeline` types),
   `AudioStitcher.swift` (native 16 kHz-mono WAV slicing into per-language
   stitched WAVs with silence pads + an offset table — no ffmpeg; also the
-  snap-to-silence `troughs` energy scan), `CodeSwitchTranscriber.swift`
+  snap-to-silence `troughs` energy scan, and **`spans(for:voice:)`, which
+  splices each run down to the audio that carries speech** — see below),
+  `CodeSwitchTranscriber.swift`
   (orchestrates and returns per-track `Transcriber.Segment`s; any whisper failure
   throws so the whole call backlogs and re-runs cleanly — no partial state).
   `ModelDownloader.swift` fetches the per-language models from Hugging Face into
   `~/.ghostie/models/` (shared by the Settings “Download models” button and
   `ghostie fetch-models`; variant→URL/filename mapping kept in lockstep with
   `setup.sh` and `CodeSwitchConfig.modelPath`).
+- **`codeSwitch.decodeSpeechOnly` (default on) decides how much audio whisper
+  ever sees.** A monolingual call is *one* language run covering the whole
+  track, so without this whisper decodes every silence in it — which is both
+  where the decode time goes and where the hallucinations
+  `TranscriptCleaner`'s gate deletes come from. `AudioStitcher.spans` cuts each
+  run to the windows above `voiceThreshold` (−54 dBFS), bridging pauses under
+  `bridgeMs` so a sentence is never spliced in half and padding by
+  `voicePaddingMs` so no word is clipped, then clips to the run so no audio is
+  decoded twice under two languages.
+  **Build the spans from the track's loudness envelope, not from
+  `run.segments`.** Those segments come from `LanguageSegmenter.segments`,
+  which are whisper's *transcription* segments over VAD-filtered audio rather
+  than silero's speech regions — they run straight across the silences they
+  look like they exclude. The first version of this did use them and logged
+  "121 min of run → 121 min of speech (1% less audio to decode)" on the
+  2026-09-08 call; the envelope keeps 71% of the Me track and 53% of
+  Participants on the same audio.
 - **Which LID you get decides how long a call takes.** Per-segment detection is
   the pipeline's most expensive stage under the whisper LIDs (~1.2 s/segment:
   measured 2026-08-28, 20 min of a 30 min run on a 56-minute call). Install the

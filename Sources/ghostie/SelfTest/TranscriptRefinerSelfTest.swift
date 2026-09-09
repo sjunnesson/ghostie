@@ -338,6 +338,54 @@ func runTranscriptRefinerSelfTest() -> Bool {
           recovered.stats.failedBatches == 0 && recovered.stats.restored == 200,
           recovered.stats.summary)
 
+    // MARK: needsPunctuation — don't pay a round-trip to be told nothing's wrong
+
+    check("needsPunctuation: whisper's run-on register needs it",
+          TranscriptRefiner.needsPunctuation(
+            "so yeah i think that the challenge is like kids are just growing in "
+            + "different directions and priorities and it is hard to find her spot"))
+
+    check("needsPunctuation: properly punctuated prose does not",
+          !TranscriptRefiner.needsPunctuation(
+            "So yeah, I think the challenge is that kids grow in different "
+            + "directions, and it's hard to find her spot. They've been the "
+            + "same ten girls for five years."))
+
+    check("needsPunctuation: a full stop alone is not enough — density counts",
+          TranscriptRefiner.needsPunctuation(
+            "so yeah i think that the challenge is like kids are just growing "
+            + "in different directions and priorities and it is hard to find her spot."))
+
+    check("needsPunctuation: a short turn is judged on its ending only",
+          !TranscriptRefiner.needsPunctuation("Yeah, exactly.")
+          && TranscriptRefiner.needsPunctuation("yeah exactly"))
+
+    do {
+        // Half the blocks already read fine: only the other half is sent, and
+        // the ones left alone come back untouched rather than missing.
+        let mixed = (0..<40).map { i -> Pipeline.Line in
+            line(i * 1_000, "Jose",
+                 i % 2 == 0
+                    ? "This one is already fine, properly punctuated, and it ends."
+                    : "this one is not punctuated at all and just runs on and on and on")
+        }
+        var sent = 0
+        let counting = StubProvider(transform: { user in
+            let items = ((try? JSONSerialization.jsonObject(with: Data(user.utf8))) as? [String]) ?? []
+            sent += items.count
+            return (try? String(data: JSONSerialization.data(
+                        withJSONObject: items.map { $0.uppercased() }), encoding: .utf8)) ?? "[]"
+        })
+        let out = TranscriptRefiner.restore(mixed, provider: counting, batchSize: 80)
+        check("restore: only the blocks that need punctuating are sent",
+              sent == 20 && out.stats.skipped == 20, "sent \(sent), \(out.stats.summary)")
+        check("restore: the skipped blocks are returned untouched, in place",
+              out.lines.count == 40
+              && out.lines.enumerated().allSatisfy { i, l in
+                    i % 2 == 0 ? l.text == mixed[i].text : l.text == mixed[i].text.uppercased()
+                 })
+    }
+
     // MARK: blocks + split — the shape the reader actually gets
 
     // The 2026-09-08 shape: whisper's segments, a backchannel landing inside

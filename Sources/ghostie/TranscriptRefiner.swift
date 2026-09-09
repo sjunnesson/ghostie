@@ -316,11 +316,14 @@ enum TranscriptRefiner {
         var densityAfter = 0
         var restored = 0
         var rejected = 0
+        /// Blocks that already read as punctuated and were never sent.
+        var skipped = 0
         var total = 0
         var summary: String {
             guard attempted else { return "punctuation: not needed" }
             var s = "punctuation: \(restored)/\(total) turns repunctuated "
                 + "(\(densityBefore) → \(densityAfter) marks per 100 words)"
+            if skipped > 0 { s += ", \(skipped) already punctuated" }
             if rejected > 0 { s += ", \(rejected) rejected for changed wording" }
             if failedBatches > 0 {
                 s += " — \(failedBatches) of \(totalBatches) batches failed even on retry "
@@ -363,6 +366,30 @@ enum TranscriptRefiner {
     /// can't run up an unbounded provider bill.
     static let maxBatches = 40
 
+    /// Whether one block still needs punctuating.
+    ///
+    /// whisper's unpunctuated register comes and goes in multi-minute
+    /// stretches, so a call is a mix: on the 2026-09-08 call 379 of 858
+    /// blocks came back from the model unchanged, each having cost a full
+    /// round-trip to be told nothing was wrong. A block that ends a sentence
+    /// *and* carries ordinary punctuation density is left alone.
+    ///
+    /// The floor is 10 marks per 100 words. Measured on that call: whisper's
+    /// unpunctuated register runs at 2–6 and its punctuated output, like the
+    /// restored text, at 20–22, so the two populations are far apart and the
+    /// threshold sits between them rather than inside either. Erring toward
+    /// sending is deliberate — a wasted request costs seconds, a block left
+    /// in run-on costs the reader.
+    static let punctuatedDensityFloor = 10
+
+    static func needsPunctuation(_ text: String) -> Bool {
+        guard endsSentence(text) else { return true }
+        let words = wordCount(text)
+        guard words >= 12 else { return false }   // too short to judge density
+        let marks = text.filter { ".,?!;:".contains($0) }.count
+        return marks * 100 / words < punctuatedDensityFloor
+    }
+
     /// True when the transcript looks like it came out of the unpunctuated
     /// register. A short transcript is not enough to judge from, and one that
     /// is already punctuated must not pay for a round-trip.
@@ -399,14 +426,17 @@ enum TranscriptRefiner {
         // Cut the whole transcript into batches first. They are independent —
         // one batch's punctuation never depends on another's — so the walk is
         // sequential and the requests are not.
-        var batches: [(offset: Int, slice: [Pipeline.Line])] = []
-        var index = 0
-        while index < lines.count, batches.count < maxBatches {
-            let slice = Array(lines[index..<min(index + max(1, batchSize), lines.count)])
-                .prefixWithinBudget(charBudget)
+        let pending = lines.indices.filter { needsPunctuation(lines[$0].text) }
+        stats.skipped = lines.count - pending.count
+        var batches: [(indices: [Int], slice: [Pipeline.Line])] = []
+        var cursor = 0
+        while cursor < pending.count, batches.count < maxBatches {
+            let window = Array(pending[cursor..<min(cursor + max(1, batchSize),
+                                                    pending.count)])
+            let slice = window.map { lines[$0] }.prefixWithinBudget(charBudget)
             guard !slice.isEmpty else { break }
-            batches.append((index, slice))
-            index += slice.count
+            batches.append((Array(window.prefix(slice.count)), slice))
+            cursor += slice.count
         }
 
         let sink = Sink(lines: lines)
@@ -450,7 +480,7 @@ enum TranscriptRefiner {
                         sink.reject(1); continue
                     }
                     guard candidate != original.text else { continue }
-                    sink.accept(at: batch.offset + offset,
+                    sink.accept(at: batch.indices[offset],
                                 Pipeline.Line(startMs: original.startMs,
                                               speaker: original.speaker,
                                               text: candidate))

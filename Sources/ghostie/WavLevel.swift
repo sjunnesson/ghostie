@@ -157,6 +157,28 @@ enum WavLevel {
     /// long enough that a 126-minute call costs ~150 k `Int`s. Returns nil for
     /// anything that is not a readable PCM WAV, which callers must treat as
     /// "no evidence" rather than as silence.
+    /// Same profile over PCM already in memory. The code-switch path reads
+    /// each track's PCM once and stitches from it; re-reading the WAV to
+    /// profile it would double the I/O on a 240 MB file.
+    static func envelope(pcm: Data, windowMs: Int = 50) -> Envelope? {
+        guard windowMs > 0, !pcm.isEmpty else { return nil }
+        let perWindow = max(1, sampleRate * windowMs / 1000)
+        var peaks: [Int] = []
+        peaks.reserveCapacity(pcm.count / 2 / perWindow + 1)
+        pcm.withUnsafeBytes { raw in
+            var windowPeak = 0, fill = 0
+            for i in 0..<(raw.count / 2) {
+                let magnitude = Int(raw.loadUnaligned(fromByteOffset: i * 2,
+                                                      as: Int16.self).magnitude)
+                if magnitude > windowPeak { windowPeak = magnitude }
+                fill += 1
+                if fill == perWindow { peaks.append(windowPeak); windowPeak = 0; fill = 0 }
+            }
+            if fill > 0 { peaks.append(windowPeak) }
+        }
+        return peaks.isEmpty ? nil : Envelope(windowMs: windowMs, peaks: peaks)
+    }
+
     static func envelope(_ url: URL, windowMs: Int = 50) -> Envelope? {
         guard windowMs > 0,
               let handle = try? FileHandle(forReadingFrom: url) else { return nil }

@@ -22,10 +22,18 @@ struct AudioStitcher {
         /// Map a timestamp on the stitched timeline back to the original
         /// track. Returns nil for timestamps that land in a silence pad
         /// (boundary noise — dropped).
+        ///
+        /// Binary search, not a scan: splicing by speech span turns a
+        /// two-hour monolingual call from 1 entry per track into ~1500, and
+        /// this is called once per decoded segment.
         func toOriginal(_ stitchedMs: Int) -> Int? {
-            for e in entries where stitchedMs >= e.stitchedStartMs
-                && stitchedMs < e.stitchedEndMs {
-                return e.originalStartMs + (stitchedMs - e.stitchedStartMs)
+            var lo = 0, hi = entries.count - 1
+            while lo <= hi {
+                let mid = (lo + hi) / 2
+                let e = entries[mid]
+                if stitchedMs < e.stitchedStartMs { hi = mid - 1 }
+                else if stitchedMs >= e.stitchedEndMs { lo = mid + 1 }
+                else { return e.originalStartMs + (stitchedMs - e.stitchedStartMs) }
             }
             return nil
         }
@@ -50,20 +58,99 @@ struct AudioStitcher {
     let sampleRate = 16_000
     let bytesPerSample = 2
 
+    /// How loud a 50 ms window has to be to count as worth decoding.
+    ///
+    /// −54 dBFS, two octaves below `WavLevel.activeThreshold`. Speech peaks
+    /// sit between −20 and −6 dBFS, so this is far under even a quiet
+    /// utterance; what it excludes is the conference silence a far end sends
+    /// when nobody is talking, and a voice-processed microphone's noise
+    /// floor. Measured on the 2026-09-08 call, with `bridgeMs`/`paddingMs`
+    /// below: keeps 71% of the Me track and 53% of Participants.
+    ///
+    /// Deliberately *not* `WavLevel.activeThreshold` (−42 dBFS), which keeps
+    /// only 54%/45%. The extra ~15 points of Me track are cheap insurance —
+    /// this decides what whisper never gets to hear, and the failure is
+    /// silent.
+    static let voiceThreshold = 64
+    /// Silence shorter than this stays in: it is a pause inside speech, and
+    /// cutting there would splice two halves of a sentence together.
+    static let bridgeMs = 1_000
+    /// Kept either side of every span, so nothing is clipped off the start of
+    /// a word and the splice a listener would hear is a real pause.
+    static let voicePaddingMs = 300
+
+    /// The spans of `run` actually worth decoding.
+    ///
+    /// A monolingual call is one run covering the whole track, so without
+    /// this whisper decodes every silence in it — half the decode time, and
+    /// the source of the hallucinations `TranscriptCleaner`'s gate deletes.
+    ///
+    /// `voice` nil means the whole run: the pre-v1.9 behaviour, and what
+    /// `decodeSpeechOnly: false` restores.
+    ///
+    /// **Not** built from `run.segments`. Those come from
+    /// `LanguageSegmenter.segments`, which are whisper's *transcription*
+    /// segments over VAD-filtered audio rather than silero's speech regions —
+    /// they run continuously across the silences they were supposed to
+    /// exclude. Building spans from them on the 2026-09-08 call yielded "121
+    /// min of run → 121 min of speech (1% less audio to decode)". The track's
+    /// own loudness envelope is the thing that actually knows where the
+    /// speech is.
+    ///
+    /// Spans are clipped to the run, because `snapBoundaries` may have moved
+    /// its edge to a trough inside speech and no audio may be decoded twice
+    /// under two languages. A run with no voice in it at all falls back to
+    /// the whole run: decoding too much costs time, decoding nothing puts a
+    /// hole in the transcript. Pure, for the selftest.
+    static func spans(for run: LanguageRun, voice: WavLevel.Envelope?,
+                      threshold: Int = voiceThreshold,
+                      bridgeMs: Int = bridgeMs,
+                      paddingMs: Int = voicePaddingMs) -> [(startMs: Int, endMs: Int)] {
+        guard let voice else { return [(run.startMs, run.endMs)] }
+        var out: [(startMs: Int, endMs: Int)] = []
+        var open: (startMs: Int, endMs: Int)?
+        var ms = run.startMs
+        while ms < run.endMs {
+            let end = min(run.endMs, ms + voice.windowMs)
+            if voice.peak(fromMs: ms, toMs: end) >= threshold {
+                if var current = open, ms - current.endMs <= bridgeMs {
+                    current.endMs = end
+                    open = current
+                } else {
+                    if let current = open { out.append(current) }
+                    open = (ms, end)
+                }
+            }
+            ms = end
+        }
+        if let current = open { out.append(current) }
+        guard !out.isEmpty else { return [(run.startMs, run.endMs)] }
+        return out.map {
+            (max(run.startMs, $0.startMs - paddingMs), min(run.endMs, $0.endMs + paddingMs))
+        }
+    }
+
     /// Concatenate `runs` (already padded by the Smoother) into one WAV with
     /// `silencePadMs` of zeroes between consecutive runs.
     func stitch(track: URL, runs: [LanguageRun], to dest: URL,
-                silencePadMs: Int) throws -> Stitched {
+                silencePadMs: Int, voice: WavLevel.Envelope? = nil) throws -> Stitched {
         try stitch(pcm: try Self.readPCM(track), runs: runs,
-                   to: dest, silencePadMs: silencePadMs)
+                   to: dest, silencePadMs: silencePadMs, voice: voice)
     }
 
     /// Same as `stitch(track:…)` but over already-read PCM, so a caller that
     /// holds the track's PCM (the codeswitch path reads it once per track) can
     /// stitch every per-language batch without re-reading and re-parsing the
     /// WAV from disk each time.
+    /// `voice` non-nil splices only each run's speech spans (see
+    /// `spans(for:voice:)`) instead of the whole run. The pause between
+    /// two spans of the same run is the padding itself — real recorded
+    /// silence either side of the cut, which is what a listener would hear —
+    /// so no synthetic pad goes between them. `silencePadMs` still separates
+    /// *runs*, where it exists to stop whisper carrying tokens across a
+    /// language change.
     func stitch(pcm: Data, runs: [LanguageRun], to dest: URL,
-                silencePadMs: Int) throws -> Stitched {
+                silencePadMs: Int, voice: WavLevel.Envelope? = nil) throws -> Stitched {
         guard !runs.isEmpty else { throw StitchError.noRuns }
         let total = pcm.count / bytesPerSample
 
@@ -77,15 +164,17 @@ struct AudioStitcher {
         let sorted = runs.sorted { $0.startMs < $1.startMs }
 
         for (i, run) in sorted.enumerated() {
-            let lo = sampleIndex(run.startMs) * bytesPerSample
-            let hi = sampleIndex(run.endMs) * bytesPerSample
-            guard hi > lo else { continue }
-            let stitchedStartMs = body.count / bytesPerSample * 1000 / sampleRate
-            body.append(pcm.subdata(in: lo..<hi))
-            let stitchedEndMs = body.count / bytesPerSample * 1000 / sampleRate
-            entries.append(OffsetEntry(stitchedStartMs: stitchedStartMs,
-                                       stitchedEndMs: stitchedEndMs,
-                                       originalStartMs: run.startMs))
+            for span in Self.spans(for: run, voice: voice) {
+                let lo = sampleIndex(span.startMs) * bytesPerSample
+                let hi = sampleIndex(span.endMs) * bytesPerSample
+                guard hi > lo else { continue }
+                let stitchedStartMs = body.count / bytesPerSample * 1000 / sampleRate
+                body.append(pcm.subdata(in: lo..<hi))
+                let stitchedEndMs = body.count / bytesPerSample * 1000 / sampleRate
+                entries.append(OffsetEntry(stitchedStartMs: stitchedStartMs,
+                                           stitchedEndMs: stitchedEndMs,
+                                           originalStartMs: span.startMs))
+            }
             if i < sorted.count - 1 { body.append(padBytes) }
         }
         try Self.writeWAV(body, to: dest, sampleRate: sampleRate)

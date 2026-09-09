@@ -603,6 +603,21 @@ struct CodeSwitchConfig: Codable {
     var maxFillGapMs: Int = 4000
     var runPaddingMs: Int = 200
     var silencePadMs: Int = 500
+
+    /// Decode only the speech inside each language run, not the whole run.
+    ///
+    /// A monolingual call is one run covering the whole track, so whisper was
+    /// decoding every silence in it — which is both half the decode time and
+    /// where the hallucinations `TranscriptCleaner`'s silence gate deletes
+    /// came from. The VAD segments that bound the speech are already attached
+    /// to every `LanguageRun`; this splices them (padded by `runPaddingMs`,
+    /// so nothing is clipped off the front of a word) instead of the run's
+    /// full span. Measured on the 2026-09-08 call: 55.4% of the Me track and
+    /// 45.6% of Participants is speech.
+    ///
+    /// Off restores the pre-v1.9 behaviour exactly, for anyone who suspects a
+    /// splice of costing them words.
+    var decodeSpeechOnly: Bool = true
     var minDetectMs: Int = 1500
 
     /// A VAD segment longer than this is split into equal chunks (each ≤ this,
@@ -705,6 +720,7 @@ struct CodeSwitchConfig: Codable {
         case languages, dominantLanguage, kbWhisperVariant
         case smoothingWindowMe, smoothingWindowParticipants, minSwitchSegments
         case minSwitchMs, maxFillGapMs, runPaddingMs, silencePadMs, minDetectMs
+        case decodeSpeechOnly
         case maxDetectMs
         case lidWindowMs, lidHopMs, intraSegmentRefineMs
         case intraSegmentMarginThreshold, minDwellMs
@@ -750,6 +766,7 @@ struct CodeSwitchConfig: Codable {
         maxFillGapMs = g(.maxFillGapMs, d.maxFillGapMs)
         runPaddingMs = g(.runPaddingMs, d.runPaddingMs)
         silencePadMs = g(.silencePadMs, d.silencePadMs)
+        decodeSpeechOnly = g(.decodeSpeechOnly, d.decodeSpeechOnly)
         minDetectMs = g(.minDetectMs, d.minDetectMs)
         maxDetectMs = g(.maxDetectMs, d.maxDetectMs)
         lidWindowMs = g(.lidWindowMs, d.lidWindowMs)
