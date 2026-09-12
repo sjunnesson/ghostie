@@ -26,6 +26,7 @@ swift build -c release            # release build (what the scripts use)
 .build/release/ghostie process <dir>       # re-run pipeline on a recording dir
 .build/release/ghostie fetch-models [v]    # download codeswitch models (KB v + large-v3 + VAD)
 .build/release/ghostie mic-probe [secs]   # is voice-processed mic capture working on this OS?
+.build/release/ghostie punctuate-probe <md>  # run the punctuation pass alone, timed
 ```
 
 There is no XCTest target and no linter. `swift build` warnings are expected to
@@ -122,7 +123,39 @@ the same code drives the menu-bar app and the headless daemon.
   "Participants" label. `diarize` returns nil **only** when there was too
   little to judge on; audio that was clustered and held one voice comes back
   as an `Assignment` with `speakerCount == 1`, so the transcript can say
-  "Participant 1" (a person) rather than "Participants" (a track). That
+  "Participant 1" (a person) rather than "Participants" (a track).
+  **`smoothed` is bounded by segment length** (`maxInterjectionWords`, 3, the
+  same number `TranscriptRefiner.maxInterjectionWords` uses for the same
+  judgement one stage later). The lone-flip rule exists for "mm"/"ja" landing
+  inside someone else's turn; unbounded it claims that one speaker between two
+  of another is *always* an interjection, which only holds while somebody is
+  monologuing. On the 2026-09-11 Zoom call's reference diarization 933 of
+  1 513 turns — 62% — sat alone between two turns of one other speaker,
+  because four people taking turns is what a meeting sounds like, and 44% of
+  those ran past three words (up to passages of 55 and 60). Rewriting those is
+  deleting a speaker a few words at a time, and it costs the quiet participant
+  far more than the person they are folded into: measured per window on that
+  call, the pattern covers 6.8% of the second speaker's audio and 0.7% of the
+  dominant one's. A segment with no word count is never assumed short.
+  **A far end that clusters to fewer people than were in the room is not
+  automatically a bug.** On the 2026-09-11 Zoom call Ghostie labelled three of
+  four, against a reference that labelled three of four differently — and the
+  embeddings, dumped per real segment and scored against that reference, say
+  the reference is the one that is wrong: its two busiest speakers sit at mean
+  cosine distance **0.401 (median 0.313) from each other, closer than either
+  is to itself** (within-speaker spread 0.455 and 0.305). That is one voice
+  split in two, and merging them is correct. Its quiet third label runs a
+  within-speaker spread of 0.697 — two people merged — while genuinely
+  different voices sit at 0.92–0.94, matching this module's own calibration.
+  Score a diarizer against another diarizer and you are measuring the
+  disagreement, not the error; centroid and within-speaker distances say which
+  side is right.
+  `Assignment.clusteredCount` reports how many clusters agglomeration found
+  *before* `foldTinyClusters` merged the slivers away, and the log names the
+  difference. The two numbers disagreeing is the whole story when a real
+  participant goes missing — clustering found them and the fold decided they
+  were too quiet to be a person — and "3 speakers" alone is consistent with
+  both explanations and evidence for neither. That
   distinction is not cosmetic: on the 2026-09-08 Meet call the far end was one
   person labelled "Participants" for two hours and the summary wrote *"a close
   friend (labeled 'Participants')"* into its prose, having no way to tell a
@@ -187,7 +220,24 @@ the same code drives the menu-bar app and the headless daemon.
   `TranscriptCleaner`'s silence gate reads.
 - **`Pipeline.swift`** — transcribe both tracks → clean per track (with each
   track's `WavLevel.envelope`, so the guard can drop what was decoded from
-  silence) → diarize Participants → cross-track echo guard → merge by
+  silence) → diarize Participants
+  **Whisper's own `endMs` is carried the whole way** — `TranscriptCleaner.Seg`
+  holds it and `cleaned()` returns `Transcriber.Segment`. It used to stop at
+  the cleaner, and `diarizeParticipants` rebuilt every span as "up to the next
+  segment's start", which is the one thing `Transcriber.Segment.endMs`
+  documents you must not do: that span swallows the pause between segments and
+  a speaker change lives in exactly that pause, so every embedding carried the
+  leading edge of whoever spoke next. Measured on the 2026-09-11 call's 577
+  Participants segments, the rebuilt spans embedded **82% more audio** than
+  whisper's, with 22% of them swallowing a pause over a second. Only a segment
+  that never had an end still falls back. `GHOSTIE_DUMP_SEGMENTS=1` writes the
+  post-clean segments beside their WAV as `<track>.cleaned.json` in whisper's
+  `-oj` shape; `ghostie diarize-probe <wav> <wav>.cleaned.json` and
+  `ghostie embed-dump <wav> <wav>.cleaned.json` then replay a call's
+  clustering offline. Nothing else reproduces that input — the decode runs
+  over a *speech-stitched* WAV, so re-running `whisper-cli` on the original
+  file gave 6 347 segments at a 1.0 s median against the pipeline's 577 at
+  ~6.5 s. → cross-track echo guard → merge by
   timestamp → blocks + restore punctuation + split into turns
   (`TranscriptRefiner`) → name speakers → summarize → write
   `<notesFolder>/<date>_<Source>-Call.md` (+ transcript), where Source is
@@ -258,6 +308,24 @@ the same code drives the menu-bar app and the headless daemon.
   hallucinated, but a timestamp base that disagrees with the audio looks
   identical and would otherwise delete a real transcript in silence. Segments
   without an `endMs`, and spans past the end of the WAV, are never judged.
+  A second audio rule sits beside it for the case the first cannot see.
+  `isSilent` asks for *nothing* in the span — the rule that needs no threshold
+  defended — and a microphone track never goes digitally silent: it carries
+  breath, a chair, the room. On the 2026-09-11 Zoom call the Me track's quiet
+  stretches still crossed `activeThreshold` in 5–13% of their windows, so six
+  invented "Thank you." turns walked through a gate that had just dropped
+  seven others. **`isStretchedOverQuiet` gates on the span instead**: whisper
+  closes a segment every few seconds while someone is talking and only hands
+  out a long one when it has nothing to cut on, so a hallucination gets the
+  whole quiet stretch while real speech over a span that long is dense by
+  construction. Measured over 184 whisper segments decoded from twelve
+  two-minute slices of that track: the nine at or past `stretchedSpanMs`
+  (15 s) with an active share at or below `stretchedFloor` (0.15) are
+  hallucinations without exception, and the real segments that long run 0.18
+  to 0.87 — 0.13 against 0.18 with nothing between, so the threshold sits in
+  the gap. It is a narrower gap than the diarizer's, which is why the rule
+  needs *both* halves and never judges a short segment. Both rules feed one
+  `silent` set, so the stand-down covers them together.
 - **Code-switching (N-language, e.g. sv↔en)** — active whenever ≥2 languages
   resolve to an installed model; there is no `codeSwitch.enabled` flag.
   `codeSwitch.languages` is an array of **`LanguageSetting` records**
@@ -368,6 +436,24 @@ the same code drives the menu-bar app and the headless daemon.
   value is a Claude tier alias); Ollama runs its one local model for both. `complete(system:user:purpose:)` carries the stage
   name into the log so a run of punctuation batches no longer reports itself
   as "Summarizing".
+  **Punctuation also gets its own watchdog**, `punctuationTimeoutSeconds`
+  (300), not the summary's `summaryTimeoutSeconds` (600). The summary is one
+  request whose length scales with the call; punctuation is dozens of
+  identically-sized ones run `maxConcurrentBatches`-wide, so a batch that
+  merely runs slow holds a slot every other batch is queued behind and never
+  reaches a cap sized for a two-hour summary. On the 2026-09-11 Zoom call
+  three batches ran 16, 50 and 51 minutes inside the 600 s budget: punctuation
+  took 54 of the run's 68 minutes and the log said nothing, because by that
+  budget nothing had failed. The same work measured healthy on the same
+  machine is 16 batches in 277 s (~52 s of slot time each), and three
+  concurrent 12 000-character batches came back in 48, 51 and 171 s — so 300
+  is nearly double the slowest healthy batch and still turns a 50-minute one
+  into five. Erring high is deliberate: a timed-out batch retries once and
+  then keeps whisper's text, and `maxBatchFailures` abandons the rest of the
+  pass after three distinct batches fail twice, so cutting too eagerly trades
+  a slow transcript for an unpunctuated one. A batch that fails now also warns
+  *when it happens* rather than only in the end-of-pass tally, which is how a
+  slow provider shows itself while the pass is still running.
 - **`Backlog.swift`** — durable retry queue at `~/.ghostie/backlog/`. Two
   stages: `transcribe` (audio kept) and `summarize` (transcript kept, audio
   dropped so it's never re-transcribed). A note is always written immediately

@@ -43,6 +43,27 @@ struct SpeakerDiarizer {
     /// into its nearest neighbour — real participants talk, and a sliver
     /// cluster is usually one noisy window, not a ninth person.
     var minClusterShare: Float = 0.03
+    /// Longest segment `smoothed` will treat as a backchannel.
+    ///
+    /// The lone-flip rule exists for "mm", "ja", "right" — a word or two
+    /// landing inside someone else's turn, where the embedding had almost no
+    /// voiced audio to work with. Unbounded, it is a claim that one speaker
+    /// between two of another is *always* an interjection, and that claim is
+    /// only true when one person is monologuing. Measured on the 2026-09-11
+    /// Zoom call's reference diarization: 933 of 1 513 turns — 62% — sit
+    /// alone between two turns of one other speaker, because four people
+    /// taking turns is what a meeting sounds like. 44% of those run to more
+    /// than three words, up to passages of 55 and 60. Rewriting those to the
+    /// neighbour is not smoothing; it is deleting a speaker a few words at a
+    /// time, and it costs a quiet participant far more than the person they
+    /// are folded into.
+    ///
+    /// Three words, matching `TranscriptRefiner.maxInterjectionWords`, which
+    /// makes the same judgement about the same thing one stage later. On that
+    /// call's reference it covers 56% of lone turns — the median lone turn is
+    /// exactly three words — and leaves the rest where diarization put them.
+    var maxInterjectionWords = 3
+
     /// Give segments that could not be embedded their neighbour's speaker.
     /// The self-test and `diarize-probe` turn this off to measure clustering
     /// on its own, without gap-filling folded into the score.
@@ -53,11 +74,30 @@ struct SpeakerDiarizer {
         /// embedded (too short, or silence Whisper hallucinated text onto).
         let speakers: [Int?]
         let speakerCount: Int
+        /// How many clusters agglomeration produced, before `foldTiny-
+        /// Clusters` merged the slivers away. Reported because the two
+        /// numbers disagreeing is the whole story when a real participant
+        /// goes missing: clustering found them and the fold decided they were
+        /// too quiet to be a person. On the 2026-09-11 Zoom call the far end
+        /// held four voices and the note named three, and the log said only
+        /// "3 speakers" — which is consistent with both explanations and
+        /// evidence for neither.
+        let clusteredCount: Int
+        /// Seconds of embedded speech in the largest cluster `foldTiny-
+        /// Clusters` merged away. The count alone cannot tell a stray noisy
+        /// window from a participant: on the 2026-09-11 Zoom call four
+        /// clusters were folded, and whether that was four slivers or a
+        /// person split four ways is the entire question.
+        let largestFoldedSeconds: Float
         var summary: String {
             let placed = speakers.compactMap { $0 }.count
+            let folded = clusteredCount > speakerCount
+                ? ", \(clusteredCount - speakerCount) folded in as too quiet to be a separate "
+                    + "person (largest held \(Int(largestFoldedSeconds.rounded())) s of speech)"
+                : ""
             return speakerCount <= 1
-                ? "diarization: one speaker on the Participants track"
-                : "diarization: \(speakerCount) speakers on the Participants track (\(placed)/\(speakers.count) segments placed)"
+                ? "diarization: one speaker on the Participants track\(folded)"
+                : "diarization: \(speakerCount) speakers on the Participants track (\(placed)/\(speakers.count) segments placed)\(folded)"
         }
     }
 
@@ -96,9 +136,17 @@ struct SpeakerDiarizer {
 
         // ---- 3: agglomerative clustering.
         var clusters = agglomerate(indexed.map(\.1))
-        clusters = foldTinyClusters(clusters,
-                                    embeddings: indexed.map(\.1),
-                                    weights: indexed.map { durations[$0.0] })
+        let clusteredCount = Set(clusters).count
+        let weights = indexed.map { durations[$0.0] }
+        let beforeFold = clusters
+        clusters = foldTinyClusters(clusters, embeddings: indexed.map(\.1),
+                                    weights: weights)
+        // Mass of the biggest cluster the fold removed, for the log.
+        var massBefore: [Int: Float] = [:]
+        for (i, c) in beforeFold.enumerated() { massBefore[c, default: 0] += weights[i] }
+        let survivors = Set(zip(beforeFold, clusters).filter { $0 == $1 }.map(\.0))
+        let largestFolded = massBefore.filter { !survivors.contains($0.key) }
+            .values.max() ?? 0
 
         var speakers = [Int?](repeating: nil, count: segments.count)
         for (n, (segmentIndex, _)) in indexed.enumerated() {
@@ -110,7 +158,9 @@ struct SpeakerDiarizer {
         // either a backchannel or a Whisper hallucination over silence;
         // either way its neighbours are a far better guess than "unknown",
         // which would surface as a bare label in the transcript.
-        speakers = smoothed(speakers)
+        speakers = smoothed(speakers, wordCounts: segments.map {
+            $0.text.split(whereSeparator: { $0 == " " || $0 == "\n" }).count
+        })
         if fillUnlabelled { speakers = fillGaps(speakers) }
 
         let ids = Set(speakers.compactMap { $0 })
@@ -122,7 +172,9 @@ struct SpeakerDiarizer {
         for s in speakers { if let s, order[s] == nil { order[s] = order.count } }
         speakers = speakers.map { $0.flatMap { order[$0] } }
 
-        return Assignment(speakers: speakers, speakerCount: order.count)
+        return Assignment(speakers: speakers, speakerCount: order.count,
+                          clusteredCount: max(clusteredCount, order.count),
+                          largestFoldedSeconds: largestFolded)
     }
 
     /// 16-bit PCM bytes (as `AudioStitcher.readPCM` returns) → ±1 floats.
@@ -296,18 +348,28 @@ struct SpeakerDiarizer {
         return out
     }
 
-    /// A single segment attributed differently from both its neighbours, where
-    /// those neighbours agree, is flipped to match them. That pattern is
-    /// nearly always a short backchannel embedded in someone else's turn,
-    /// where the embedding had almost no voiced audio to work with.
+    /// A single **short** segment attributed differently from both its
+    /// neighbours, where those neighbours agree, is flipped to match them.
+    /// That pattern is a backchannel embedded in someone else's turn, where
+    /// the embedding had almost no voiced audio to work with.
+    ///
+    /// The length bound is the whole rule. Without it this fires on ordinary
+    /// turn-taking — see `maxInterjectionWords` — and the speaker it erases
+    /// is always the quieter one, because a person who says a sentence and
+    /// stops is exactly the person whose segments have neighbours on both
+    /// sides. `wordCounts` is per segment, parallel to `speakers`; a segment
+    /// with no count (a shorter array, which only the self-test passes) is
+    /// left alone rather than assumed short.
     ///
     /// Internal for the self-test.
-    func smoothed(_ speakers: [Int?]) -> [Int?] {
+    func smoothed(_ speakers: [Int?], wordCounts: [Int] = []) -> [Int?] {
         guard speakers.count > 2 else { return speakers }
         var out = speakers
         for i in 1..<(speakers.count - 1) {
             guard let prev = speakers[i - 1], let next = speakers[i + 1],
                   let cur = speakers[i], prev == next, cur != prev else { continue }
+            guard i < wordCounts.count,
+                  wordCounts[i] <= maxInterjectionWords else { continue }
             out[i] = prev
         }
         return out

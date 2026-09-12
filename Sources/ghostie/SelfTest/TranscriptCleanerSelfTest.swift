@@ -190,7 +190,78 @@ func runTranscriptCleanerSelfTest() -> Bool {
           TranscriptCleaner.clean([span(0, 3_000, "So how did the reorg land")],
                                   audio: longHole).stats.silenced == 0)
 
-    // Timestamps that disagree with the audio look exactly like a fully
+    // MARK: whisper's spans survive the cleaner
+
+    // Diarization embeds these spans. Rebuilding them from the next segment's
+    // start swallows the pause a speaker change lives in, so they have to
+    // arrive intact rather than be inferred downstream.
+    let spanned = TranscriptCleaner.clean([span(0, 1_800, "So how did the reorg land"),
+                                           span(2_000, 3_900, "It closed the whole department")],
+                                          audio: envelope([0, 1, 2, 3], seconds: 5))
+    plain("spans: whisper's own endMs reaches the far side of the cleaner",
+          spanned.segments.map(\.endMs) == [1_800, 3_900],
+          "got \(spanned.segments.map(\.endMs))")
+
+    plain("spans: a segment that never had an end still has none",
+          TranscriptCleaner.clean([(startMs: 0, text: "no end here")])
+            .segments.first?.endMs == nil)
+
+    // The collapse marker stands for the whole run, so it has to span it —
+    // otherwise the run's audio reads as a fraction of its real length.
+    let looped = (0..<4).map { span($0 * 1_000, $0 * 1_000 + 900, "Yeah, yeah.") }
+    let collapsed = TranscriptCleaner.clean(looped)
+    plain("spans: the repeated-audio marker spans the whole run it replaces",
+          collapsed.segments.count == 2
+          && collapsed.segments[1].text.contains("repeated audio removed")
+          && collapsed.segments[1].endMs == 3_900,
+          "got \(collapsed.segments.map { ($0.text.prefix(20), $0.endMs) })")
+
+    // MARK: the stretched-over-quiet rule — a mic track is never digitally silent
+
+    /// A microphone track: every slot carries *something* (breath, the room),
+    /// but only `loud` slots carry speech. Nothing here is ever zero, so the
+    /// `isSilent` gate above can never fire on it — which is the 2026-09-11
+    /// Zoom call, where six "Thank you."s survived a gate that had just
+    /// dropped seven others.
+    func micEnvelope(_ loud: Set<Int>, seconds: Int) -> WavLevel.Envelope {
+        WavLevel.Envelope(windowMs: 50,
+                          peaks: (0..<(seconds * 20)).map {
+                              loud.contains($0 / 20) ? 9_000 : ($0 % 7 == 0 ? 300 : 40)
+                          })
+    }
+    // 10% of windows over the threshold — measured on that call's quiet
+    // stretches, which ran 5–13%.
+    let micTrack = micEnvelope([0, 1, 2, 40, 41], seconds: 42)
+
+    plain("stretched gate: a bare phrase over a quiet 30 s of mic track is dropped",
+          TranscriptCleaner.clean([span(5_000, 35_000, "Thank you.")],
+                                  audio: micTrack).stats.silenced == 1,
+          "room tone kept a 30 s \"Thank you.\" alive")
+
+    plain("stretched gate: the same phrase over its own speech is kept",
+          TranscriptCleaner.clean([span(0, 2_000, "Thank you.")],
+                                  audio: micTrack).stats.silenced == 0)
+
+    plain("stretched gate: a short quiet segment is never judged by it",
+          TranscriptCleaner.clean([span(5_000, 12_000, "Thank you.")],
+                                  audio: micTrack).stats.silenced == 0,
+          "a 7 s span is below stretchedSpanMs and must survive")
+
+    // 12 words over 23 seconds at 18% active was the closest real segment in
+    // the measurement; the threshold has to leave it alone.
+    let sparseButReal = WavLevel.Envelope(
+        windowMs: 50, peaks: (0..<(30 * 20)).map { $0 % 100 < 18 ? 9_000 : 40 })
+    plain("stretched gate: sparse but real speech over a long span survives",
+          TranscriptCleaner.clean(
+            [span(0, 23_000, "Well, I consider it important, so I'm happy that you did that.")],
+            audio: sparseButReal).stats.silenced == 0,
+          "18% active is real speech, not a hallucination")
+
+    plain("stretched gate: a long span past the end of the WAV is not judged",
+          TranscriptCleaner.clean([span(60_000, 90_000, "Thank you.")],
+                                  audio: micTrack).stats.silenced == 0)
+
+        // Timestamps that disagree with the audio look exactly like a fully
     // hallucinated call. That is the case to refuse, not to act on.
     // Deliberately unalike, so only the gate could remove any of them.
     let distinct = ["the reorg closed our department", "so I took the package instead",

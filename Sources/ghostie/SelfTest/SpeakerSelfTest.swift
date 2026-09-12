@@ -116,12 +116,26 @@ func runSpeakerSelfTest() -> Bool {
             < d.mergeThreshold)
 
     // ------------------------------------------------------------ Smoothing
+    // A backchannel: two words inside someone else's turn.
     check("a lone flip between agreeing neighbours is smoothed",
-          d.smoothed([0, 0, 1, 0, 0]) == [0, 0, 0, 0, 0])
+          d.smoothed([0, 0, 1, 0, 0], wordCounts: [9, 9, 2, 9, 9]) == [0, 0, 0, 0, 0])
     check("a real turn change is not smoothed away",
-          d.smoothed([0, 0, 1, 1, 0]) == [0, 0, 1, 1, 0])
-    check("smoothing leaves gaps alone", d.smoothed([0, nil, 0]) == [0, nil, 0])
-    check("smoothing handles a two-element input", d.smoothed([0, 1]) == [0, 1])
+          d.smoothed([0, 0, 1, 1, 0], wordCounts: [9, 9, 2, 2, 9]) == [0, 0, 1, 1, 0])
+    check("smoothing leaves gaps alone",
+          d.smoothed([0, nil, 0], wordCounts: [9, 2, 9]) == [0, nil, 0])
+    check("smoothing handles a two-element input",
+          d.smoothed([0, 1], wordCounts: [9, 2]) == [0, 1])
+    // The 2026-09-11 case: four people taking turns. A whole sentence between
+    // two of someone else's is that person speaking, not an interjection —
+    // 62% of that call's reference turns sat in exactly this position.
+    check("a lone flip that is a whole sentence is left where diarization put it",
+          d.smoothed([0, 0, 1, 0, 0], wordCounts: [9, 9, 14, 9, 9]) == [0, 0, 1, 0, 0])
+    check("the backchannel bound is inclusive",
+          d.smoothed([0, 1, 0], wordCounts: [9, d.maxInterjectionWords, 9]) == [0, 0, 0])
+    check("one word past the bound is a speaker, not a backchannel",
+          d.smoothed([0, 1, 0], wordCounts: [9, d.maxInterjectionWords + 1, 9]) == [0, 1, 0])
+    check("a segment with no word count is never assumed short",
+          d.smoothed([0, 1, 0]) == [0, 1, 0])
 
     // ------------------------------------------------------------ Gap filling
     check("a gap between one speaker's turns is that speaker",

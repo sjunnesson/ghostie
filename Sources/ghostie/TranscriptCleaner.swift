@@ -165,6 +165,55 @@ enum TranscriptCleaner {
         return audio.activeFraction(fromMs: segment.startMs, toMs: endMs) <= floor
     }
 
+    /// Whether `segment` is a few words stretched over a long, mostly quiet
+    /// span — the shape of a hallucination that `isSilent` cannot see.
+    ///
+    /// `isSilent` asks for *nothing* in the span, which is the rule that needs
+    /// no threshold defended. It catches a hallucination written onto digital
+    /// silence, which is what Google Meet sends while the far side is quiet.
+    /// A microphone track never goes digitally silent: it carries breath,
+    /// keyboard, a chair, the room. On the 2026-09-11 Zoom call the Me track's
+    /// quiet stretches still crossed `WavLevel.activeThreshold` in 5–13% of
+    /// their windows, so six invented "Thank you." turns walked through a gate
+    /// that had just dropped seven others.
+    ///
+    /// What separates them is the span. Whisper closes a segment every few
+    /// seconds while someone is talking; it only hands out a long one when it
+    /// has nothing to cut on, so a hallucination gets the whole quiet stretch
+    /// (on the 2026-09-08 call, exactly 30.00 s every time). Real speech over
+    /// a span that long is dense by construction.
+    ///
+    /// Measured over 184 whisper segments decoded from twelve two-minute
+    /// slices of that call's Me track, scored against the audio: the nine
+    /// segments at or past `stretchedSpanMs` with an active share at or below
+    /// `stretchedFloor` are hallucinations without exception — three bare
+    /// "Thank you."s, a bare "yeah", two loops repeating a real sentence onto
+    /// silence, and three invented sentences. The real segments that long run
+    /// 0.18 to 0.87 active. The two populations are 0.13 against 0.18 with
+    /// nothing in between, and this threshold sits in that gap.
+    ///
+    /// It is a narrower gap than the diarizer's, which is why the rule needs
+    /// *both* halves: fifteen seconds of near-silence is not an opinion about
+    /// the text, and no segment shorter than `stretchedSpanMs` is ever judged
+    /// by it.
+    static func isStretchedOverQuiet(_ segment: Transcriber.Segment,
+                                     in audio: WavLevel.Envelope,
+                                     spanMs: Int = stretchedSpanMs,
+                                     floor: Double = stretchedFloor) -> Bool {
+        guard let endMs = segment.endMs, endMs - segment.startMs >= spanMs,
+              audio.covers(fromMs: segment.startMs, toMs: endMs) else { return false }
+        return audio.activeFraction(fromMs: segment.startMs, toMs: endMs) <= floor
+    }
+
+    /// Shortest span the stretched-over-quiet rule will judge. Fifteen
+    /// seconds is far past where whisper cuts running speech, and every real
+    /// segment that long in the measurement was dense.
+    static let stretchedSpanMs = 15_000
+
+    /// …and the active share below which such a span is quiet. See
+    /// `isStretchedOverQuiet` for the measurement this sits in the middle of.
+    static let stretchedFloor = 0.15
+
     /// Normalized longest-common-substring ratio (fast similarity measure),
     /// matching whisper-guard's consecutive-dedup heuristic.
     private static func similarity(_ a: String, _ b: String) -> Double {
@@ -183,7 +232,17 @@ enum TranscriptCleaner {
         return Double(best) / Double(max(x.count, y.count))
     }
 
-    struct Seg { let startMs: Int; var text: String }
+    /// A cleaned segment. `endMs` is **whisper's own** segment end, carried
+    /// through every stage rather than recomputed.
+    ///
+    /// It used to stop here, and `Pipeline` rebuilt each span as "up to the
+    /// next segment's start" before diarizing — which is the one thing
+    /// `Transcriber.Segment.endMs` documents you must not do: that span
+    /// swallows the pause between two segments, and the pause is exactly
+    /// where a speaker change lives. Every embedding then carried the leading
+    /// edge of whoever spoke next, which is a good way to make two people
+    /// look like one.
+    struct Seg { let startMs: Int; var text: String; var endMs: Int? = nil }
 
     /// A segment has to have *some* audible fraction of its own span to count
     /// as speech that happened. Zero means not one window of it — at 50 ms
@@ -240,7 +299,13 @@ enum TranscriptCleaner {
             // By index, not by timestamp: two segments can legitimately share
             // a start, and only the one that is actually silent may go.
             let gateable = spans.indices.filter { spans[$0].endMs != nil }
-            let silent = Set(gateable.filter { isSilent(spans[$0], in: audio) })
+            // Both audio rules feed one set, so the stand-down below covers
+            // them together: a timestamp base that disagrees with the audio
+            // makes every segment look quiet, by either rule.
+            let silent = Set(gateable.filter {
+                isSilent(spans[$0], in: audio)
+                    || isStretchedOverQuiet(spans[$0], in: audio)
+            })
             if gateable.count >= minSegmentsToJudgeSilentFraction,
                Double(silent.count) / Double(gateable.count) > maxSilentFraction {
                 stats.silenceGateStoodDown = silent.count
@@ -249,7 +314,7 @@ enum TranscriptCleaner {
                 stats.silenced = silent.count
             }
         }
-        var segs = spans.map { Seg(startMs: $0.startMs, text: $0.text) }
+        var segs = spans.map { Seg(startMs: $0.startMs, text: $0.text, endMs: $0.endMs) }
         stats.afterSilenceGate = segs.count
 
         // 1. Drop training-data-leak hallucinations (YouTube/Amara/URLs).
@@ -260,7 +325,8 @@ enum TranscriptCleaner {
         // whisper loops within a segment as well as across them, and the
         // consecutive-dedup below only sees whole segments).
         segs = segs.map { Seg(startMs: $0.startMs,
-                              text: collapseWithinSegmentLoop($0.text)) }
+                              text: collapseWithinSegmentLoop($0.text),
+                              endMs: $0.endMs) }
 
         // 2. Collapse consecutive near-duplicate runs (≥3, similarity ≥0.8).
         segs = collapseConsecutive(segs)
@@ -336,8 +402,11 @@ enum TranscriptCleaner {
                   similarity(segs[i].text, segs[i+run].text) >= 0.8 { run += 1 }
             out.append(segs[i])
             if run >= 3 {
+                // The marker stands for the whole collapsed run, so it spans
+                // it: the last segment's end, not the first one's.
                 out.append(Seg(startMs: segs[i].startMs,
-                               text: "[…] repeated audio removed — \(run) segments collapsed"))
+                               text: "[…] repeated audio removed — \(run) segments collapsed",
+                               endMs: segs[i + run - 1].endMs ?? segs[i].endMs))
             } else if run > 1 {
                 for k in 1..<run { out.append(segs[i+k]) }
             }

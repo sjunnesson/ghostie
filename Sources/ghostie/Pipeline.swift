@@ -295,6 +295,38 @@ struct Pipeline {
     /// code-switching is enabled the dual-model pipeline replaces the single
     /// whisper pass; per-track cleaning + the timestamp merge are unchanged so
     /// the cleaner and summary see the same shape either way.
+    /// Writes the post-clean segments beside their WAV, in whisper's own
+    /// `-oj` shape, when `GHOSTIE_DUMP_SEGMENTS` is set.
+    ///
+    /// These are what diarization actually sees, and nothing else can produce
+    /// them: the decode runs over a *speech-stitched* WAV and maps back, so
+    /// re-running `whisper-cli` on the original file gives a different set
+    /// entirely — measured on the 2026-09-11 call, 6 347 segments at a 1.0 s
+    /// median against the pipeline's 577 at ~6.5 s. Tuning diarization
+    /// against that would be tuning against the wrong input.
+    /// `ghostie diarize-probe <wav> <wav>.cleaned.json` then reproduces a
+    /// call's clustering exactly, offline, as often as you like.
+    ///
+    /// Off by default: a call already keeps its audio, and this would add a
+    /// file per track to every session for the sake of an investigation that
+    /// is not usually running.
+    static func dumpSegments(_ segments: [Transcriber.Segment], beside wav: URL) {
+        guard ProcessInfo.processInfo.environment["GHOSTIE_DUMP_SEGMENTS"] != nil,
+              !segments.isEmpty else { return }
+        let rows: [[String: Any]] = segments.map {
+            ["text": $0.text,
+             "offsets": ["from": $0.startMs, "to": $0.endMs ?? $0.startMs]]
+        }
+        let url = wav.deletingPathExtension().appendingPathExtension("cleaned.json")
+        guard let data = try? JSONSerialization.data(withJSONObject: ["transcription": rows],
+                                                     options: [.prettyPrinted]),
+              (try? data.write(to: url)) != nil else {
+            Log.warn("Could not write \(url.lastPathComponent).")
+            return
+        }
+        Log.info("Dumped \(segments.count) post-clean segments → \(url.lastPathComponent)")
+    }
+
     private func transcribeMerge(mic: URL, sys: URL,
                                  roster: MeetingRoster = MeetingRoster()) throws -> [Line] {
         // One streamed pass per track, so the cleaner can ask whether a
@@ -305,20 +337,29 @@ struct Pipeline {
             return WavLevel.envelope(wav)
         }
 
+        // Whisper's own `endMs` rides along: diarization embeds these spans,
+        // and rebuilding them from the next segment's start swallows the
+        // pause a speaker change lives in.
         func cleaned(_ raw: [Transcriber.Segment], _ speaker: String,
-                     audio: WavLevel.Envelope?) -> [(startMs: Int, text: String)] {
-            guard config.cleanTranscript else {
-                return raw.map { (startMs: $0.startMs, text: $0.text) }
+                     wav: URL, audio: WavLevel.Envelope?) -> [Transcriber.Segment] {
+            let out: [Transcriber.Segment]
+            if config.cleanTranscript {
+                let (cleanSegs, stats) = TranscriptCleaner.clean(raw, audio: audio)
+                if stats.removed > 0 || stats.silenceGateStoodDown > 0 {
+                    Log.info("\(speaker): \(stats.summary)")
+                }
+                out = cleanSegs.map {
+                    Transcriber.Segment(startMs: $0.startMs, text: $0.text, endMs: $0.endMs)
+                }
+            } else {
+                out = raw
             }
-            let (out, stats) = TranscriptCleaner.clean(raw, audio: audio)
-            if stats.removed > 0 || stats.silenceGateStoodDown > 0 {
-                Log.info("\(speaker): \(stats.summary)")
-            }
-            return out.map { (startMs: $0.startMs, text: $0.text) }
+            Self.dumpSegments(out, beside: wav)
+            return out
         }
 
-        var me: [(startMs: Int, text: String)]
-        var part: [(startMs: Int, text: String)]
+        var me: [Transcriber.Segment]
+        var part: [Transcriber.Segment]
 
         // Codeswitch is taken whenever ≥2 per-language whisper models are
         // installed on disk. With one model, the single-language path runs
@@ -332,14 +373,14 @@ struct Pipeline {
                 + active.joined(separator: "+") + ").")
             let cst = CodeSwitchTranscriber(config: config, installed: installed)
             let (meSegs, partSegs) = try cst.transcribeBoth(me: mic, participants: sys)
-            me = cleaned(meSegs, "Me", audio: envelope(mic))
-            part = cleaned(partSegs, "Participants", audio: envelope(sys))
+            me = cleaned(meSegs, "Me", wav: mic, audio: envelope(mic))
+            part = cleaned(partSegs, "Participants", wav: sys, audio: envelope(sys))
         } else {
             let transcriber = Transcriber(config: config)
             me = cleaned(try transcriber.transcribe(mic, speaker: "Me"),
-                         "Me", audio: envelope(mic))
+                         "Me", wav: mic, audio: envelope(mic))
             part = cleaned(try transcriber.transcribe(sys, speaker: "Participants"),
-                           "Participants", audio: envelope(sys))
+                           "Participants", wav: sys, audio: envelope(sys))
         }
 
         let partLabels = diarizeParticipants(part, wav: sys)
@@ -348,10 +389,16 @@ struct Pipeline {
         // re-enters the mic, so Me duplicates Participants. Per-track cleaning
         // can't see this; it has to run here, between clean and merge.
         if config.cleanTranscript {
-            let (deEchoed, stats) = EchoSuppressor.suppress(me: me, participants: part)
+            // The echo guard reads text and start times only, and the Me
+            // track's spans have no consumer past this point — diarization
+            // runs on Participants alone — so they stop here rather than
+            // being threaded through a module with its own fixtures.
+            let (deEchoed, stats) = EchoSuppressor.suppress(
+                me: me.map { (startMs: $0.startMs, text: $0.text) },
+                participants: part.map { (startMs: $0.startMs, text: $0.text) })
             if stats.engaged {
                 Log.info(stats.summary)
-                me = deEchoed
+                me = deEchoed.map { Transcriber.Segment(startMs: $0.startMs, text: $0.text) }
             }
         }
 
@@ -414,19 +461,24 @@ struct Pipeline {
     /// and the summary then wrote *"a close friend (labeled 'Participants')"*
     /// into its prose — the model had no way to know it was reading a track
     /// name rather than a name.
-    private func diarizeParticipants(_ segments: [(startMs: Int, text: String)],
+    private func diarizeParticipants(_ segments: [Transcriber.Segment],
                                      wav: URL) -> [Int: String] {
         guard config.diarization, segments.count > 1 else { return [:] }
         guard let embedder = SpeakerEmbedder.load(config: config) else { return [:] }
         defer { embedder.shutdown() }
         guard let pcm = try? AudioStitcher.readPCM(wav) else { return [:] }
 
-        // The cleaner may have dropped or merged segments since transcription,
-        // so spans are rebuilt here from what actually reached the transcript.
+        // Whisper's own span per segment, which the cleaner carries through.
+        // Only a segment that never had one falls back to the next segment's
+        // start — see `Transcriber.Segment.endMs`: that fallback span
+        // swallows the pause between two segments, and a speaker change lives
+        // in exactly that pause, so the embedding picks up the leading edge of
+        // whoever spoke next. Doing it for *every* segment is how four voices
+        // clustered into three on the 2026-09-11 Zoom call.
         let input = segments.enumerated().map { i, s in
             Transcriber.Segment(
                 startMs: s.startMs, text: s.text,
-                endMs: i + 1 < segments.count ? segments[i + 1].startMs : nil)
+                endMs: s.endMs ?? (i + 1 < segments.count ? segments[i + 1].startMs : nil))
         }
         let t0 = Date()
         guard let a = SpeakerDiarizer().diarize(

@@ -784,7 +784,14 @@ func printHelp() {
 /// when. Fixed segments (rather than Whisper's) keep the probe independent of
 /// transcription, so it answers "can the embeddings tell these voices apart?"
 /// on its own.
-func cmdDiarizeProbe(_ config: Config, wavPath: String, segmentMs: Int) {
+///
+/// Pass a whisper `-oj` JSON in place of the segment length to ask the other
+/// question instead — what the pipeline actually does — because the two can
+/// disagree. On the 2026-09-11 Zoom call fixed three-second windows clustered
+/// into five and fixed six-second ones into three, so segment length alone
+/// moves the answer and only the real boundaries settle it.
+func cmdDiarizeProbe(_ config: Config, wavPath: String, segmentMs: Int,
+                     segmentsJSON: String? = nil) {
     guard let embedder = SpeakerEmbedder.load(config: config) else {
         print("diarize-probe: speaker embedding unavailable"); exit(1)
     }
@@ -796,12 +803,33 @@ func cmdDiarizeProbe(_ config: Config, wavPath: String, segmentMs: Int) {
     let floats = SpeakerDiarizer.floatSamples(samples)
     let totalMs = floats.count * 1000 / Fbank.sampleRate
     var segments: [Transcriber.Segment] = []
-    var t = 0
-    while t + segmentMs <= totalMs {
-        segments.append(Transcriber.Segment(startMs: t, text: "", endMs: t + segmentMs))
-        t += segmentMs
+    if let segmentsJSON {
+        guard let data = FileManager.default.contents(atPath: segmentsJSON),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let rows = root["transcription"] as? [[String: Any]] else {
+            print("diarize-probe: could not read whisper segments from \(segmentsJSON)")
+            exit(1)
+        }
+        for row in rows {
+            guard let off = row["offsets"] as? [String: Any],
+                  let from = off["from"] as? Int, let to = off["to"] as? Int,
+                  to > from else { continue }
+            segments.append(Transcriber.Segment(
+                startMs: from, text: (row["text"] as? String) ?? "", endMs: to))
+        }
+        let spans = segments.map { Double(($0.endMs ?? $0.startMs) - $0.startMs) / 1000 }
+        let mean = spans.isEmpty ? 0 : spans.reduce(0, +) / Double(spans.count)
+        print(String(format: "%d whisper segments over %.1f min, mean span %.1f s",
+                     segments.count, Double(totalMs) / 60_000, mean))
+    } else {
+        var t = 0
+        while t + segmentMs <= totalMs {
+            segments.append(Transcriber.Segment(startMs: t, text: "", endMs: t + segmentMs))
+            t += segmentMs
+        }
+        print("\(segments.count) segments of \(segmentMs) ms over \(String(format: "%.1f", Double(totalMs) / 60_000)) min")
     }
-    print("\(segments.count) segments of \(segmentMs) ms over \(String(format: "%.1f", Double(totalMs) / 60_000)) min")
+    guard segments.count > 1 else { print("diarize-probe: too few segments"); exit(1) }
     let t0 = Date()
     var diarizer = SpeakerDiarizer()
     diarizer.fillUnlabelled = ProcessInfo.processInfo.environment["GHOSTIE_DIARIZE_NOFILL"] == nil
@@ -820,21 +848,115 @@ func cmdDiarizeProbe(_ config: Config, wavPath: String, segmentMs: Int) {
     if !line.isEmpty { print("  \(line)") }
 }
 
+// MARK: - punctuate-probe (hidden)
+
+/// Field debugging for the punctuation pass: runs `TranscriptRefiner.restore`
+/// over a transcript through the real provider and times every batch.
+///
+/// The pass is the pipeline's longest stage and the one whose cost is
+/// invisible from the outside — on the 2026-09-11 call it spent 54 of 68
+/// minutes and logged nothing, because a batch that is merely slow has not
+/// failed. This runs it on its own, so a stall can be reproduced in minutes
+/// against a saved transcript instead of only after the next real call, and
+/// so `punctuationTimeoutSeconds` can be checked to actually fire.
+func cmdPunctuateProbe(_ config: Config, transcriptPath: String) {
+    guard let text = try? String(contentsOfFile: transcriptPath, encoding: .utf8) else {
+        print("punctuate-probe: could not read \(transcriptPath)"); exit(1)
+    }
+    // Accept a Ghostie transcript note or a plain one-turn-per-line file.
+    var lines: [Pipeline.Line] = []
+    for raw in text.split(separator: "\n", omittingEmptySubsequences: true) {
+        let line = String(raw).trimmingCharacters(in: .whitespaces)
+        guard !line.isEmpty, !line.hasPrefix("#"), !line.hasPrefix("- "),
+              line != "---" else { continue }
+        if line.hasPrefix("**["),
+           let close = line.range(of: ":** ") {
+            let body = String(line[close.upperBound...])
+            let stamp = line.dropFirst(3).prefix(while: { $0 != "]" })
+            let parts = stamp.split(separator: ":").compactMap { Int($0) }
+            let ms = parts.reduce(0) { $0 * 60 + $1 } * 1000
+            lines.append(Pipeline.Line(startMs: ms, speaker: "Speaker", text: body))
+        } else {
+            lines.append(Pipeline.Line(startMs: lines.count * 1000,
+                                       speaker: "Speaker", text: line))
+        }
+    }
+    guard !lines.isEmpty else { print("punctuate-probe: no turns found"); exit(1) }
+
+    let provider = Summarizer(config: config).punctuationProvider
+    guard provider.isConfigured else {
+        print("punctuate-probe: summarization provider is not configured"); exit(1)
+    }
+    print(String(format: "%d turns, %.0f%% end a sentence",
+                 lines.count, TranscriptRefiner.terminalFraction(lines) * 100))
+    print("timeout \(Int(config.punctuationTimeoutSeconds)) s per batch, "
+        + "\(TranscriptRefiner.maxConcurrentBatches) at a time")
+    let t0 = Date()
+    let (out, stats) = TranscriptRefiner.restore(lines, provider: provider)
+    print(String(format: "\nwall clock %.1f s", Date().timeIntervalSince(t0)))
+    print(stats.summary)
+    print(String(format: "%.0f%% of turns end a sentence now",
+                 TranscriptRefiner.terminalFraction(out) * 100))
+}
+
 // MARK: - embed-dump (hidden, diagnostics)
 
-/// Prints one L2-normalized speaker embedding per fixed-length segment as
-/// TSV, for offline analysis of separability.
-func cmdEmbedDump(_ config: Config, wavPath: String, segmentMs: Int) {
+/// Prints one L2-normalized speaker embedding per segment as TSV, for
+/// offline analysis of separability.
+///
+/// With a segment length, the segments are fixed windows and the first column
+/// is the window index. With a whisper `-oj` JSON — `<wav>.cleaned.json` from
+/// `GHOSTIE_DUMP_SEGMENTS` is the pipeline's own input — the first column is
+/// the segment's start in ms, so rows can be joined against a reference
+/// diarization by time.
+func cmdEmbedDump(_ config: Config, wavPath: String, segmentMs: Int,
+                  segmentsJSON: String? = nil) {
     guard let embedder = SpeakerEmbedder.load(config: config) else { exit(1) }
     defer { embedder.shutdown() }
     guard let pcm = try? AudioStitcher.readPCM(URL(fileURLWithPath: wavPath)) else { exit(1) }
     let f = SpeakerDiarizer.floatSamples(pcm)
+    func row(_ key: Int, _ e: [Float]) {
+        print("\(key)\t" + e.map { String(format: "%.5f", $0) }.joined(separator: ","))
+    }
+    if let segmentsJSON {
+        guard let data = FileManager.default.contents(atPath: segmentsJSON),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let rows = root["transcription"] as? [[String: Any]] else {
+            FileHandle.standardError.write(Data("embed-dump: could not read \(segmentsJSON)\n".utf8))
+            exit(1)
+        }
+        // Averaged over the segment's windows, exactly as `SpeakerDiarizer`
+        // does it — otherwise the offline analysis is of different vectors
+        // than the ones the pipeline clusters.
+        for r in rows {
+            guard let off = r["offsets"] as? [String: Any],
+                  let from = off["from"] as? Int, let to = off["to"] as? Int,
+                  to > from else { continue }
+            let a = max(0, from * Fbank.sampleRate / 1000)
+            let b = min(f.count, to * Fbank.sampleRate / 1000)
+            let minS = Fbank.sampleRate * SpeakerEmbedder.minWindowMs / 1000
+            guard b - a >= minS else { continue }
+            let window = Fbank.sampleRate * SpeakerEmbedder.windowMs / 1000
+            let hop = Fbank.sampleRate * SpeakerEmbedder.hopMs / 1000
+            var sum = [Float](repeating: 0, count: SpeakerEmbedder.embeddingDim)
+            var used = 0, off2 = a
+            while off2 + minS <= b {
+                let end = min(b, off2 + window)
+                if let e = embedder.embed(Array(f[off2..<end])) {
+                    for i in 0..<sum.count { sum[i] += e[i] }
+                    used += 1
+                }
+                if end == b { break }
+                off2 += hop
+            }
+            if used > 0 { row(from, SpeakerEmbedder.normalized(sum)) }
+        }
+        return
+    }
     let step = Fbank.sampleRate * segmentMs / 1000
     var i = 0, n = 0
     while i + step <= f.count {
-        if let e = embedder.embed(Array(f[i..<(i + step)])) {
-            print("\(n)\t" + e.map { String(format: "%.5f", $0) }.joined(separator: ","))
-        }
+        if let e = embedder.embed(Array(f[i..<(i + step)])) { row(n, e) }
         i += step; n += 1
     }
 }
@@ -966,13 +1088,26 @@ case "roster-probe":
 case "diarize-probe":
     // Hidden: cluster a WAV's speakers on fixed segments and print a timeline.
     guard args.count > 1 else {
-        Log.error("Usage: ghostie diarize-probe <wav> [segment-ms]"); exit(1)
+        Log.error("Usage: ghostie diarize-probe <wav> [segment-ms | whisper.json]"); exit(1)
     }
+    let arg = args.count > 2 ? args[2] : ""
     cmdDiarizeProbe(config, wavPath: args[1],
-                    segmentMs: Int(args.count > 2 ? args[2] : "") ?? 3000)
+                    segmentMs: Int(arg) ?? 3000,
+                    segmentsJSON: arg.hasSuffix(".json") ? arg : nil)
+case "punctuate-probe":
+    // Hidden: run the punctuation pass alone over a saved transcript and time
+    // every batch, so a stall is reproducible without waiting for a call.
+    guard args.count > 1 else {
+        Log.error("Usage: ghostie punctuate-probe <transcript.md>"); exit(1)
+    }
+    cmdPunctuateProbe(config, transcriptPath: args[1])
 case "embed-dump":
-    guard args.count > 1 else { Log.error("Usage: ghostie embed-dump <wav> [ms]"); exit(1) }
-    cmdEmbedDump(config, wavPath: args[1], segmentMs: Int(args.count > 2 ? args[2] : "") ?? 3000)
+    guard args.count > 1 else {
+        Log.error("Usage: ghostie embed-dump <wav> [ms | whisper.json]"); exit(1)
+    }
+    let embedArg = args.count > 2 ? args[2] : ""
+    cmdEmbedDump(config, wavPath: args[1], segmentMs: Int(embedArg) ?? 3000,
+                 segmentsJSON: embedArg.hasSuffix(".json") ? embedArg : nil)
 case "wav-probe":
     // Hidden: report per-track signal level for a session dir or a WAV.
     guard args.count > 1 else {
