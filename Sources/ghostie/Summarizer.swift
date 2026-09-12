@@ -17,20 +17,33 @@ struct Summarizer {
 
     /// The provider for the mechanical passes — today, punctuation restoration.
     ///
-    /// The same backend on a different model. Restoring punctuation is the
-    /// highest-volume caller in the pipeline and asks for no judgement, and
-    /// `TranscriptRefiner.preservesWording` throws away anything a model did
-    /// beyond punctuating, so a lighter tier here cannot corrupt a transcript
-    /// — it can only leave a line as whisper wrote it. Falls back to
-    /// `provider` whenever there is nothing to switch to: an Ollama install
-    /// (one local model, and the alias would mean nothing to it), an empty
-    /// setting, or a setting that names the summary model anyway.
+    /// The same backend, optionally on a different model, and always on its
+    /// own watchdog.
+    ///
+    /// Restoring punctuation is the highest-volume caller in the pipeline and
+    /// asks for no judgement, and `TranscriptRefiner.preservesWording` throws
+    /// away anything a model did beyond punctuating, so a lighter tier here
+    /// cannot corrupt a transcript — it can only leave a line as whisper
+    /// wrote it. An empty `punctuationModel`, or one naming the summary model
+    /// anyway, simply keeps the summary model.
+    ///
+    /// The timeout is `config.punctuationTimeoutSeconds`, not the summary's.
+    /// The summary is one request whose length scales with the call;
+    /// punctuation is dozens of identically-sized ones run
+    /// `maxConcurrentBatches`-wide, so a batch that merely runs slow holds a
+    /// slot the rest are queued behind, and a cap sized for a two-hour
+    /// summary never fires on it. On the 2026-09-11 Zoom call three batches
+    /// ran 16, 50 and 51 minutes inside the 600 s summary budget and
+    /// punctuation took 54 of the run's 68 minutes — with nothing in the log,
+    /// because by that budget nothing had failed.
     var punctuationProvider: SummarizationProvider {
-        let model = config.punctuationModel.trimmingCharacters(in: .whitespaces)
-        guard config.summaryProvider != "ollama",
-              !model.isEmpty, model != config.summaryModel else { return provider }
+        // Ollama runs one local model and its own client timeout; there is
+        // nothing here to retune.
+        guard config.summaryProvider != "ollama" else { return provider }
         var tuned = config
-        tuned.summaryModel = model
+        let model = config.punctuationModel.trimmingCharacters(in: .whitespaces)
+        if !model.isEmpty { tuned.summaryModel = model }
+        tuned.summaryTimeoutSeconds = config.punctuationTimeoutSeconds
         return ClaudeSummarizationProvider(config: tuned)
     }
 

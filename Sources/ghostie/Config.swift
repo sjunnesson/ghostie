@@ -225,6 +225,32 @@ struct Config: Codable {
     /// forever, not to bound how long a long call may take.
     var summaryTimeoutSeconds: Double = 600
 
+    /// Wall-clock cap on one *punctuation* request, separate from the
+    /// summary's.
+    ///
+    /// The summary is one long request whose length scales with the call;
+    /// punctuation is dozens of identically-sized ones run
+    /// `TranscriptRefiner.maxConcurrentBatches`-wide, so a batch that merely
+    /// runs slow holds a slot every other batch is queued behind, and a cap
+    /// sized for a two-hour summary never fires on it. On the 2026-09-11 Zoom
+    /// call three batches ran 16, 50 and 51 minutes inside the 600 s summary
+    /// budget: punctuation took 54 of the run's 68 minutes and the log said
+    /// nothing, because by that budget nothing had failed.
+    ///
+    /// 300, from measuring the same work on the same machine. A healthy pass
+    /// over that call's 1 219 turns ran 16 batches in 277 s — about 52 s of
+    /// slot time each — and three concurrent 12 000-character batches of it
+    /// came back in 48, 51 and 171 s. So a straggler at three times the
+    /// median is normal and 300 is nearly double the slowest healthy batch
+    /// measured, while still turning a 50-minute one into five.
+    ///
+    /// Erring high on purpose: a batch that times out is retried once and
+    /// then keeps whisper's own text, and `TranscriptRefiner.maxBatchFailures`
+    /// abandons the rest of the pass after three distinct batches fail twice.
+    /// Cutting too eagerly would trade a slow transcript for an unpunctuated
+    /// one, which is the worse of the two.
+    var punctuationTimeoutSeconds: Double = 300
+
     // MARK: Updates (in-app OTA — see Updater.swift)
 
     /// Check GitHub Releases on launch + ~daily and surface a newer version.
@@ -264,7 +290,7 @@ struct Config: Codable {
         case cleanTranscript, restorePunctuation, transcriptionQuality, codeSwitch
         case summaryProvider, summaryModel, punctuationModel, claudeBinary
         case ollamaUrl, ollamaModel
-        case summaryTimeoutSeconds
+        case summaryTimeoutSeconds, punctuationTimeoutSeconds
         case workDir
         case autoCheckUpdates, lastUpdateCheck, updateFeedOverride
     }
@@ -353,6 +379,7 @@ struct Config: Codable {
         let timeout = g(.summaryTimeoutSeconds, d.summaryTimeoutSeconds)
         summaryTimeoutSeconds = timeout == Config.oldSummaryTimeoutSeconds
             ? d.summaryTimeoutSeconds : timeout
+        punctuationTimeoutSeconds = g(.punctuationTimeoutSeconds, d.punctuationTimeoutSeconds)
         workDir = g(.workDir, d.workDir)
         autoCheckUpdates = g(.autoCheckUpdates, d.autoCheckUpdates)
         lastUpdateCheck = g(.lastUpdateCheck, d.lastUpdateCheck)

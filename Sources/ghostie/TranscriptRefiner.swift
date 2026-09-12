@@ -481,6 +481,12 @@ enum TranscriptRefiner {
                 }
                 var restored = attempt(label)
                 if restored == nil {
+                    // Say so now, not only in the end-of-pass tally: a batch
+                    // that fails and then succeeds on retry leaves no trace
+                    // there, and a run of these is how a slow provider shows
+                    // itself while the pass is still going.
+                    Log.warn("Punctuation batch \(n + 1)/\(batches.count) failed "
+                        + "(\(why)) — retrying once.")
                     Thread.sleep(forTimeInterval: batchRetryDelay)
                     restored = attempt(label + ", retry")
                 }
