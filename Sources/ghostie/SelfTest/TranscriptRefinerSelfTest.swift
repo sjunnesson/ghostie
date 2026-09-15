@@ -196,6 +196,68 @@ func runTranscriptRefinerSelfTest() -> Bool {
           && mixed.stats.restored == 1 && mixed.stats.rejected == 1,
           mixed.stats.summary)
 
+    // MARK: restore — the solo retry for rejected blocks
+    //
+    // Measured on the 2026-09-15 call: of 43 unpunctuated blocks sent one at
+    // a time, 32 came back clean that the batch pass had rejected. The model
+    // drifts on a block inside a long batch and not when asked about it
+    // alone, so a rejection is worth one more round-trip.
+
+    // Drifts on the second block in a batch, honest when asked about one.
+    let driftsInBatch = StubProvider(transform: { user in
+        user.contains("i've been in this thing") && user.contains("so yeah")
+            ? "[\"So yeah, I don't know.\", \"I have been working on this thing.\"]"
+            : "[\"I've been in this thing.\"]"
+    })
+    let saved = TranscriptRefiner.restore(rough, provider: driftsInBatch)
+    check("restore: a block the guard rejected is re-asked alone and recovered",
+          saved.lines.map(\.text) == ["So yeah, I don't know.", "I've been in this thing."]
+          && saved.stats.recovered == 1 && saved.stats.rejected == 0
+          && saved.stats.restored == 2,
+          saved.stats.summary)
+
+    // Drifts the same way both times — the guard refuses it twice and the
+    // block keeps whisper's text. This is the "sas" → "SaaS" case: the model
+    // wants to correct a word, which is precisely what must not happen.
+    let alwaysDrifts = StubProvider(transform: { user in
+        user.contains("so yeah")
+            ? "[\"So yeah, I don't know.\", \"I have been working on this thing.\"]"
+            : "[\"I have been working on this thing.\"]"
+    })
+    let stubborn = TranscriptRefiner.restore(rough, provider: alwaysDrifts)
+    check("restore: a block rejected twice keeps whisper's text and stays rejected",
+          stubborn.lines[1].text == "i've been in this thing"
+          && stubborn.stats.rejected == 1 && stubborn.stats.recovered == 0,
+          stubborn.stats.summary)
+
+    // Nothing rejected → the solo pass must not cost a single round-trip.
+    var calls = 0
+    let counted = StubProvider(transform: { _ in
+        calls += 1
+        return "[\"So yeah, I don't know.\", \"I've been in this thing.\"]"
+    })
+    _ = TranscriptRefiner.restore(rough, provider: counted)
+    check("restore: no rejections means no solo requests", calls == 1)
+
+    // A solo retry that fails outright is one block's punctuation, not
+    // evidence the provider is down — the rest of the transcript stands.
+    struct DiesOnSoloProvider: SummarizationProvider {
+        var isConfigured = true
+        var displayStatus = "stub"
+        var maxTranscriptChars = 1 << 20
+        func complete(system: String, user: String, purpose: String) throws -> String {
+            guard user.contains("so yeah") else { throw NSError(domain: "ghostie", code: 1) }
+            return "[\"So yeah, I don't know.\", \"I have been working on this thing.\"]"
+        }
+    }
+    let diesOnSolo = DiesOnSoloProvider()
+    let partial = TranscriptRefiner.restore(rough, provider: diesOnSolo)
+    check("restore: a failed solo retry costs one block, not the pass",
+          partial.lines[0].text == "So yeah, I don't know."
+          && partial.lines[1].text == "i've been in this thing"
+          && partial.stats.rejected == 1 && partial.stats.failedBatches == 0,
+          partial.stats.summary)
+
     // Truncating provider: the batch can't be aligned, so none of it is used.
     let truncating = StubProvider(transform: { _ in "[\"So yeah, I don't know.\"]" })
     let dropped = TranscriptRefiner.restore(rough, provider: truncating)

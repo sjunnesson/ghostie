@@ -315,7 +315,11 @@ enum TranscriptRefiner {
         var densityBefore = 0
         var densityAfter = 0
         var restored = 0
+        /// Blocks still rejected after the solo pass — the model insisted on
+        /// changing a word and the transcript keeps whisper's.
         var rejected = 0
+        /// Blocks the guard rejected in their batch and the solo pass saved.
+        var recovered = 0
         /// Blocks that already read as punctuated and were never sent.
         var skipped = 0
         var total = 0
@@ -324,6 +328,7 @@ enum TranscriptRefiner {
             var s = "punctuation: \(restored)/\(total) turns repunctuated "
                 + "(\(densityBefore) → \(densityAfter) marks per 100 words)"
             if skipped > 0 { s += ", \(skipped) already punctuated" }
+            if recovered > 0 { s += ", \(recovered) recovered on a solo retry" }
             if rejected > 0 { s += ", \(rejected) rejected for changed wording" }
             if failedBatches > 0 {
                 s += " — \(failedBatches) of \(totalBatches) batches failed even on retry "
@@ -497,7 +502,7 @@ enum TranscriptRefiner {
                 for (offset, candidate) in restored.enumerated() {
                     let original = batch.slice[offset]
                     guard preservesWording(original.text, candidate) else {
-                        sink.reject(1); continue
+                        sink.reject(at: batch.indices[offset]); continue
                     }
                     guard candidate != original.text else { continue }
                     sink.accept(at: batch.indices[offset],
@@ -508,6 +513,53 @@ enum TranscriptRefiner {
             }
         }
         group.wait()
+
+        // Second pass: every block the guard rejected, asked again on its own.
+        //
+        // A rejection is not a provider failure — the reply arrived and was
+        // the right shape, it just said something the original didn't, so the
+        // block keeps whisper's run-on text and nothing in the transcript
+        // says why. Asked alone the model usually doesn't drift: on the
+        // 2026-09-15 call (124 min) the batch pass rejected 25 blocks and
+        // this pass recovered 18 of them, for 38 s of a 5-minute run. The 7
+        // it could not save are the point of the guard — each one a word the
+        // model wanted to *correct* ("sas" → "SaaS", "tipsy scale" → "table
+        // stakes") rather than punctuate. A second rejection is a real
+        // answer, so the block is left alone for good.
+        let solo = Array(sink.rejectedIndices.prefix(maxSoloRetries))
+        if !solo.isEmpty, !sink.providerIsDown {
+            Log.info("Punctuation: re-asking \(solo.count) rejected "
+                + "block\(solo.count == 1 ? "" : "s") one at a time…")
+            for (n, index) in solo.enumerated() {
+                inFlight.wait()
+                guard !sink.providerIsDown else { inFlight.signal(); break }
+                queue.async(group: group) {
+                    defer { inFlight.signal() }
+                    let original = lines[index]
+                    guard let payload = try? JSONSerialization.data(
+                            withJSONObject: [original.text], options: []),
+                          let user = String(data: payload, encoding: .utf8)
+                    else { return }
+                    // A failure here costs one block its punctuation and
+                    // nothing else, so it is not counted against
+                    // `maxBatchFailures` — the batch pass already decided
+                    // whether the provider is up.
+                    guard let reply = try? provider.complete(
+                            system: system, user: user,
+                            purpose: "Repunctuating rejected block \(n + 1)/\(solo.count)"),
+                          let candidate = parse(reply, expecting: 1)?.first,
+                          preservesWording(original.text, candidate),
+                          candidate != original.text
+                    else { return }
+                    sink.recover(at: index,
+                                 Pipeline.Line(startMs: original.startMs,
+                                               speaker: original.speaker,
+                                               text: candidate))
+                }
+            }
+            group.wait()
+        }
+
         if sink.failures > 0 {
             let detail = sink.reasons.map { "\"\($0)\"" }.joined(separator: ", ")
             Log.warn("Punctuation: \(sink.failures) of \(batches.count) batches failed twice "
@@ -517,6 +569,7 @@ enum TranscriptRefiner {
         let out = sink.result
         stats.restored = sink.restored
         stats.rejected = sink.rejected
+        stats.recovered = sink.recovered
         stats.failedBatches = sink.failures
         stats.totalBatches = batches.count
         stats.densityAfter = punctuationDensity(out)
@@ -539,6 +592,14 @@ enum TranscriptRefiner {
     /// genuinely gone fails the retry too and `maxBatchFailures` stops the run.
     static let batchRetryDelay: TimeInterval = 3
 
+    /// Rejected blocks that may be re-asked one at a time. Each is a whole
+    /// round-trip for one block, so the cap is what keeps a transcript the
+    /// model disagrees with everywhere from turning into hundreds of them;
+    /// 40 blocks at three concurrent is about a minute, against the 8m04s
+    /// the batch pass itself took on the call this was measured on, which
+    /// rejected 25. The cap is headroom over that, not a budget to spend.
+    static let maxSoloRetries = 40
+
     /// Distinct batches that may fail before the rest are abandoned. Under
     /// concurrency a single failure is not evidence the provider is gone —
     /// which is what the first version of this assumed, quietly dropping
@@ -555,8 +616,17 @@ enum TranscriptRefiner {
         private var down = false
         private(set) var restored = 0
         private(set) var rejected = 0
+        private(set) var recovered = 0
         private(set) var failures = 0
         private(set) var reasons: [String] = []
+        /// Indices the guard threw away, for the solo pass to ask again.
+        /// Sorted on the way out so the `maxSoloRetries` cut is the first
+        /// blocks of the transcript rather than whichever batch finished
+        /// first.
+        private var rejectedAt: [Int] = []
+        var rejectedIndices: [Int] {
+            lock.lock(); defer { lock.unlock() }; return rejectedAt.sorted()
+        }
 
         init(lines: [Pipeline.Line]) { self.lines = lines }
 
@@ -571,9 +641,18 @@ enum TranscriptRefiner {
             if failures >= max { down = true }
             lock.unlock()
         }
-        func reject(_ n: Int) { lock.lock(); rejected += n; lock.unlock() }
+        func reject(at i: Int) {
+            lock.lock(); rejected += 1; rejectedAt.append(i); lock.unlock()
+        }
         func accept(at i: Int, _ line: Pipeline.Line) {
             lock.lock(); lines[i] = line; restored += 1; lock.unlock()
+        }
+        /// A block the guard rejected in its batch, saved by the solo retry.
+        /// It stops counting as rejected: the transcript has its punctuation.
+        func recover(at i: Int, _ line: Pipeline.Line) {
+            lock.lock()
+            lines[i] = line; restored += 1; recovered += 1; rejected -= 1
+            lock.unlock()
         }
     }
 
