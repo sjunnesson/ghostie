@@ -23,7 +23,8 @@ swift build -c release            # release build (what the scripts use)
 .build/release/ghostie selftest   # REGRESSION SUITE (see Testing)
 .build/release/ghostie doctor     # check deps/permissions/backlog
 .build/release/ghostie test-record 15      # smoke-test the full pipeline
-.build/release/ghostie process <dir>       # re-run pipeline on a recording dir
+.build/release/ghostie process <dir>       # re-run pipeline on a recording dir (one track is enough)
+.build/release/ghostie import <file>…      # external m4a/mp3/wav/mov → session dir → pipeline
 .build/release/ghostie fetch-models [v]    # download codeswitch models (KB v + large-v3 + VAD)
 .build/release/ghostie mic-probe [secs]   # is voice-processed mic capture working on this OS?
 .build/release/ghostie punctuate-probe <md>  # run the punctuation pass alone, timed
@@ -81,6 +82,17 @@ the same code drives the menu-bar app and the headless daemon.
   away. At confirm the coordinator freezes a `CallSource` (Teams / Zoom /
   Meet, from the evidence's bundle ids / tab site); Engine reads it via
   `currentCallSource()` and threads it to the pipeline for note naming.
+- **`RecordingImporter.swift`** — recordings made outside Ghostie (menu
+  "Import Audio File…", `ghostie import`, `Engine.importRecording`). Decodes
+  via AVAudioFile, folds channels by hand and lets `AVAudioConverter` do only
+  the rate change (same lesson as `MicCapture`), and writes a normal session
+  folder with the whole file on `participants.wav` — the Participants track
+  is where diarization runs, so it is the only placement that splits a room
+  into people; the user is "Participant N", not "Me". The folder (and note)
+  is stamped with the file's embedded creation date. `Pipeline` treats the
+  absent `me.wav` as silent, and `source == Pipeline.importedSource`
+  switches the meta block's origin line so the summarizer is not told the
+  audio came from ScreenCaptureKit.
 - **`AudioRecorder.swift`** — two audio paths, both 16 kHz mono:
   SCK `.audio` (system → everyone else → `participants.wav`), and the mic
   (you → `me.wav`) via **`MicCapture.swift`** — AVAudioEngine with

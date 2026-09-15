@@ -43,6 +43,12 @@ struct Pipeline {
 
     // MARK: Live processing
 
+    /// `source` label for recordings brought in by `RecordingImporter`.
+    /// Names the note (`<stamp>_Imported-Call.md`) and switches the meta
+    /// block's origin line; persisted in `Backlog.Meta.source` so a retry
+    /// writes the same note.
+    static let importedSource = "Imported"
+
     @discardableResult
     func process(_ rec: AudioRecorder.Result, startedAt: Date,
                  source: String = "Call",
@@ -60,7 +66,8 @@ struct Pipeline {
                                  source: source, roster: roster,
                                  copyingOriginals: config.keepAudio)
             let url = writeNote(meta: metaBlock(startedAt, durationMins,
-                                                mic: rec.micWav, sys: rec.systemWav),
+                                                mic: rec.micWav, sys: rec.systemWav,
+                                                source: source),
                 summary: "> ⏳ **Queued.** Transcription wasn't available (\(error.localizedDescription)). Ghostie will process this recording automatically once it can run again.",
                 transcript: "_(Pending transcription.)_", startedAt: startedAt,
                 source: source)
@@ -70,7 +77,7 @@ struct Pipeline {
 
         let transcript = render(lines)
         let meta = metaBlock(startedAt, durationMins,
-                             mic: rec.micWav, sys: rec.systemWav)
+                             mic: rec.micWav, sys: rec.systemWav, source: source)
 
         if lines.isEmpty {
             let url = writeNote(meta: meta,
@@ -133,8 +140,10 @@ struct Pipeline {
             let startedAt = entry.startedAtDate
             let meta = entry.meta.stage == "transcribe"
                 ? p.metaBlock(startedAt, entry.meta.durationMins,
-                              mic: entry.micWav, sys: entry.systemWav)
-                : p.metaBlock(startedAt, entry.meta.durationMins)
+                              mic: entry.micWav, sys: entry.systemWav,
+                              source: entry.meta.source ?? "Call")
+                : p.metaBlock(startedAt, entry.meta.durationMins,
+                              source: entry.meta.source ?? "Call")
             // Pre-source entries default to "Teams" — the label their queued
             // note was originally written under, so the note name re-derives
             // identically and the upgrade lands in place.
@@ -361,6 +370,17 @@ struct Pipeline {
         var me: [Transcriber.Segment]
         var part: [Transcriber.Segment]
 
+        // A single-track recording — `ghostie process` on an imported file,
+        // or a session whose other WAV was never written — has no second
+        // track. The health warning above reads the real URLs (a track that
+        // does not exist is not a track that recorded nothing); down here a
+        // silent stub stands in for it so both transcription paths run
+        // unchanged and the missing side simply contributes no lines.
+        let haveMic = FileManager.default.fileExists(atPath: mic.path)
+        let haveSys = FileManager.default.fileExists(atPath: sys.path)
+        let mic = haveMic ? mic : Self.silentStub(beside: mic)
+        let sys = haveSys ? sys : Self.silentStub(beside: sys)
+
         // Codeswitch is taken whenever ≥2 per-language whisper models are
         // installed on disk. With one model, the single-language path runs
         // exactly as it did pre-v2. Users control behaviour by what they
@@ -377,10 +397,14 @@ struct Pipeline {
             part = cleaned(partSegs, "Participants", wav: sys, audio: envelope(sys))
         } else {
             let transcriber = Transcriber(config: config)
-            me = cleaned(try transcriber.transcribe(mic, speaker: "Me"),
-                         "Me", wav: mic, audio: envelope(mic))
-            part = cleaned(try transcriber.transcribe(sys, speaker: "Participants"),
-                           "Participants", wav: sys, audio: envelope(sys))
+            me = haveMic
+                ? cleaned(try transcriber.transcribe(mic, speaker: "Me"),
+                          "Me", wav: mic, audio: envelope(mic))
+                : []
+            part = haveSys
+                ? cleaned(try transcriber.transcribe(sys, speaker: "Participants"),
+                          "Participants", wav: sys, audio: envelope(sys))
+                : []
         }
 
         let partLabels = diarizeParticipants(part, wav: sys)
@@ -410,6 +434,29 @@ struct Pipeline {
         // its unpunctuated register. Both run before naming so the naming
         // prompt — and the summary built on it — see the readable transcript.
         return named(refined(Self.merge(lines)), roster: roster)
+    }
+
+    /// A 1.5 s silent 16 kHz mono WAV written next to a track that does not
+    /// exist (`<name>.empty.wav`). Long enough that whisper's VAD pass accepts
+    /// it (it refuses inputs under a second), short enough that nothing can
+    /// be decoded from it: VAD finds no speech, so the code-switch path
+    /// returns no segments for the track.
+    private static func silentStub(beside wav: URL) -> URL {
+        let stub = wav.deletingPathExtension().appendingPathExtension("empty.wav")
+        let rate: UInt32 = 16_000
+        let bytes = Int(rate) * 3 / 2 * 2   // 1.5 s of 16-bit samples
+        var data = Data()
+        func u32(_ v: UInt32) { withUnsafeBytes(of: v.littleEndian) { data.append(contentsOf: $0) } }
+        func u16(_ v: UInt16) { withUnsafeBytes(of: v.littleEndian) { data.append(contentsOf: $0) } }
+        data.append(contentsOf: Array("RIFF".utf8)); u32(UInt32(36 + bytes))
+        data.append(contentsOf: Array("WAVE".utf8))
+        data.append(contentsOf: Array("fmt ".utf8)); u32(16); u16(1); u16(1)
+        u32(rate); u32(rate * 2); u16(2); u16(16)
+        data.append(contentsOf: Array("data".utf8)); u32(UInt32(bytes))
+        data.append(Data(count: bytes))
+        try? data.write(to: stub)
+        Log.info("\(wav.lastPathComponent) not present — treating that track as silent.")
+        return stub
     }
 
     /// Coalesce segments into turns, then repunctuate when the transcript
@@ -522,11 +569,17 @@ struct Pipeline {
     }
 
     private func metaBlock(_ startedAt: Date, _ durationMins: String,
-                           mic: URL? = nil, sys: URL? = nil) -> String {
+                           mic: URL? = nil, sys: URL? = nil,
+                           source: String = "Call") -> String {
+        // An imported file was never captured by Ghostie; saying it was
+        // would be the meta block's first lie, and the summarizer reads it.
+        let origin = source == Self.importedSource
+            ? "Imported audio file, transcribed locally. There is no separate \"Me\" speaker in this recording: the reader is one of the numbered participants, so do not list \"You\" or \"Me\" as a participant of their own."
+            : "Captured locally via ScreenCaptureKit (no bot joined the call)"
         var block = """
         - Date: \(Self.human.string(from: startedAt))
         - Duration: \(durationMins) minutes
-        - Captured locally via ScreenCaptureKit (no bot joined the call)
+        - \(origin)
         """
         if let warning = Self.trackHealthWarning(mic: mic, sys: sys) {
             block += "\n- ⚠️ \(warning)"

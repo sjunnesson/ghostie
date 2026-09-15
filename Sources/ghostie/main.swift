@@ -329,9 +329,39 @@ func cmdProcess(_ config: Config, dir: String) {
           FileManager.default.fileExists(atPath: sys.path) else {
         Log.error("No me.wav / participants.wav found in \(dir)"); return
     }
+    // A session folder is named for the moment the recording started
+    // (`yyyy-MM-dd_HH-mm-ss`), so a re-run — or an imported recording dropped
+    // into a folder named that way — dates its note by the recording, not by
+    // when this command happened to run. Duration comes off the longer WAV.
+    let stamp = DateFormatter()
+    stamp.dateFormat = "yyyy-MM-dd_HH-mm-ss"
+    stamp.locale = Locale(identifier: "en_US_POSIX")
+    let startedAt = stamp.date(from: url.lastPathComponent) ?? Date()
+    let duration = max(WavLevel.probe(mic)?.seconds ?? 0, WavLevel.probe(sys)?.seconds ?? 0)
     let result = AudioRecorder.Result(sessionDir: url, micWav: mic,
-                                      systemWav: sys, duration: 0)
-    Pipeline(config: config).process(result, startedAt: Date())
+                                      systemWav: sys, duration: duration)
+    Pipeline(config: config).process(result, startedAt: startedAt)
+}
+
+/// Headless twin of the menu's "Import Audio File…": one session folder and
+/// one note per file, in order. A file that cannot be decoded is reported
+/// and skipped; the exit code says whether every file made it.
+func cmdImport(_ config: Config, files: [String]) {
+    var failed = 0
+    for path in files {
+        let url = URL(fileURLWithPath: path)
+        do {
+            let imported = try RecordingImporter.importFile(url, config: config)
+            let note = Pipeline(config: config).process(
+                imported.result, startedAt: imported.startedAt,
+                source: Pipeline.importedSource)
+            if let note { print("Note: \(note.path)") }
+        } catch {
+            Log.error("\(url.lastPathComponent): \(error.localizedDescription)")
+            failed += 1
+        }
+    }
+    if failed > 0 { exit(1) }
 }
 
 /// Headless equivalent of the Settings "Download models" button. Uses the
@@ -751,6 +781,10 @@ func printHelp() {
       run                 Headless watch loop (launchd / servers).
       test-record [secs]  Record N seconds (default 30) → full pipeline.
       process <dir>       Re-run transcription+summary on a recording dir.
+      import <file>…      Transcribe+summarize recordings made elsewhere
+                          (m4a, mp3, wav, mov…). Audio lands on the
+                          Participants track; the note is dated by the
+                          file's own creation date.
       doctor              Check dependencies & permissions.
       doctor models       SHA256-verify every required model against the
                           sidecar from its last successful download.
@@ -1053,6 +1087,9 @@ case "test-record":
 case "process":
     guard args.count > 1 else { Log.error("Usage: ghostie process <dir>"); exit(1) }
     cmdProcess(config, dir: args[1])
+case "import":
+    guard args.count > 1 else { Log.error("Usage: ghostie import <file>…"); exit(1) }
+    cmdImport(config, files: Array(args.dropFirst()))
 case "fetch-models":
     cmdFetchModels(config, args: Array(args.dropFirst()))
 case "doctor":

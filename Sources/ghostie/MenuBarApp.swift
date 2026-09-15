@@ -1,4 +1,5 @@
 import AppKit
+import UniformTypeIdentifiers
 import UserNotifications
 
 /// The menu bar (status bar) application. No Dock icon — it lives entirely in
@@ -147,6 +148,9 @@ final class MenuBarApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // "Stop Recording" whenever a capture is live, detected or manual.
         recordItem = item("Start Recording", #selector(toggleManualRecording), key: "r")
         menu.addItem(recordItem)
+        // Recordings made elsewhere — a voice memo, a phone, an exported
+        // call — through the same pipeline. See RecordingImporter.
+        menu.addItem(item("Import Audio File…", #selector(importAudioFile), key: "i"))
 
         toggleItem = item("Pause Listening", #selector(toggleListening))
         menu.addItem(toggleItem)
@@ -330,6 +334,40 @@ final class MenuBarApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             DispatchQueue.main.async {
                 self?.refreshLastNote()
                 if let note { NSWorkspace.shared.open(note) }
+            }
+        }
+    }
+
+    /// Pick one or more audio/video files and run each through the
+    /// pipeline. Imports queue on the engine's work queue in the order
+    /// picked; each one notifies and opens its note when done.
+    @objc private func importAudioFile() {
+        let panel = NSOpenPanel()
+        panel.title = "Import a recording"
+        panel.message = "Choose a recording to transcribe and summarize. Everyone in it lands on the Participants track — you included."
+        panel.prompt = "Import"
+        panel.allowedContentTypes = [.audio, .movie]
+        panel.allowsMultipleSelection = true
+        panel.canChooseDirectories = false
+        // A menu-bar-only app has no key window; without this the panel can
+        // open behind whatever is frontmost.
+        NSApp.activate(ignoringOtherApps: true)
+        guard panel.runModal() == .OK, !panel.urls.isEmpty else { return }
+        for url in panel.urls {
+            let name = url.lastPathComponent
+            notify("Ghostie", "Importing \(name)…")
+            engine.importRecording(url) { [weak self] outcome in
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    self.refreshLastNote()
+                    switch outcome {
+                    case .success(let note):
+                        self.notify("Imported \(name)", "Summary ready.")
+                        if let note { NSWorkspace.shared.open(note) }
+                    case .failure(let error):
+                        self.notify("Import failed", error.localizedDescription)
+                    }
+                }
             }
         }
     }

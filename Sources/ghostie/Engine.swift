@@ -489,6 +489,41 @@ final class Engine: @unchecked Sendable {
         }
     }
 
+    /// Bring a recording made outside Ghostie through the pipeline (see
+    /// `RecordingImporter`). Decoding and the pipeline both run on `work`,
+    /// so an import queues behind whatever is already summarizing and never
+    /// interleaves with it; `processingCount` keeps the menu bar honest
+    /// meanwhile. Never refused: unlike a test capture it needs no SCStream,
+    /// so it cannot collide with a live or manual recording — it just waits
+    /// its turn. `completion` fires on `work` with the note, or the error
+    /// that stopped the import before the pipeline ran.
+    func importRecording(_ file: URL, completion: @escaping (Result<URL?, Error>) -> Void) {
+        gate.async {
+            self.processingCount += 1
+            self.settleStateLocked()   // → .processing
+            self.work.async {
+                let config = Config.load()
+                let outcome: Result<URL?, Error>
+                do {
+                    let imported = try RecordingImporter.importFile(file, config: config)
+                    let note = Pipeline(config: config).process(
+                        imported.result, startedAt: imported.startedAt,
+                        source: Pipeline.importedSource)
+                    if let note { self.lastNote = note; self.onNote?(note) }
+                    outcome = .success(note)
+                } catch {
+                    Log.error("Import of \(file.lastPathComponent) failed: \(error.localizedDescription)")
+                    outcome = .failure(error)
+                }
+                self.gate.async {
+                    self.processingCount -= 1
+                    self.settleStateLocked()
+                }
+                completion(outcome)
+            }
+        }
+    }
+
     /// Finalize any active recording synchronously-ish before app quit.
     /// Hops through `gate` (this used to poke `recorder` straight from the
     /// caller's thread, racing handleStart/handleStop) and waits out an

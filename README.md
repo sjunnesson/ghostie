@@ -133,6 +133,13 @@ header, no Dock icon, always watching.
 The menu bar icon reflects state (watching · ● recording 02:13 · summarizing)
 and its menu gives quick access to everything:
 
+- **Start / Stop Recording** — record without call detection (in-person
+  meetings, anything the detector doesn't cover)
+- **Import Audio File…** (`⌘I`) — run a recording made elsewhere (a voice
+  memo, a phone recording, an exported call: m4a, mp3, wav, mov…) through
+  the same transcribe → diarize → summarize pipeline. Everyone in the file
+  lands on the Participants track, you included, and the note is dated by
+  the file's own creation date.
 - **Pause / Resume Listening**
 - **Open Notes Folder** · **Open Last Summary**
 - **Run 15-Second Test** (verifies the whole pipeline)
@@ -180,6 +187,7 @@ The same binary also runs without a UI — useful for launchd or remote boxes:
 ghostie run                          # headless watch loop; Ctrl-C to stop
 ghostie test-record 15               # 15s smoke test through the full pipeline
 ghostie process <dir>                # re-summarize a saved recording folder
+ghostie import <file>…               # transcribe+summarize recordings made elsewhere
 ghostie install-service              # headless launchd service
 ghostie doctor                       # dependency + permission diagnostics
 ghostie diagnose-detect              # live detector readout (30s, 500ms refresh)
