@@ -90,6 +90,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         var transcription: TranscriptionPane?
         var summary: SummaryPane?
         var updates: UpdatesPane?
+        var connect: ConnectPane?
         var advanced: AdvancedPane?
         var about: AboutPane?
     }
@@ -403,6 +404,15 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
                 changes: { [weak self] block in self?.mutateCfg(block) }
             )
             panes.summary = p
+            return p
+        case .connect:
+            if let p = panes.connect { return p }
+            let p = ConnectPane(cfg: cfg, reveal: { path in
+                try? FileManager.default.createDirectory(
+                    atPath: path, withIntermediateDirectories: true)
+                NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+            })
+            panes.connect = p
             return p
         case .updates:
             if let p = panes.updates { return p }
@@ -903,9 +913,10 @@ private extension String {
 // MARK: - Pane identity
 
 enum PaneId: String, CaseIterable {
-    case listening, notes, transcription, summary, updates, advanced, about
+    case listening, notes, transcription, summary, connect, updates, advanced, about
 
-    static let mainOrder: [PaneId] = [.listening, .notes, .transcription, .summary, .updates]
+    static let mainOrder: [PaneId] = [.listening, .notes, .transcription, .summary,
+                                      .connect, .updates]
     static let bottomOrder: [PaneId] = [.advanced, .about]
 
     var title: String {
@@ -914,6 +925,7 @@ enum PaneId: String, CaseIterable {
         case .notes:         return "Notes"
         case .transcription: return "Transcription"
         case .summary:       return "Summary"
+        case .connect:       return "MCP"
         case .updates:       return "Updates"
         case .advanced:      return "Developer"
         case .about:         return "About"
@@ -926,6 +938,7 @@ enum PaneId: String, CaseIterable {
         case .notes:         return "folder"
         case .transcription: return "waveform"
         case .summary:       return "sparkles"
+        case .connect:       return "link"
         case .updates:       return "arrow.triangle.2.circlepath"
         case .advanced:      return "hammer"
         case .about:         return "info.circle"

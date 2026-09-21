@@ -676,6 +676,19 @@ struct Pipeline {
         do {
             try doc.write(to: noteURL, atomically: true, encoding: .utf8)
             Log.ok("Note saved → \(noteURL.path)")
+            // Index after the note lands, not before: the record points at
+            // the note, so a failed write must not leave the index claiming a
+            // call that has no note. Every route to a note — live, backlog
+            // drain, orphan sweep, `process`, `import` — comes through here,
+            // which is why this is the only place that indexes.
+            TranscriptIndex.write(
+                id: base, startedAt: startedAt, source: source,
+                durationMins: TranscriptIndex.duration(fromMeta: meta),
+                notePath: noteURL.path,
+                transcriptPath: config.saveTranscript
+                    ? folder.appendingPathComponent(base + "_transcript.md").path
+                    : nil,
+                transcript: transcript)
             return noteURL
         } catch {
             Log.error("Failed to write note: \(error.localizedDescription)")

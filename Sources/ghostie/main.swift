@@ -804,11 +804,142 @@ func printHelp() {
                           smoother + updater version/manifest logic.
       install-service     Headless background service via launchd.
       uninstall-service   Remove the headless service.
+      mcp                 Run the MCP server on stdio, so an AI assistant can
+                          read your call notes. Launched by the client — you
+                          do not run this by hand.
+      connect [client…] [--remove|--status|--list|--print]
+                          Register the MCP server with the assistants found on
+                          this Mac (Claude Desktop/Code, Cursor, VS Code,
+                          Windsurf, LM Studio). --list shows them, --print
+                          emits the config block for any other MCP client.
+      index               Rebuild the MCP search index from the notes folder.
       help                Show this help.
 
     Build the menu bar app:  ./scripts/build-app.sh
     Config: \(Config.configPath)
     """)
+}
+
+// MARK: - index / connect (MCP)
+
+/// Rebuild the transcript index every note on disk, including the ones
+/// written before the index existed. Safe to re-run: it overwrites.
+func cmdIndex(_ config: Config) {
+    print("Indexing notes in \(config.notesFolder)…")
+    let result = TranscriptIndex.rebuild(notesFolder: config.notesFolder)
+    print("Indexed \(result.indexed) call\(result.indexed == 1 ? "" : "s")"
+          + (result.skipped > 0 ? ", skipped \(result.skipped) unreadable file(s)" : "")
+          + " → \(TranscriptIndex.root)")
+    if result.indexed == 0 && result.skipped == 0 {
+        print("No notes found. Ghostie writes one per call; record a call first.")
+    }
+}
+
+/// `ghostie connect [client…] [--remove|--status|--print]` — the terminal
+/// half of the same registration the MCP pane does.
+///
+/// With no client named it acts on everything installed, which is the common
+/// case and usually one or two apps. Naming one that isn't installed is an
+/// error worth reporting, though: it means a typo, or an expectation that
+/// Ghostie supports something it doesn't.
+func cmdConnect(_ config: Config, args: [String]) {
+    let flags = Set(args.filter { $0.hasPrefix("--") })
+    let named = args.filter { !$0.hasPrefix("--") }
+
+    if flags.contains("--print") {
+        // `servers` is VS Code's spelling; every other client uses mcpServers.
+        print(MCPSetup.configSnippet(key: named.first == "vscode" ? "servers" : "mcpServers"))
+        exit(0)
+    }
+
+    if flags.contains("--list") {
+        print("Ghostie can set these up itself (✓ = found on this Mac):\n")
+        for client in MCPSetup.knownClients {
+            print("  \(client.isInstalled(config) ? "✓" : " ") \(client.id.padding(toLength: 16, withPad: " ", startingAt: 0))\(client.displayName)")
+        }
+        print("\nAnything else: `ghostie connect --print` gives the block to paste.")
+        exit(0)
+    }
+
+    var clients: [MCPSetup.Client] = []
+    if named.isEmpty {
+        clients = MCPSetup.installedClients(config)
+        guard !clients.isEmpty else {
+            print("No assistant Ghostie knows was found on this Mac.")
+            print("Run `ghostie connect --list` to see them, or `ghostie connect --print`")
+            print("to get the configuration block for any other MCP client.")
+            exit(1)
+        }
+    } else {
+        for name in named {
+            guard let client = MCPSetup.client(id: name) else {
+                Log.error("Unknown client \"\(name)\". Try `ghostie connect --list`.")
+                exit(1)
+            }
+            clients.append(client)
+        }
+    }
+
+    let path = MCPSetup.executablePath()
+
+    if flags.contains("--status") {
+        print("This binary: \(path)")
+        for client in clients {
+            switch MCPSetup.status(client, config: config) {
+            case .connected:
+                print("✓ \(client.displayName): connected")
+            case .connectedToOtherPath(let other):
+                print("! \(client.displayName): connected, but to \(other)")
+            case .notConnected:
+                print("· \(client.displayName): not connected")
+            case .unavailable(let why):
+                print("· \(client.displayName): \(why)")
+            }
+        }
+        exit(0)
+    }
+
+    let removing = flags.contains("--remove")
+    if !removing {
+        print("Registering: \(path) mcp")
+        if MCPSetup.isTransientPath(path) {
+            print("⚠️  That is a build directory. Install the app "
+                  + "(./scripts/build-app.sh) and run `connect` again, or the clients "
+                  + "will point at a binary that gets deleted.")
+        }
+    }
+
+    var failed = false
+    for client in clients {
+        // Skip a client that isn't there rather than failing the whole run —
+        // `connect` with no argument is the common case.
+        if case .unavailable(let why) = MCPSetup.status(client, config: config), !removing {
+            print("— \(client.displayName): skipped. \(why)")
+            continue
+        }
+        // Writing a running client's config loses the entry the next time it
+        // saves, which looks like the feature simply not working.
+        if let issue = MCPSetup.blockingIssue(client) {
+            print("✗ \(client.displayName): \(issue)")
+            failed = true
+            continue
+        }
+        let result = removing
+            ? MCPSetup.disconnect(client, config: config)
+            : MCPSetup.connect(client, config: config)
+        switch result {
+        case .success(let message): print("✓ \(client.displayName): \(message)")
+        case .failure(let error):
+            print("✗ \(client.displayName): \(error.localizedDescription)")
+            failed = true
+        }
+    }
+    if !removing {
+        let indexed = TranscriptIndex.summaries().count
+        if indexed == 0 { cmdIndex(config) }
+        else { print("\n\(indexed) call\(indexed == 1 ? "" : "s") indexed and ready to read.") }
+    }
+    exit(failed ? 1 : 0)
 }
 
 // MARK: - diarize-probe (hidden)
@@ -1067,6 +1198,11 @@ func cmdLidProbe(_ config: Config, wavPath: String) {
 
 // MARK: - Entry
 
+// `ghostie mcp` frames JSON-RPC on stdout, so nothing else may write
+// there — not even the startup logging below. This has to run before
+// `Config.load()`, which logs on a first run.
+if CommandLine.arguments.dropFirst().first == "mcp" { Log.echoesToStdout = false }
+
 let config = Config.load()
 config.writeExampleIfMissing()
 ModelCatalog.seedIfMissing()
@@ -1175,8 +1311,18 @@ case "selftest":
     let wavOK = runWavLevelSelfTest()
     print("")
     let speakerOK = runSpeakerSelfTest()
+    print("")
+    let indexOK = runTranscriptIndexSelfTest()
+    print("")
+    let mcpOK = runMCPSetupSelfTest()
     exit(cleanerOK && echoOK && refinerOK && codeSwitchOK && updaterOK && detectorOK
-         && micOK && wavOK && speakerOK ? 0 : 1)
+         && micOK && wavOK && speakerOK && indexOK && mcpOK ? 0 : 1)
+case "mcp":
+    GhostieMCPServer.runBlocking(config: config)
+case "index":
+    cmdIndex(config)
+case "connect":
+    cmdConnect(config, args: Array(args.dropFirst()))
 case "settings":
     launchSettingsOnly()
 case "install-service":

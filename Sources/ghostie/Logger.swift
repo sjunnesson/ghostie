@@ -28,11 +28,22 @@ enum Log {
     /// growing without bound.
     private static let rotateAtBytes: Int64 = 5_000_000
 
+    /// When false, log lines go to the file and to stderr but never to
+    /// stdout. `ghostie mcp` owns stdout for JSON-RPC framing — a single
+    /// stray log line there is not noise, it is a parse error that drops the
+    /// client's connection. Set it before anything else can log (see
+    /// `main.swift`, which flips it above the command switch).
+    nonisolated(unsafe) static var echoesToStdout = true
+
     static func line(_ level: String, _ msg: String) {
         let stamp = df.string(from: Date())
         let text = "[\(stamp)] \(level) \(msg)"
-        print(text)
-        fflush(stdout)
+        if echoesToStdout {
+            print(text)
+            fflush(stdout)
+        } else {
+            FileHandle.standardError.write(Data((text + "\n").utf8))
+        }
         guard let data = (text + "\n").data(using: .utf8) else { return }
         queue.async { appendLocked(data) }
     }

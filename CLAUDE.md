@@ -28,10 +28,26 @@ swift build -c release            # release build (what the scripts use)
 .build/release/ghostie fetch-models [v]    # download codeswitch models (KB v + large-v3 + VAD)
 .build/release/ghostie mic-probe [secs]   # is voice-processed mic capture working on this OS?
 .build/release/ghostie punctuate-probe <md>  # run the punctuation pass alone, timed
+.build/release/ghostie index               # rebuild the MCP index from the notes folder
+.build/release/ghostie connect [client…] [--remove|--status|--list|--print]  # (un)register
+.build/release/ghostie mcp                 # the MCP server on stdio (Claude launches this)
 ```
 
 There is no XCTest target and no linter. `swift build` warnings are expected to
 stay at zero (a recent commit silenced them deliberately).
+
+The package has exactly one remote dependency:
+[`modelcontextprotocol/swift-sdk`](https://github.com/modelcontextprotocol/swift-sdk)
+for `ghostie mcp` (which pulls swift-log, swift-system, swift-nio and
+eventsource transitively). Everything else is still vendored or dlopen'd —
+keep it that way. A first build on a clean checkout now needs network.
+
+**Nothing may print to stdout in the `mcp` subcommand.** `Log.line` echoes
+every line to stdout by default, which would be framed into the JSON-RPC
+stream and drop the client's connection; `main.swift` sets
+`Log.echoesToStdout = false` above the command switch, *before* `Config.load()`
+(which logs on a first run). If you add startup work that runs before dispatch,
+it must respect that flag.
 
 ### Testing
 
@@ -45,13 +61,18 @@ rules including backchannel crossing, `blocks`/`split` and their timestamp
 provenance, sentence splitting, the `preservesWording` guard, reply parsing and
 concurrent batching, all against a stub provider), `runEchoSuppressorSelfTest()` (exercises `EchoSuppressor.suppress` over
 real-call echo fixtures — pure echo, mixed real+echo segments, ASR variance,
-plus the never-engage guards for headphone/solo calls), and
+plus the never-engage guards for headphone/solo calls), `runTranscriptIndexSelfTest()` (exercises `TranscriptIndex` — the
+round trip from `Pipeline.render` back to turns, note-name parsing, the
+note-vs-transcript filter and summary extraction),
+`runMCPSetupSelfTest()` (exercises the MCP client registry — unique ids,
+per-client servers key, the copyable snippet's shape; **no client needs to be
+installed**), and
 `runCodeSwitchSelfTest()` (exercises the `Smoother` over synthetic
 `LanguageDetection`s — single-language collapse, mixed 3-run split,
 cross-track flip vs. isolated fall-back; **no audio or models needed**, so
 it's green everywhere). **Any change to `TranscriptCleaner.swift`,
-`TranscriptRefiner.swift`, `EchoSuppressor.swift` or `Smoother.swift` must keep
-`ghostie selftest` green**; add a `check(...)` case in the relevant suite
+`TranscriptRefiner.swift`, `EchoSuppressor.swift`, `Smoother.swift` or
+`TranscriptIndex.swift` or `MCPSetup.swift` must keep `ghostie selftest` green**; add a `check(...)` case in the relevant suite
 rather than building a separate harness. Optional end-to-end audio fixtures under `Tests/Fixtures`
 are skipped cleanly when absent.
 
@@ -471,6 +492,77 @@ the same code drives the menu-bar app and the headless daemon.
   dropped so it's never re-transcribed). A note is always written immediately
   with a "queued" banner and upgraded in place once processing succeeds. Drains
   on launch, after each call, on settings change, and every 10 min.
+- **`TranscriptIndex.swift`** — machine-readable sidecars for the markdown
+  notes, one JSON per call under `~/.ghostie/index/`, written by
+  `Pipeline.writeNote` (the single choke point every route to a note passes
+  through, so live, backlog-drain, orphan-sweep, `process` and `import` are all
+  covered by one call site). Turns are **recovered by parsing
+  `Pipeline.render`'s own markdown**, not threaded through as `[Line]`: the
+  backlog's summarize stage re-reads its transcript from disk and never holds
+  the lines, and pre-existing notes have nothing but the markdown — one parser
+  means a freshly indexed call and a back-filled one are byte-identical.
+  **The renderer and the parser must stay in step**; a format change that
+  isn't mirrored here fails silently as "that call had no speech", which is
+  what `runTranscriptIndexSelfTest()` pins. The summary is deliberately *not*
+  stored — the note is canonical and people edit it in their vault, so it is
+  read from the note at request time. The index is derived and disposable:
+  bump `currentSchema` and stale records are ignored until `ghostie index`
+  rebuilds them.
+- **`MCPServer.swift`** — `ghostie mcp`, the read-only MCP server over stdio
+  (official Swift SDK). Client-agnostic by construction: plain MCP, so Claude
+  Desktop/Code, Cursor, VS Code, Windsurf, LM Studio on a local model or
+  anything else that launches a stdio server all get the same thing. Six `ghostie_*` tools, calls as
+  `ghostie://call/<id>` resources, two prompts. **Everything is bounded by
+  default**: listings carry no turns, `get_call` returns the summary not the
+  transcript, `get_transcript` pages and filters — an hour of speech is tens
+  of thousands of tokens. Answers are markdown text only, deliberately not
+  duplicated into `structuredContent`. Tool errors come back as
+  `isError` content naming the ids that *do* exist, not as JSON-RPC errors, so
+  the model can correct itself. On first run with an empty index it rebuilds
+  once rather than telling the user to go and run a command.
+- **`MCPSetup.swift`** — a registry of MCP clients: (id, display name, config
+  path(s), servers key, app bundle name). Almost every client uses the same
+  `command`/`args` shape under `mcpServers`; **VS Code is the exception and
+  keys them under `servers`** (the selftest pins that, because getting it
+  backwards writes a valid file the client silently ignores). Claude Code is
+  the other exception — it is CLI-managed, so it goes through
+  `claude mcp add --scope user` rather than a guess at `~/.claude.json`.
+  Driven by both `Settings → MCP` (`Settings/Panes/ConnectPane.swift`)
+  and `ghostie connect`.
+
+  `Method.cli` covers clients that own their config through a vendor command
+  — Claude Code (`~/.claude.json`) and Codex (`~/.codex/config.toml`, TOML,
+  which cannot be merged safely without a parser Ghostie does not have). A CLI
+  fails loudly; a hand-written TOML merge would fail silently.
+
+  **ChatGPT is deliberately absent from the registry.** Its connectors are
+  remote HTTPS only (Streamable HTTP/SSE, URL ending `/mcp`, Developer Mode,
+  paid plan) — there is no stdio option and nothing local to register. OpenAI's
+  Secure MCP Tunnel bridges it, and it takes a stdio `--mcp-command` directly,
+  so **this is still not a reason to build an HTTP transport**: the SDK's
+  `StatelessHTTPServerTransport` is a transport, not a listener, and would need
+  NIO wiring to serve something the tunnel already solves. README documents the
+  tunnel invocation.
+
+  Three rules, all learned the hard way:
+  1. **Only installed clients are offered.** A wrong path then writes nothing.
+  2. **A running client is never written to.** Claude Desktop keeps its config
+     in memory and rewrites the whole file when any of its own settings change
+     — measured 2026-09-21: the entry was added, a pane in Claude Desktop was
+     dragged, and the entry was gone. `blockingIssue` refuses while the app is
+     running and names it. The failure it prevents looks like "the feature
+     doesn't work", not like a conflict.
+  3. **Schemas that differ are not guessed at.** Zed nests `command` under
+     `context_servers`, Goose is YAML. Both are covered by `configSnippet()`
+     — the copyable block — not by untested code that could corrupt someone's
+     editor settings.
+
+  Config files are merged key-by-key through `JSONSerialization` with a
+  `.ghostie-backup` written before the first edit; they hold other servers'
+  API tokens and the user's editor preferences, so nothing outside Ghostie's
+  one entry may change. Registers `Bundle.main.executablePath`, and warns when
+  that is a `.build` directory — a client pointed at a deleted binary fails
+  with nothing more useful than "server disconnected".
 - **`Config.swift`** — `~/.ghostie/config.json` + env overrides
   (`GHOSTIE_NOTES_FOLDER`, `GHOSTIE_WHISPER_MODEL`, `GHOSTIE_SUMMARY_MODEL`).
   Binary/model paths are **never persisted** so resolution (including

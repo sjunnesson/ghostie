@@ -8,6 +8,13 @@ let package = Package(
         // (SCStreamOutputType.microphone). Host here is macOS 26.
         .macOS(.v15)
     ],
+    dependencies: [
+        // Official MCP server SDK. Ghostie's only remote dependency: the
+        // `ghostie mcp` subcommand speaks JSON-RPC over stdio to Claude
+        // Desktop / Claude Code, and the protocol is not worth re-deriving
+        // by hand every time it revises.
+        .package(url: "https://github.com/modelcontextprotocol/swift-sdk.git", from: "0.12.1"),
+    ],
     targets: [
         // Vendored ONNX Runtime C API declarations (MIT). Declaration-only:
         // nothing links onnxruntime at build time — ORTRuntime.swift dlopens
@@ -18,7 +25,10 @@ let package = Package(
         ),
         .executableTarget(
             name: "ghostie",
-            dependencies: ["CONNXRuntime"],
+            dependencies: [
+                "CONNXRuntime",
+                .product(name: "MCP", package: "swift-sdk"),
+            ],
             path: "Sources/ghostie",
             resources: [
                 // Bundled assets shipped in the SwiftPM resource bundle. The

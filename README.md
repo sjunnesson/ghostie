@@ -193,11 +193,117 @@ ghostie doctor                       # dependency + permission diagnostics
 ghostie diagnose-detect              # live detector readout (30s, 500ms refresh)
 ghostie diagnose-detect --json       # line-delimited JSON for scripting
 ghostie selftest                     # transcript guard + codeswitch + updater + detector
+ghostie connect                      # register the MCP server with every assistant found
+ghostie connect --list               # which assistants Ghostie can set up
+ghostie connect --print              # config block for any other MCP client
+ghostie connect cursor --remove      # unregister from one of them
+ghostie index                        # rebuild the MCP index from the notes folder
+ghostie mcp                          # the MCP server itself (Claude launches this; you don't)
 ```
 
 When detection misfires (a false start or a missed call), `diagnose-detect`
 is the first stop. Each line shows the current state machine stage, every
 evidence signal, and the most recent transition reason.
+
+## Ask your assistant about your calls (MCP)
+
+Ghostie ships an [MCP](https://modelcontextprotocol.io) server, so an AI
+assistant can read the calls it has already transcribed — "what did we decide
+on my last call?", "when did Andrea last bring up pricing?".
+
+It is plain MCP over stdio, so **anything that speaks the protocol can use
+it** — including an assistant running a local model, in which case nothing
+leaves the machine at all. Ghostie can set these up for you:
+
+| | |
+|---|---|
+| Claude Desktop | `~/Library/Application Support/Claude/claude_desktop_config.json` |
+| Claude Code | `claude mcp add`, user scope |
+| Codex | `codex mcp add` — shared by the Codex CLI, app and IDE extension |
+| Cursor | `~/.cursor/mcp.json` |
+| VS Code | user `mcp.json` (the one client that keys servers under `servers`) |
+| Windsurf | `~/.codeium/windsurf/mcp_config.json` |
+| LM Studio | `~/.lmstudio/mcp.json` |
+
+From **Settings → MCP**, or a terminal:
+
+```bash
+ghostie connect            # everything found on this Mac
+ghostie connect cursor     # just one
+ghostie connect --list     # what it knows about, and what's installed
+ghostie connect --status   # where each one currently points
+```
+
+Only clients actually installed are offered, so a path that is wrong for your
+setup never creates a stray file.
+
+### ChatGPT
+
+ChatGPT is the one client that cannot launch a local server itself. Its
+connectors are **remote HTTPS only** — Streamable HTTP or SSE, a URL ending in
+`/mcp`, Developer Mode enabled under Settings → Apps & Connectors, and a paid
+plan. There is no stdio option.
+
+OpenAI's own [Secure MCP Tunnel](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels)
+closes that gap without putting anything on the public internet, and it takes
+a **stdio** server directly — so Ghostie needs no changes:
+
+```bash
+tunnel-client init --sample sample_mcp_stdio_local --profile ghostie \
+  --tunnel-id <your tunnel id> \
+  --mcp-command "/Applications/Ghostie.app/Contents/MacOS/ghostie mcp"
+tunnel-client run --profile ghostie
+```
+
+The client makes an outbound HTTPS connection to OpenAI and forwards MCP
+requests to the local process; nothing listens on a public port. Note that
+your notes then travel to OpenAI when ChatGPT reads them, and that the tunnel
+only carries traffic while `tunnel-client run` is up.
+
+**Anything else** — Zed, Cline, Goose, a self-hosted agent — takes the block
+from `ghostie connect --print` (or the Copy buttons in Settings):
+
+```json
+{
+  "mcpServers": {
+    "ghostie": {
+      "command": "/Applications/Ghostie.app/Contents/MacOS/ghostie",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+**Quit the client before connecting.** Apps that own a JSON settings file
+usually hold it in memory and rewrite the whole thing when any of their own
+settings change — Claude Desktop does, and it will silently drop Ghostie's
+entry if it was added while running. `connect` refuses rather than let that
+happen, and says which app to quit.
+
+### What it exposes
+
+Six tools, all read-only: `ghostie_get_latest_call`, `ghostie_list_calls`,
+`ghostie_get_call`, `ghostie_get_transcript`, `ghostie_search_calls` and
+`ghostie_get_status`. Each call is also a resource (`ghostie://call/<id>`) for
+clients that support @-mentioning, and two prompts (`call-recap`,
+`action-items`) cover the common asks.
+
+Everything is bounded by default — a listing carries metadata and no turns,
+`get_call` returns the written summary rather than the transcript, and
+`get_transcript` pages and filters by time range or speaker. An hour-long
+transcript is tens of thousands of tokens, and a small local model may have
+only a few thousand to spend.
+
+**What this shares.** Audio still never leaves the machine. A note the
+assistant reads goes wherever that assistant goes — to its provider if it is a
+cloud model, nowhere if it is a local one — and only when you ask about a
+call, never in the background. The server cannot start a recording, change a
+setting or delete anything.
+
+The tools read a small JSON index under `~/.ghostie/index/`, written alongside
+each note. It is derived data: `ghostie index` rebuilds it from the notes
+folder, which is also how notes written before this feature existed get picked
+up (the server does it once, by itself, on first connect).
 
 ## Transcript quality
 
@@ -401,6 +507,10 @@ ready. See [Summarization](#summarization).
   transcript never leaves the machine running Ollama.
 - Recordings live in `~/.ghostie/recordings` only while processing and are
   deleted unless `keepAudio` is true.
+- The **MCP server** (off until you connect it) lets an AI assistant read your
+  notes on request — reaching that assistant's provider, or nowhere at all if
+  it runs a local model. Nothing is sent in the background, and the connection
+  is read-only.
 - **Be mindful of consent laws and your employer's policy before recording
   calls.**
 
