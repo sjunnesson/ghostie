@@ -243,32 +243,68 @@ private final class ClientRow: NSView {
     }
     required init?(coder: NSCoder) { fatalError() }
 
+    /// Bumped per refresh so a slow CLI answer can't overwrite a newer one.
+    private var generation = 0
+
     func refresh() {
+        generation += 1
+        guard case .cli = client.method else {
+            render(MCPSetup.status(client, config: cfg))
+            return
+        }
+        // A CLI-managed client is asked through its own command, and `claude
+        // mcp get` health-checks the server by launching it (~1.2 s measured).
+        // Run on the main thread, that froze the pane once per CLI row on
+        // every build and after every connect/disconnect.
+        render(nil)
+        let gen = generation, client = client, cfg = cfg
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let status = MCPSetup.status(client, config: cfg)
+            DispatchQueue.main.async {
+                guard let self, self.generation == gen else { return }
+                self.render(status)
+            }
+        }
+    }
+
+    /// `status` nil: still being checked — shown as such, with the action
+    /// disabled until there is something to act on.
+    private func render(_ status: MCPSetup.Status?) {
         container.arrangedSubviews.forEach { $0.removeFromSuperview() }
 
-        let status = MCPSetup.status(client, config: cfg)
-        let target = ActionTarget { [weak self] in self?.act(from: status) }
+        let target = ActionTarget { [weak self] in
+            if let status { self?.act(from: status) }
+        }
         buttonTarget = target
-        let blocked = MCPSetup.blockingIssue(client) != nil
-        let button = StyledButton(title: buttonTitle(for: status), target: target,
+        let blocked = status != nil && MCPSetup.blockingIssue(client) != nil
+        let button = StyledButton(title: status.map(buttonTitle(for:)) ?? "Connect",
+                                  target: target,
                                   action: #selector(ActionTarget.fire))
-        button.kind = status.isConnected ? .secondary : .primary
-        button.isEnabled = { if case .unavailable = status { return false }; return true }()
+        button.kind = status?.isConnected == true ? .secondary : .primary
+        button.isEnabled = {
+            guard let status else { return false }
+            if case .unavailable = status { return false }
+            return true
+        }()
         objc_setAssociatedObject(button, &ActionTarget.key, target, .OBJC_ASSOCIATION_RETAIN)
 
-        let badge = blocked
+        let badge = status == nil
+            ? StatusBadgeView(kind: .muted, label: "Checking…")
+            : blocked
             ? StatusBadgeView(kind: .warn, label: "Quit \(client.displayName)")
-            : badgeView(for: status)
+            : badgeView(for: status!)
         let control = NSStackView(views: [badge, button]).asRowControl()
         let row = RowBuilder.row(
             label: client.displayName,
             // While it is running the row is read-only, so say which of the
             // two situations it is: already set up, or waiting to be.
-            sub: blocked
-                ? (status.isConnected
+            sub: status == nil
+                ? "Checking with \(client.displayName)…"
+                : blocked
+                ? (status!.isConnected
                     ? "Connected. Quit it before changing this, or the entry is lost on its next save."
                     : "Running — quit it first, or it will discard the entry the next time it saves.")
-                : subtitle(for: status),
+                : subtitle(for: status!),
             leadingSymbol: client.symbol,
             leadingTint: Theme.accent,
             control: control)

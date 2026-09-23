@@ -686,6 +686,28 @@ func runDetectorStateMachineSelfTest() -> Bool {
         check("buildEvidence: browser mic + meeting tab is primary with output corroborator",
               with.primarySignal && with.triggerInputPids == [300]
               && with.corroborators.contains("output"))
+        // The real layout: the tab probe hits the main app (pid 200), the
+        // audio runs in its helper (pid 301).
+        let helper = DetectionCoordinator.buildEvidence(
+            audio: [AudioProcessInfo(pid: 301, bundleId: "com.google.chrome.helper",
+                                     isRunningInput: true, isRunningOutput: true)],
+            now: 0, matchers: ["com.microsoft.teams2"],
+            browserMatchers: ["com.google.chrome"], browserTabPids: [200],
+            browserTabBundles: ["com.google.chrome"],
+            defaultDeviceId: 42, meetingWindow: .notMatched,
+            cameraPids: [], deviceSwapWithinLast3s: false)
+        check("buildEvidence: a meeting tab's helper process (own pid) is primary",
+              helper.primarySignal && helper.triggerInputPids == [301])
+        let otherBrowser = DetectionCoordinator.buildEvidence(
+            audio: [AudioProcessInfo(pid: 401, bundleId: "com.brave.browser.helper",
+                                     isRunningInput: true, isRunningOutput: false)],
+            now: 0, matchers: ["com.microsoft.teams2"],
+            browserMatchers: ["com.google.chrome", "com.brave.browser"],
+            browserTabPids: [200], browserTabBundles: ["com.google.chrome"],
+            defaultDeviceId: 42, meetingWindow: .notMatched,
+            cameraPids: [], deviceSwapWithinLast3s: false)
+        check("buildEvidence: another browser's mic does not ride on Chrome's meeting tab",
+              !otherBrowser.primarySignal && otherBrowser.triggerInputPids.isEmpty)
 
         // Full coordinator lifecycle: Chrome in a Teams meeting tab confirms;
         // closing the tab (probe returns nothing) ends the call.

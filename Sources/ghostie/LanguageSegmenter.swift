@@ -148,17 +148,17 @@ struct LanguageSegmenter {
             "-np"
         ])
         guard status == 0 else { throw SegmenterError.whisperFailed(status, out) }
-        let segs = Self.parseSegments(URL(fileURLWithPath: prefix + ".json"))
-        try? FileManager.default.removeItem(atPath: prefix + ".json")
+        defer { try? FileManager.default.removeItem(atPath: prefix + ".json") }
+        let segs = try Self.parseSegments(URL(fileURLWithPath: prefix + ".json"))
         // Defensive: VAD min-speech is 250 ms, but drop anything shorter.
         return segs.filter { $0.durationMs >= 250 }
     }
 
     /// Parse `transcription[].offsets.{from,to}` (ms) into VAD segments.
-    static func parseSegments(_ url: URL) -> [VADSegment] {
-        guard let data = try? Data(contentsOf: url),
-              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let items = root["transcription"] as? [[String: Any]] else { return [] }
+    /// Throws on a missing or malformed file (see `Transcriber.parse`) —
+    /// an empty segment list must mean "no speech", never "no output".
+    static func parseSegments(_ url: URL) throws -> [VADSegment] {
+        let items = try Transcriber.transcriptionItems(url)
         var out: [VADSegment] = []
         for item in items {
             guard let off = item["offsets"] as? [String: Any] else { continue }
@@ -675,13 +675,13 @@ struct LanguageSegmenter {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: config.whisperBinary)
         p.arguments = args
-        let pipe = Pipe()
-        p.standardOutput = pipe
-        p.standardError = pipe
-        do { try p.run() } catch { return (-1, error.localizedDescription) }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        p.waitUntilExit()
-        return (p.terminationStatus, String(data: data, encoding: .utf8) ?? "")
+        // Every call here reads one WAV (`-f`); budget by its length.
+        let wav = args.firstIndex(of: "-f").flatMap { i in
+            i + 1 < args.count ? URL(fileURLWithPath: args[i + 1]) : nil
+        }
+        let timeout = wav.map(Transcriber.timeout(for:)) ?? 15 * 60
+        do { return try runWatched(p, timeout: timeout) }
+        catch { return (-1, error.localizedDescription) }
     }
 
     private static func intValue(_ any: Any?) -> Int? {

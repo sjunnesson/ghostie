@@ -143,7 +143,18 @@ the same code drives the menu-bar app and the headless daemon.
   *within* the Participants track. VP failure is not always a throw: a stopped
   graph keeps emitting zero-filled buffers, so `MicCapture` rebuilds on
   `AVAudioEngineConfigurationChange` and `AudioRecorder` probes for a non-zero
-  sample before committing, then watchdogs the track for the rest of the call.
+  sample before committing, then watchdogs the track for the rest of the call
+  — including a track that carried audio and then went digitally silent,
+  which gets a rebuild-only ladder (never the raw tap: a hardware-muted
+  headset looks identical, and `AVAudioApplication.isInputMuted` is honoured).
+  **Every source stamps on the host clock**, so a mic rebuild or raw-tap
+  switch is real missing time and is silence-padded; never re-anchor the
+  track on a source change (that shifted Me ~1–2 s earlier per device swap).
+  `AudioRecorder.realignment` is pure and pinned in `selftest`. The SCK
+  system track obeys the same converter rule as the mic:
+  **`AudioChunkConverter` averages channels by hand** — asked to go stereo →
+  mono itself, AVAudioConverter kept channel 0 and a right-panned speaker came
+  out at peak 0 (selftest pins it).
   A 2×2 dropped video stream is required only to keep the stream alive.
 - **`SpeakerDiarizer.swift` / `SpeakerEmbedder.swift` / `Fbank.swift`** —
   splits the Participants track per person. Kaldi-compatible 80-bin fbank →
@@ -491,7 +502,18 @@ the same code drives the menu-bar app and the headless daemon.
   stages: `transcribe` (audio kept) and `summarize` (transcript kept, audio
   dropped so it's never re-transcribed). A note is always written immediately
   with a "queued" banner and upgraded in place once processing succeeds. Drains
-  on launch, after each call, on settings change, and every 10 min.
+  on launch, after each call, on settings change, and every 10 min — coalesced
+  in `Engine`, and under a cross-process `flock` (`Backlog.DrainLock`) so the
+  app and `ghostie process-backlog` never drain the same entry. A failed
+  attempt is *counted* at most once per doubling window (`Backlog.bump`), so
+  giving up takes hours of real unavailability, not six clicks. A recording
+  is recoverable at every step: `.ghostie-pending` is written when the WAVs
+  are finalized and removed only by `Pipeline.cleanup`, and the launch sweep
+  queues any session still carrying it. Quitting mid-call queues the call
+  (`Pipeline.queueForLater`) and stops every registered child
+  (`ChildProcesses`) instead of running the pipeline first. whisper-cli runs
+  through `runWatched` (`Proc.swift`) with a `Transcriber.timeout(for:)`
+  deadline; a missing/malformed `-oj` JSON throws — it is never "no speech".
 - **`TranscriptIndex.swift`** — machine-readable sidecars for the markdown
   notes, one JSON per call under `~/.ghostie/index/`, written by
   `Pipeline.writeNote` (the single choke point every route to a note passes

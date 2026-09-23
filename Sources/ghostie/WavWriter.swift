@@ -1,6 +1,7 @@
 import Foundation
 
-/// Streams 16-bit PCM samples to a .wav file and patches the RIFF header on close.
+/// Streams 16-bit PCM samples to a .wav file, keeping the RIFF header current
+/// (every ~10 s of audio, and on close).
 /// We always write mono so the file is exactly what whisper.cpp wants (16 kHz mono).
 ///
 /// Writes use the throwing `FileHandle.write(contentsOf:)` — the legacy
@@ -15,6 +16,8 @@ final class WavWriter {
     private let sampleRate: Int
     private let channels: Int
     private var dataBytes: UInt32 = 0
+    /// `dataBytes` at the last header patch; see `patchInterval`.
+    private var patchedBytes: UInt32 = 0
     private var closed = false
     private(set) var totalFrames: Int = 0
     /// True once a write has failed (disk full, volume gone). Sticky: no
@@ -73,7 +76,35 @@ final class WavWriter {
         }
         dataBytes += UInt32(data.count)
         totalFrames += samples.count / channels
+        if dataBytes - patchedBytes >= patchInterval {
+            // Keep the header current while recording, so a file cut off by
+            // a crash or kill is still a valid WAV holding everything up to
+            // the last patch — not a header claiming 0 bytes, which
+            // whisper-cli decodes as empty. A failure poisons the writer like
+            // any failed write: after a failed seek the file offset is unknown,
+            // and appending anyway could write audio over the header.
+            if (try? patchHeader()) != nil, (try? handle.seekToEnd()) != nil {
+                patchedBytes = dataBytes
+            } else {
+                failed = true
+                Log.error("Could not update the WAV header of \(url.lastPathComponent) — dropping further audio for this file.")
+                return false
+            }
+        }
         return true
+    }
+
+    /// ~10 s of audio between in-flight header patches (two 4-byte writes).
+    private var patchInterval: UInt32 { UInt32(sampleRate * channels * 2 * 10) }
+
+    private func patchHeader() throws {
+        var sizes = Data(count: 8)
+        write(&sizes, 0, UInt32(36) + dataBytes)        // RIFF chunk size
+        write(&sizes, 4, dataBytes)                     // data chunk size
+        try handle.seek(toOffset: 4)
+        try handle.write(contentsOf: sizes.subdata(in: 0..<4))
+        try handle.seek(toOffset: 40)
+        try handle.write(contentsOf: sizes.subdata(in: 4..<8))
     }
 
     /// Seconds of audio written so far.
@@ -82,14 +113,8 @@ final class WavWriter {
     func close() {
         guard !closed else { return }
         closed = true
-        var sizes = Data(count: 8)
-        write(&sizes, 0, UInt32(36) + dataBytes)        // RIFF chunk size
-        write(&sizes, 4, dataBytes)                     // data chunk size
         do {
-            try handle.seek(toOffset: 4)
-            try handle.write(contentsOf: sizes.subdata(in: 0..<4))
-            try handle.seek(toOffset: 40)
-            try handle.write(contentsOf: sizes.subdata(in: 4..<8))
+            try patchHeader()
         } catch {
             // Header patching rewrites existing bytes, so this is rare even
             // on a full disk; the file may be unreadable by strict parsers.

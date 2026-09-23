@@ -29,6 +29,10 @@ final class DetectionCoordinator {
     private var deviceToken: DetectionToken?
     private var presenceToken: DetectionToken?
     private var backstop: DispatchSourceTimer?
+    /// Current backstop period (queue-owned); see `adjustBackstop`.
+    private var backstopInterval: Double = 5
+    static let activeBackstopSeconds: Double = 5
+    static let idleBackstopSeconds: Double = 20
     private var lastDeviceSwapAt: VirtualTime?
     private static let deviceSwapQuiescenceSeconds: TimeInterval = 3
     /// True while a debounced `evaluate()` is scheduled (see
@@ -67,6 +71,9 @@ final class DetectionCoordinator {
     /// coordinator callback running on `queue`.
     private let participants: ParticipantRosterProvider
     private var rosterSoFar = MeetingRoster()    // sourceLock-guarded
+    /// Bumped by `clearRoster`, so a walk still running when a call ends
+    /// cannot add that call's names to the next one. sourceLock-guarded.
+    private var rosterGeneration = 0
     private var lastRosterSampleAt: TimeInterval = -.greatestFiniteMagnitude
     /// The roster changes on the timescale of people joining, not of audio
     /// evidence, and the AX walk is by far the most expensive probe here.
@@ -158,8 +165,16 @@ final class DetectionCoordinator {
         }
     }
 
+    /// Cap on every AX message this process sends. The default is ~6 s, and
+    /// the probes run synchronously on the detector queue: one hung Teams or
+    /// Chrome stalled evaluation — and so a call's `onCallStop` — for as long
+    /// as the walk kept asking it. 2 s still leaves Chrome room to build its
+    /// web accessibility tree on the first query.
+    static let axMessagingTimeout: Float = 2
+
     func start() {
         promptForAXOnceIfNeeded()
+        AXUIElementSetMessagingTimeout(AXUIElementCreateSystemWide(), Self.axMessagingTimeout)
         queue.async { [weak self] in
             guard let self, !self.running else { return }
             self.running = true
@@ -202,8 +217,13 @@ final class DetectionCoordinator {
     }
 
     func stop() {
-        queue.async { [weak self] in
-            guard let self, self.running else { return }
+        // Strong on purpose: `stop` is often the last thing its owner does
+        // before dropping the coordinator (a Settings save swaps detectors),
+        // and a weak capture let it deallocate first — so the providers were
+        // never invalidated and the state machine never force-stopped. It is
+        // one-shot, so there is no cycle.
+        queue.async { [self] in
+            guard self.running else { return }
             self.running = false
             self.audioToken?.invalidate(); self.audioToken = nil
             self.cameraToken?.invalidate(); self.cameraToken = nil
@@ -225,6 +245,12 @@ final class DetectionCoordinator {
         let evidence: CallEvidence
     }
 
+    /// Just the state machine's stage — `snapshot()` without building the
+    /// evidence (which walks the provider set).
+    func stage() -> CallStateMachine.Stage {
+        queue.sync { stateMachine.stage }
+    }
+
     func snapshot() -> Snapshot {
         // Read state-machine fields and `lastDeviceSwapAt` on the detector
         // queue so we can't tear an `Array` mid-append or read an optional
@@ -233,7 +259,7 @@ final class DetectionCoordinator {
             Snapshot(
                 stage: stateMachine.stage,
                 sessionId: stateMachine.sessionId,
-                transitionsCount: stateMachine.transitions.count,
+                transitionsCount: stateMachine.transitionCount,
                 lastTransition: stateMachine.transitions.last,
                 evidence: buildEvidenceLocked()
             )
@@ -290,6 +316,13 @@ final class DetectionCoordinator {
             }
         }
         let browserTabPids: [pid_t] = browserTabHits.keys.sorted()
+        // The tab probe finds the browser's *main* app; its audio I/O runs in
+        // a helper process with its own PID (`com.google.Chrome.helper`). So a
+        // browser proc also counts by the bundle of a browser showing a
+        // meeting tab — see `buildEvidence`.
+        let browserTabBundles: [String] = allApps
+            .filter { browserTabHits[$0.pid] != nil }
+            .map { $0.bundleId.lowercased() }
         sampleRosterIfDue(browserTabHits: browserTabHits, apps: allApps)
         let primaryAudio = primaryNativeAudio || !browserTabPids.isEmpty
         lastSource = Self.deriveSource(audio: audioProcs,
@@ -315,6 +348,7 @@ final class DetectionCoordinator {
             matchers: triggerBundleMatchers,
             browserMatchers: browserMatchers,
             browserTabPids: browserTabPids,
+            browserTabBundles: browserTabBundles,
             defaultDeviceId: device.currentDeviceId(),
             meetingWindow: meetingWindow,
             cameraPids: cameraPids,
@@ -374,7 +408,10 @@ final class DetectionCoordinator {
     /// Called when a session ends rather than when one begins, so the value
     /// is still readable from Engine's stop handler.
     func clearRoster() {
-        sourceLock.withLock { rosterSoFar = MeetingRoster() }
+        sourceLock.withLock {
+            rosterSoFar = MeetingRoster()
+            rosterGeneration += 1
+        }
     }
 
     /// Walk the meeting browser's AX tree for participant names, at most
@@ -388,19 +425,36 @@ final class DetectionCoordinator {
         lastRosterSampleAt = now
         let meetingBrowsers = apps.filter { browserTabHits[$0.pid] != nil }
         guard !meetingBrowsers.isEmpty else { return }
-        let found = participants.roster(browsers: meetingBrowsers)
-        guard !found.isEmpty else { return }
-        sourceLock.withLock {
-            let before = rosterSoFar
-            rosterSoFar = before.merged(with: found)
-            if rosterSoFar != before {
-                Log.info("Meeting roster: "
-                    + (rosterSoFar.others.isEmpty ? "(no other participants named)"
-                       : rosterSoFar.others.joined(separator: ", "))
-                    + (rosterSoFar.selfName.map { " (you: \($0))" } ?? ""))
+        // The walk is thousands of AX round trips into Chrome; on the
+        // detector queue it held up evaluation (and so a call's end) for as
+        // long as it ran. It gets its own queue, one walk at a time.
+        guard rosterWalkInFlight.withLock({ (busy: inout Bool) -> Bool in
+            if busy { return false }
+            busy = true
+            return true
+        }) else { return }
+        let generation = sourceLock.withLock { rosterGeneration }
+        rosterQueue.async { [weak self] in
+            guard let self else { return }
+            defer { self.rosterWalkInFlight.withLock { $0 = false } }
+            let found = self.participants.roster(browsers: meetingBrowsers)
+            guard !found.isEmpty else { return }
+            self.sourceLock.withLock {
+                guard self.rosterGeneration == generation else { return }
+                let before = self.rosterSoFar
+                self.rosterSoFar = before.merged(with: found)
+                if self.rosterSoFar != before {
+                    Log.info("Meeting roster: "
+                        + (self.rosterSoFar.others.isEmpty ? "(no other participants named)"
+                           : self.rosterSoFar.others.joined(separator: ", "))
+                        + (self.rosterSoFar.selfName.map { " (you: \($0))" } ?? ""))
+                }
             }
         }
     }
+
+    private let rosterQueue = DispatchQueue(label: "ghostie.detector.roster", qos: .utility)
+    private let rosterWalkInFlight = Locked(false)
 
     /// Which app the evidence points at: the trigger app actually holding the
     /// mic wins (input outranks output-only, then lowest PID for
@@ -469,6 +523,20 @@ final class DetectionCoordinator {
         // this queue, start()/stop() dispatch here).
         let evidence = buildEvidenceLocked()
         stateMachine.evaluate(evidence: evidence)
+        adjustBackstop()
+    }
+
+    /// The backstop only heals missed push notifications, and while idle a
+    /// missed one costs at most a later start — so it ticks every 20 s there
+    /// instead of waking the Mac every 5 s all day. Past idle the state
+    /// machine's own timers (the 3 s confirm, the 30 s end grace) are driven
+    /// by these ticks, so it is back to 5 s the moment a candidate appears.
+    private func adjustBackstop() {
+        let want = stateMachine.stage == .idle
+            ? Self.idleBackstopSeconds : Self.activeBackstopSeconds
+        guard want != backstopInterval, let t = backstop else { return }
+        backstopInterval = want
+        t.schedule(deadline: .now() + want, repeating: want)
     }
 
     /// Pure transform from raw provider output to a `CallEvidence` snapshot.
@@ -488,6 +556,7 @@ final class DetectionCoordinator {
                               matchers: [String],
                               browserMatchers: [String] = [],
                               browserTabPids: [pid_t] = [],
+                              browserTabBundles: [String] = [],
                               defaultDeviceId: AudioDeviceID?,
                               meetingWindow: MeetingWindowMatch,
                               cameraPids: [pid_t],
@@ -496,9 +565,13 @@ final class DetectionCoordinator {
             guard let b = p.bundleId?.lowercased() else { return false }
             if matchesTriggerBundle(b, matchers: matchers) { return true }
             // A browser process only counts while its app currently shows a
-            // meeting tab — plain web-mic use never qualifies.
+            // meeting tab — plain web-mic use never qualifies. Matched by PID
+            // (the main app) or by that app's bundle, which is what reaches
+            // its helpers: Chrome's audio runs in `…Chrome.helper`, a
+            // different PID, and a PID-only test never saw a Meet call's mic.
             return matchesTriggerBundle(b, matchers: browserMatchers)
-                && browserTabPids.contains(p.pid)
+                && (browserTabPids.contains(p.pid)
+                    || matchesTriggerBundle(b, matchers: browserTabBundles))
         }
         let inputPids = triggerProcs.filter(\.isRunningInput).map(\.pid)
         let outputPids = triggerProcs.filter(\.isRunningOutput).map(\.pid)

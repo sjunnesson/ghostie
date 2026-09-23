@@ -34,7 +34,7 @@ import AppKit
 /// coordinator's queue. All listeners are torn down on dealloc.
 final class CoreAudioActivityProvider: AudioActivityProvider {
 
-    private let listenerQueue = DispatchQueue(label: "ghostie.coreaudio.listener")
+    private let listenerQueue = ListenerQueues.make(label: "ghostie.coreaudio.listener")
     private let stateLock = NSLock()
     private let fanout = ChangeFanout()
     /// Lowercased Teams main-app bundle IDs (same list the coordinator feeds
@@ -49,6 +49,12 @@ final class CoreAudioActivityProvider: AudioActivityProvider {
     /// or no PID). Skipped on incremental reconciles so a list change does
     /// not re-resolve every process on the system; re-examined on `refresh()`.
     private var nonMatching: Set<AudioObjectID> = []
+    /// The subset of `nonMatching` whose bundle ID *resolved* to another app.
+    /// A process object's bundle never changes, so the backstop `refresh()`
+    /// skips these — it used to re-resolve every audio process on the system
+    /// every 5 s. Only unresolved objects (a helper that registered its bundle
+    /// late) and the matching ones are re-examined.
+    private var foreign: Set<AudioObjectID> = []
     private var listListenerTeardown: (() -> Void)?
 
     /// - Parameter matchers: lowercased trigger bundle IDs; a process counts
@@ -66,7 +72,7 @@ final class CoreAudioActivityProvider: AudioActivityProvider {
         // a CoreAudio block can be partway through `reconcileProcessListeners`
         // when the last strong ref drops. Synchronizing on listenerQueue
         // ensures it finishes before we yank the listeners.
-        listenerQueue.sync { }
+        ListenerQueues.drain(listenerQueue)
         listListenerTeardown?()
         for (_, tear) in perProcessTeardowns { tear() }
     }
@@ -138,13 +144,15 @@ final class CoreAudioActivityProvider: AudioActivityProvider {
             cache.removeValue(forKey: obj)
         }
         nonMatching.formIntersection(current)
+        foreign.formIntersection(current)
         let listening = Set(perProcessTeardowns.keys)
         let skip = nonMatching
+        let settled = foreign
         stateLock.unlock()
         for t in teardowns { t() }
 
         let toExamine = reexamineAll
-            ? current
+            ? current.subtracting(settled)
             : current.subtracting(listening).subtracting(skip)
         for obj in toExamine {
             examine(obj, hasListeners: listening.contains(obj))
@@ -155,7 +163,8 @@ final class CoreAudioActivityProvider: AudioActivityProvider {
     /// (if missing) per-object listeners; everything else is remembered in
     /// `nonMatching` until the next full refresh. Caller on `listenerQueue`.
     private func examine(_ obj: AudioObjectID, hasListeners: Bool) {
-        if let info = Self.buildInfo(processObject: obj),
+        let info = Self.buildInfo(processObject: obj)
+        if let info,
            let bundle = info.bundleId,
            DetectionCoordinator.matchesTriggerBundle(bundle, matchers: matchers) {
             stateLock.lock()
@@ -173,6 +182,7 @@ final class CoreAudioActivityProvider: AudioActivityProvider {
             let tear = perProcessTeardowns.removeValue(forKey: obj)
             cache.removeValue(forKey: obj)
             nonMatching.insert(obj)
+            if info?.bundleId != nil { foreign.insert(obj) }
             stateLock.unlock()
             tear?()
         }

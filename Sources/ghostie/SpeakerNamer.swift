@@ -30,6 +30,9 @@ struct SpeakerNamer {
     /// of one participant's name inside the window — the model was guessing
     /// from almost nothing. The whole transcript already goes to this same
     /// provider for the summary, so showing all of it here exposes nothing new.
+    /// A naming request that failed faster than this is retried once.
+    static let retryIfFailedWithin: TimeInterval = 60
+
     static let promptBudget = 24_000
 
     struct Naming {
@@ -74,13 +77,23 @@ struct SpeakerNamer {
         guard provider.isConfigured else {
             return resolved.isEmpty ? nil : Naming(names: resolved)
         }
-        guard let reply = try? provider.complete(
-                system: Self.system,
-                user: Self.user(labels: ask, transcript: transcript,
-                                knownSelf: resolved["Me"],
-                                roster: roster,
-                                budget: max(Self.promptBudget,
-                                            provider.maxTranscriptChars))) else {
+        let prompt = Self.user(labels: ask, transcript: transcript,
+                               knownSelf: resolved["Me"], roster: roster,
+                               budget: max(Self.promptBudget, provider.maxTranscriptChars))
+        func request() -> String? { try? provider.complete(system: Self.system, user: prompt) }
+        // One retry, as the punctuation batches get — but only after a fast
+        // failure. Naming runs straight after that burst of concurrent
+        // requests, where a transient refusal is most likely, and unlike the
+        // summary a failure here is never backlogged: the note keeps
+        // "Participant N" for good. A request that failed by timing out is
+        // not asked twice; that would double the wait for the same answer.
+        let started = Date()
+        var reply = request()
+        if reply == nil, Date().timeIntervalSince(started) < Self.retryIfFailedWithin {
+            Thread.sleep(forTimeInterval: TranscriptRefiner.batchRetryDelay)
+            reply = request()
+        }
+        guard let reply else {
             Log.info("Speaker naming skipped: the summarization model could not be reached.")
             return resolved.isEmpty ? nil : Naming(names: resolved)
         }

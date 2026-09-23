@@ -63,12 +63,18 @@ enum RecordingImporter {
 
         let inFormat = file.processingFormat   // Float32, deinterleaved
         let channels = Int(inFormat.channelCount)
-        let startedAt = recordedAt(source)
+        let startedAt = ImportLedger.claim(file: source, recordedAt: recordedAt(source),
+                                           config: config)
         let dir = try makeSessionDir(config: config, startedAt: startedAt)
+        // Any throw from here on removes the half-built session folder;
+        // otherwise every failed attempt left an orphan `<stamp>[-N]/` behind.
+        var imported = false
+        defer { if !imported { try? FileManager.default.removeItem(at: dir) } }
         let wavURL = dir.appendingPathComponent("participants.wav")
         guard let writer = WavWriter(url: wavURL, sampleRate: Int(targetRate)) else {
             throw ImportError.cannotWrite(wavURL.path)
         }
+        defer { writer.close() }   // idempotent; the success path closes first
 
         // Fold channels ourselves and leave AVAudioConverter only the rate
         // change. `MicCapture` learned the hard way that a converter asked to
@@ -138,10 +144,8 @@ enum RecordingImporter {
 
         let duration = writer.duration
         writer.close()
-        guard duration > 0 else {
-            try? FileManager.default.removeItem(at: dir)
-            throw ImportError.empty(name)
-        }
+        guard duration > 0 else { throw ImportError.empty(name) }
+        imported = true
         Log.ok("Imported \(name) → \(String(format: "%.1f", duration / 60)) min at 16 kHz mono.")
 
         let result = AudioRecorder.Result(sessionDir: dir,
@@ -209,6 +213,66 @@ enum RecordingImporter {
             throw ImportError.cannotWrite(dir.path)
         }
         return dir
+    }
+
+    /// Which file owns each import start time.
+    ///
+    /// The note, the backlog folder and the index id are all a pure function
+    /// of `startedAt` (to the second) + source, so two files stamped in the
+    /// same second — a batch copied off a recorder together — used to share
+    /// one note: the second import overwrote the first, and had both failed
+    /// transcription, the second enqueue deleted the first's queued audio.
+    /// `claim` hands out the recording's own second when it is free (or
+    /// already this file's, so a re-import still updates its note in place),
+    /// otherwise the next free one. Persisted at `~/.ghostie/imports.json`.
+    enum ImportLedger {
+        static var path: String { "\(NSHomeDirectory())/.ghostie/imports.json" }
+
+        static func claim(file: URL, recordedAt: Date, config: Config) -> Date {
+            let size = (try? FileManager.default.attributesOfItem(atPath: file.path))?[.size] as? Int ?? 0
+            let key = "\(file.lastPathComponent)|\(size)"
+            var ledger = load()
+            var t = Date(timeIntervalSince1970: recordedAt.timeIntervalSince1970.rounded(.down))
+            for _ in 0..<3600 {
+                let stamp = AudioRecorder.stampFormatter.string(from: t)
+                if let owner = ledger[stamp] {
+                    if owner == key { return t }             // re-import: same note
+                } else if !isOccupied(t, stamp: stamp, config: config) {
+                    ledger[stamp] = key
+                    save(ledger)
+                    if stamp != AudioRecorder.stampFormatter.string(from: recordedAt) {
+                        Log.info("Import: \(file.lastPathComponent) shares its start second with another recording — stamped \(stamp).")
+                    }
+                    return t
+                }
+                t = t.addingTimeInterval(1)
+            }
+            return recordedAt
+        }
+
+        /// Something from another recording already lives at this second.
+        private static func isOccupied(_ t: Date, stamp: String, config: Config) -> Bool {
+            let fm = FileManager.default
+            let note = URL(fileURLWithPath: config.notesFolder)
+                .appendingPathComponent(Pipeline.noteBaseName(startedAt: t,
+                                                              source: Pipeline.importedSource) + ".md")
+            return fm.fileExists(atPath: note.path)
+                || fm.fileExists(atPath: URL(fileURLWithPath: config.workDir)
+                                     .appendingPathComponent(stamp).path)
+                || fm.fileExists(atPath: Backlog.entryDir(for: t).path)
+        }
+
+        private static func load() -> [String: String] {
+            guard let data = FileManager.default.contents(atPath: path),
+                  let d = try? JSONDecoder().decode([String: String].self, from: data)
+            else { return [:] }
+            return d
+        }
+
+        private static func save(_ d: [String: String]) {
+            guard let data = try? JSONEncoder().encode(d) else { return }
+            try? data.write(to: URL(fileURLWithPath: path), options: .atomic)
+        }
     }
 
     /// When the recording was made. The container's own creation date first

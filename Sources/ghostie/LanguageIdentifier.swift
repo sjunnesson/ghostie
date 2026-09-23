@@ -174,18 +174,14 @@ struct WhisperLID: LanguageIdentifier {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: binary)
         p.arguments = ["-m", model, "-f", scratch.path, "-l", "auto", "--detect-language"]
-        let pipe = Pipe()
-        p.standardOutput = pipe
-        p.standardError = pipe
-        do { try p.run() } catch {
+        // One short slice through the language head: seconds when healthy.
+        let status: Int32, out: String
+        do {
+            (status, out) = try runWatched(p, timeout: 120)
+        } catch {
             throw LIDError.whisperFailed(-1, error.localizedDescription)
         }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        p.waitUntilExit()
-        let out = String(data: data, encoding: .utf8) ?? ""
-        guard p.terminationStatus == 0 else {
-            throw LIDError.whisperFailed(p.terminationStatus, out)
-        }
+        guard status == 0 else { throw LIDError.whisperFailed(status, out) }
         guard let (lang, prob) = Self.parse(out) else {
             throw LIDError.unparseable(out)
         }
@@ -464,6 +460,7 @@ final class ServerWhisperLID: LanguageIdentifier {
     private func stopLocked() {
         guard let p = process else { return }
         process = nil
+        defer { ChildProcesses.unregister(p) }
         guard p.isRunning else { return }
         p.terminate()                                  // SIGTERM → trap kills server
         let deadline = Date().addingTimeInterval(3)
@@ -520,6 +517,7 @@ final class ServerWhisperLID: LanguageIdentifier {
                 continue
             }
             if Self.waitUntilReady(port: candidate, process: p) {
+                ChildProcesses.register(p)
                 process = p
                 port = candidate
                 Log.info("whisper-server up on 127.0.0.1:\(candidate) "

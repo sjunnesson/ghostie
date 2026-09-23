@@ -94,19 +94,26 @@ final class MenuBarApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         // OTA: a delayed launch check + a daily timer (only on builds we can
         // cryptographically verify; the timer re-reads the toggle each fire).
-        if Updater.runningBuildSupportsOTA() {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 20) { [weak self] in
-                self?.maybeAutoCheck()
-            }
-            let ut = DispatchSource.makeTimerSource(
-                queue: DispatchQueue(label: "ghostie.updatecheck"))
-            ut.schedule(deadline: .now() + 86_400, repeating: 86_400)
-            ut.setEventHandler { [weak self] in
-                DispatchQueue.main.async { self?.maybeAutoCheck() }
-            }
-            ut.resume()
-            updateTimer = ut
+        // The verify shells out to codesign + spctl (>1 s), so it runs off the
+        // main thread and the result is cached for every later caller.
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard Updater.runningBuildSupportsOTA() else { return }
+            DispatchQueue.main.async { self?.scheduleUpdateChecks() }
         }
+    }
+
+    private func scheduleUpdateChecks() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 20) { [weak self] in
+            self?.maybeAutoCheck()
+        }
+        let ut = DispatchSource.makeTimerSource(
+            queue: DispatchQueue(label: "ghostie.updatecheck"))
+        ut.schedule(deadline: .now() + 86_400, repeating: 86_400)
+        ut.setEventHandler { [weak self] in
+            DispatchQueue.main.async { self?.maybeAutoCheck() }
+        }
+        ut.resume()
+        updateTimer = ut
     }
 
     // MARK: Menu

@@ -4,9 +4,18 @@ import CoreMedia
 
 /// Converts ScreenCaptureKit audio sample buffers (typically 48 kHz, stereo,
 /// non-interleaved Float32) into the 16 kHz mono Int16 stream whisper.cpp wants.
+///
+/// Channels are averaged here, by hand; `AVAudioConverter` only changes rate
+/// and sample format. Asked to go stereo → mono itself it keeps channel 0 and
+/// drops the rest (`downmix` defaults to false) — so on Teams' spatial audio
+/// or a panned Zoom call a right-panned speaker came out quieter or missing
+/// from participants.wav. Same rule as `MicCapture` and `RecordingImporter`:
+/// never ask the converter to change channel count.
 final class AudioChunkConverter {
     private var converter: AVAudioConverter?
     private var inFormat: AVAudioFormat?
+    /// Reused mono staging buffer for the fold.
+    private var monoBuffer: AVAudioPCMBuffer?
     private let outFormat = AVAudioFormat(
         commonFormat: .pcmFormatInt16,
         sampleRate: 16000,
@@ -48,14 +57,21 @@ final class AudioChunkConverter {
             return nil
         }
 
-        if needsNewConverter(for: asbd) {
-            converter = AVAudioConverter(from: input, to: outFormat)
+        return convert(pcmIn, asbd: asbd)
+    }
+
+    /// Everything after the CMSampleBuffer unwrap; internal for the selftest.
+    func convert(_ pcmIn: AVAudioPCMBuffer, asbd: AudioStreamBasicDescription) -> [Int16]? {
+        let input = pcmIn.format
+        let source = input.channelCount > 1 ? (foldToMono(pcmIn) ?? pcmIn) : pcmIn
+        if needsNewConverter(for: asbd) || converter?.inputFormat != source.format {
+            converter = AVAudioConverter(from: source.format, to: outFormat)
             inFormat = input
         }
         guard let converter else { return nil }
 
         let ratio = outFormat.sampleRate / input.sampleRate
-        let outCapacity = AVAudioFrameCount(Double(pcmIn.frameLength) * ratio) + 2048
+        let outCapacity = AVAudioFrameCount(Double(source.frameLength) * ratio) + 2048
         guard let pcmOut = AVAudioPCMBuffer(pcmFormat: outFormat,
                                             frameCapacity: outCapacity) else { return nil }
 
@@ -68,7 +84,7 @@ final class AudioChunkConverter {
             }
             fed = true
             statusPtr.pointee = .haveData
-            return pcmIn
+            return source
         }
 
         guard result != .error, pcmOut.frameLength > 0,
@@ -76,6 +92,44 @@ final class AudioChunkConverter {
 
         let count = Int(pcmOut.frameLength)
         return Array(UnsafeBufferPointer(start: channelData[0], count: count))
+    }
+
+    /// Average every channel of a Float32 buffer (interleaved or not) into a
+    /// mono Float32 buffer at the same rate. Nil for any other sample format,
+    /// which then goes to the converter as before rather than being guessed at.
+    private func foldToMono(_ input: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
+        guard input.format.commonFormat == .pcmFormatFloat32,
+              let src = input.floatChannelData else { return nil }
+        let frames = Int(input.frameLength)
+        let channels = Int(input.format.channelCount)
+        if monoBuffer == nil
+            || monoBuffer!.format.sampleRate != input.format.sampleRate
+            || monoBuffer!.frameCapacity < input.frameLength {
+            guard let fmt = AVAudioFormat(commonFormat: .pcmFormatFloat32,
+                                          sampleRate: input.format.sampleRate,
+                                          channels: 1, interleaved: false) else { return nil }
+            monoBuffer = AVAudioPCMBuffer(pcmFormat: fmt,
+                                          frameCapacity: max(input.frameLength, 4096))
+        }
+        guard let mono = monoBuffer, let dst = mono.floatChannelData?[0] else { return nil }
+        mono.frameLength = input.frameLength
+        let scale = 1 / Float(channels)
+        if input.format.isInterleaved {
+            let p = src[0]
+            for f in 0..<frames {
+                var sum: Float = 0
+                for c in 0..<channels { sum += p[f * channels + c] }
+                dst[f] = sum * scale
+            }
+        } else {
+            for f in 0..<frames { dst[f] = src[0][f] }
+            for c in 1..<channels {
+                let p = src[c]
+                for f in 0..<frames { dst[f] += p[f] }
+            }
+            for f in 0..<frames { dst[f] *= scale }
+        }
+        return mono
     }
 
     /// A device swap can change channel count, sample format, or interleaving

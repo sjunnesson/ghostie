@@ -40,11 +40,12 @@ final class MicCapture {
     private let stateLock = NSLock()
 
     private let onSamples: ([Int16], Double?) -> Void
-    /// Fired on `control` after the graph is rebuilt against a new device.
-    /// The recorder re-anchors the "Me" track's PTS clock: the new source
-    /// starts a fresh timeline and comparing it to the old anchor would
-    /// otherwise inject a huge realignment pad.
-    var onRebuilt: (() -> Void)?
+    /// Fired on `control` when a rebuild could not build the graph at all.
+    /// That is a dead voice-processing path, not a quiet one, so the recorder
+    /// moves the "Me" track to the raw tap. (A successful rebuild needs no
+    /// hook: every source stamps on the host clock, so the recorder pads the
+    /// gap without being told.)
+    var onRebuildFailed: (() -> Void)?
 
     private var engine: AVAudioEngine?
     private var observer: NSObjectProtocol?
@@ -163,9 +164,9 @@ final class MicCapture {
         teardownLocked()
         do {
             try buildLocked()
-            onRebuilt?()
         } catch {
             Log.warn("Mic capture: rebuild failed (\(error.localizedDescription)) — the 'Me' track stays silent until the recorder falls back to the raw tap.")
+            onRebuildFailed?()
         }
     }
 

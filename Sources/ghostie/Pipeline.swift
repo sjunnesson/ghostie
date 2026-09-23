@@ -55,23 +55,43 @@ struct Pipeline {
                  roster: MeetingRoster = MeetingRoster()) -> URL? {
         let durationMins = String(format: "%.1f", rec.duration / 60.0)
         Log.info("Processing recording (\(durationMins) min) at \(rec.sessionDir.lastPathComponent)…")
+        // Until `cleanup` removes it, this marker is what lets the launch
+        // sweep recover the session if Ghostie quits or crashes mid-pipeline.
+        // Its body is the source, so a recovered call keeps its note name.
+        Self.markPending(rec.sessionDir, source: source)
 
         let lines: [Line]
         do {
             lines = try transcribeMerge(mic: rec.micWav, sys: rec.systemWav, roster: roster)
         } catch {
+            // Killed by a quit: leave the session (and its pending marker)
+            // for the next launch's sweep.
+            if ChildProcesses.isQuitting { return nil }
             Log.error("Transcription failed: \(error.localizedDescription) — queued to backlog")
-            Backlog.enqueueAudio(micWav: rec.micWav, systemWav: rec.systemWav,
-                                 startedAt: startedAt, durationMins: durationMins,
-                                 source: source, roster: roster,
-                                 copyingOriginals: config.keepAudio)
+            guard Backlog.enqueueAudio(micWav: rec.micWav, systemWav: rec.systemWav,
+                                       startedAt: startedAt, durationMins: durationMins,
+                                       source: source, roster: roster,
+                                       copyingOriginals: config.keepAudio) else {
+                // Keep the session dir (and its pending marker): the launch
+                // sweep retries it. Deleting it here would lose the call.
+                return nil
+            }
+            // `ghostie process` run on a backlog entry queues it into its own
+            // folder; `cleanup` would then delete the only copy of the audio.
+            let queuedInPlace = rec.sessionDir.standardizedFileURL.deletingLastPathComponent()
+                == URL(fileURLWithPath: Backlog.root).standardizedFileURL
             let url = writeNote(meta: metaBlock(startedAt, durationMins,
                                                 mic: rec.micWav, sys: rec.systemWav,
                                                 source: source),
                 summary: "> ⏳ **Queued.** Transcription wasn't available (\(error.localizedDescription)). Ghostie will process this recording automatically once it can run again.",
                 transcript: "_(Pending transcription.)_", startedAt: startedAt,
                 source: source)
-            cleanup(rec.sessionDir)
+            if queuedInPlace {
+                try? FileManager.default.removeItem(
+                    at: rec.sessionDir.appendingPathComponent(Self.pendingMarker))
+            } else {
+                cleanup(rec.sessionDir)
+            }
             return url
         }
 
@@ -90,6 +110,7 @@ struct Pipeline {
         let url = finishWithSummary(startedAt: startedAt, durationMins: durationMins,
                                     meta: meta, transcript: transcript, source: source,
                                     roster: roster)
+        if url == nil && ChildProcesses.isQuitting { return nil }   // see above
         cleanup(rec.sessionDir)
         return url
     }
@@ -113,6 +134,7 @@ struct Pipeline {
                              transcript: transcript, startedAt: startedAt,
                              source: source)
         } catch {
+            if ChildProcesses.isQuitting { return nil }
             Log.error("Summary unavailable: \(error.localizedDescription) — queued to backlog")
             Backlog.enqueueTranscript(startedAt: startedAt,
                                       durationMins: durationMins, transcript: transcript,
@@ -128,8 +150,19 @@ struct Pipeline {
 
     /// Try to complete every queued entry. Returns how many were finished.
     /// Safe to call repeatedly; entries that still can't run stay queued.
+    ///
+    /// Holds the backlog's cross-process lock for the duration: the app and a
+    /// `ghostie process-backlog` run used to drain the same entries at once —
+    /// double the CPU for tens of minutes, and then one `remove`d a folder the
+    /// other was still reading. Whoever finds it held skips this drain.
     @discardableResult
     static func drain(config: Config) -> Int {
+        guard !Backlog.isEmpty else { return 0 }
+        guard let lock = Backlog.DrainLock() else {
+            Log.info("Backlog: another Ghostie process is draining it — skipping this pass.")
+            return 0
+        }
+        defer { lock.release() }
         let entries = Backlog.entries()
         guard !entries.isEmpty else { return 0 }
         let p = Pipeline(config: config)
@@ -175,6 +208,8 @@ struct Pipeline {
                                     transcript: transcript, startedAt: startedAt,
                                     source: source)
                     Backlog.remove(entry); completed += 1
+                } else if ChildProcesses.isQuitting {
+                    continue          // killed by a quit, not a failed attempt
                 } else {
                     // Transcribed OK but summary still down: keep the
                     // transcript so we never re-transcribe this one again.
@@ -185,8 +220,14 @@ struct Pipeline {
                 }
 
             case "summarize":
-                let transcript = (try? String(contentsOf: entry.transcriptFile,
-                                              encoding: .utf8)) ?? ""
+                // Unreadable is not empty: summarizing "" would write a note
+                // with no transcript and then remove the only copy.
+                guard let transcript = try? String(contentsOf: entry.transcriptFile,
+                                                   encoding: .utf8) else {
+                    Log.warn("Backlog: could not read \(entry.transcriptFile.path) — will retry.")
+                    Backlog.bump(entry)
+                    continue
+                }
                 if let summary = p.trySummary(transcript: transcript, meta: meta) {
                     _ = p.writeNote(meta: meta, summary: summary,
                                     transcript: transcript, startedAt: startedAt,
@@ -248,6 +289,7 @@ struct Pipeline {
     /// Synchronous; called once at launch on the engine's serial work queue.
     /// Returns how many sessions were swept.
     static func sweepOrphanedRecordings(config: Config) -> Int {
+        CodeSwitchTranscriber.sweepScratch()
         let fm = FileManager.default
         guard let items = try? fm.contentsOfDirectory(
             at: URL(fileURLWithPath: config.workDir),
@@ -272,16 +314,21 @@ struct Pipeline {
                 ?? Date()
             let durationMins = String(format: "%.1f", wavSeconds(mic, sys) / 60.0)
             Log.info("Recovered orphaned recording \(dir.lastPathComponent) — queued to backlog.")
-            // The session dir doesn't record which app the call came from, so
-            // recovered recordings get the generic label.
-            Backlog.enqueueAudio(micWav: mic, systemWav: sys,
-                                 startedAt: startedAt, durationMins: durationMins,
-                                 source: "Call",
-                                 copyingOriginals: config.keepAudio)
+            // `Pipeline.process` writes the call's source into the marker; a
+            // session that died before processing began has an empty one and
+            // gets the generic label.
+            let marked = (try? String(contentsOf: dir.appendingPathComponent(pendingMarker),
+                                      encoding: .utf8))?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let source = marked.isEmpty ? "Call" : marked
+            guard Backlog.enqueueAudio(micWav: mic, systemWav: sys,
+                                       startedAt: startedAt, durationMins: durationMins,
+                                       source: source,
+                                       copyingOriginals: config.keepAudio) else { continue }
             _ = p.writeNote(meta: p.metaBlock(startedAt, durationMins),
                 summary: "> ⏳ **Queued.** Ghostie quit before this recording could be processed. It has been queued and will be processed automatically.",
                 transcript: "_(Pending transcription.)_", startedAt: startedAt,
-                source: "Call")
+                source: source)
             p.cleanup(dir)
             swept += 1
         }
@@ -513,7 +560,11 @@ struct Pipeline {
         guard config.diarization, segments.count > 1 else { return [:] }
         guard let embedder = SpeakerEmbedder.load(config: config) else { return [:] }
         defer { embedder.shutdown() }
-        guard let pcm = try? AudioStitcher.readPCM(wav) else { return [:] }
+        // Converted straight away so the Int16 bytes are released before
+        // the (minutes-long) embedding pass rather than held beside the Float
+        // copy for all of it — ~230 MB on a two-hour track.
+        guard let samples = (try? AudioStitcher.readPCM(wav))
+                .map(SpeakerDiarizer.floatSamples) else { return [:] }
 
         // Whisper's own span per segment, which the cleaner carries through.
         // Only a segment that never had one falls back to the next segment's
@@ -530,7 +581,7 @@ struct Pipeline {
         let t0 = Date()
         guard let a = SpeakerDiarizer().diarize(
                 segments: input,
-                samples: SpeakerDiarizer.floatSamples(pcm),
+                samples: samples,
                 embedder: embedder) else {
             Log.info("Diarization: too little on the Participants track to judge on "
                 + "— keeping the generic label.")
@@ -622,6 +673,34 @@ struct Pipeline {
         return nil
     }
 
+    /// Quit with a call still live: queue it rather than run a pipeline that
+    /// takes minutes to tens of minutes while the app hangs on "Finishing
+    /// up…". Moves the audio into the backlog (a rename), writes the queued
+    /// note so the call is visibly saved, and the next launch's drain does the
+    /// rest. If the enqueue fails the session keeps its pending marker and the
+    /// launch sweep picks it up instead.
+    func queueForLater(_ rec: AudioRecorder.Result, startedAt: Date, source: String,
+                       roster: MeetingRoster) {
+        let durationMins = String(format: "%.1f", rec.duration / 60.0)
+        Self.markPending(rec.sessionDir, source: source)
+        guard Backlog.enqueueAudio(micWav: rec.micWav, systemWav: rec.systemWav,
+                                   startedAt: startedAt, durationMins: durationMins,
+                                   source: source, roster: roster,
+                                   copyingOriginals: config.keepAudio) else { return }
+        _ = writeNote(meta: metaBlock(startedAt, durationMins, source: source),
+            summary: "> ⏳ **Queued.** Ghostie was quit while this call was recording. The recording is saved and will be transcribed automatically the next time Ghostie runs.",
+            transcript: "_(Pending transcription.)_", startedAt: startedAt, source: source)
+        cleanup(rec.sessionDir)
+    }
+
+    /// Mark `sessionDir` as holding audio that has not yet become a note or a
+    /// backlog entry. `AudioRecorder.stop` writes it empty once the WAVs are
+    /// finalized; `process` rewrites it with the source.
+    static func markPending(_ sessionDir: URL, source: String = "") {
+        try? Data(source.utf8).write(
+            to: sessionDir.appendingPathComponent(pendingMarker), options: .atomic)
+    }
+
     /// The session has been fully handled (note written and/or audio queued):
     /// drop the `.ghostie-pending` marker so the launch-time orphan sweep
     /// never re-queues this directory, then honor `keepAudio`.
@@ -647,11 +726,9 @@ struct Pipeline {
         let folder = URL(fileURLWithPath: config.notesFolder)
         try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
 
-        // "Zoom" → "Zoom-Call" / "Zoom Call"; the bare generic label stays
-        // "Call" (never "Call-Call").
-        let token = source == "Call" ? "Call" : "\(source)-Call"
+        // "Zoom Call"; the bare generic label stays "Call" (never "Call-Call").
         let title = source == "Call" ? "Call" : "\(source) Call"
-        let base = Self.fileStamp.string(from: startedAt) + "_" + token
+        let base = Self.noteBaseName(startedAt: startedAt, source: source)
         let noteURL = folder.appendingPathComponent(base + ".md")
 
         var doc = """
@@ -712,6 +789,14 @@ struct Pipeline {
     /// while the note name stays a pure function of `startedAt` + `source` —
     /// backlog retries re-derive both from meta.json and upgrade the queued
     /// note in place.
+    /// `2026-09-21_20-59-58_Zoom-Call` — the note's basename, and so the
+    /// index id. A pure function of `startedAt` + source (see `writeNote`).
+    static func noteBaseName(startedAt: Date, source: String) -> String {
+        // "Zoom" → "Zoom-Call"; the bare generic label stays "Call".
+        let token = source == "Call" ? "Call" : "\(source)-Call"
+        return fileStamp.string(from: startedAt) + "_" + token
+    }
+
     private static let fileStamp: DateFormatter = {
         let f = DateFormatter()
         f.dateFormat = "yyyy-MM-dd_HH-mm-ss"

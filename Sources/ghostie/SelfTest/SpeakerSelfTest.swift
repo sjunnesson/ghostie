@@ -104,6 +104,45 @@ func runSpeakerSelfTest() -> Bool {
     check("one speaker stays one cluster", Set(d.agglomerate(one)).count == 1,
           "\(d.agglomerate(one))")
 
+    // The running-sum clustering must reproduce the original member-pair
+    // average linkage exactly, on data noisy enough to need many merges.
+    func referenceAgglomerate(_ e: [[Float]], threshold: Float, maxSpeakers: Int) -> [Int] {
+        var members = (0..<e.count).map { [$0] }
+        func linkage(_ a: [Int], _ b: [Int]) -> Float {
+            var t: Float = 0
+            for i in a { for j in b { t += SpeakerEmbedder.similarity(e[i], e[j]) } }
+            return t / Float(a.count * b.count)
+        }
+        while members.count > 1 {
+            var best: (Int, Int, Float)?
+            for x in 0..<members.count {
+                for y in (x + 1)..<members.count {
+                    let s = linkage(members[x], members[y])
+                    if best == nil || s > best!.2 { best = (x, y, s) }
+                }
+            }
+            guard let (x, y, sim) = best else { break }
+            if 1 - sim > threshold && members.count <= maxSpeakers { break }
+            members[x] += members[y]
+            members.remove(at: y)
+        }
+        var out = [Int](repeating: 0, count: e.count)
+        for (id, m) in members.enumerated() { for i in m { out[i] = id } }
+        return out
+    }
+    func partition(_ c: [Int]) -> Set<Set<Int>> {
+        Set(Dictionary(grouping: c.indices, by: { c[$0] }).values.map(Set.init))
+    }
+    for (speakers, spread) in [(4, 0.8), (6, 1.2)] as [(Int, Float)] {
+        let noisy = (0..<90).map { embedding(speaker: $0 % speakers, index: $0 + 100, spread: spread) }
+        let want = referenceAgglomerate(noisy, threshold: d.mergeThreshold,
+                                        maxSpeakers: d.maxSpeakers)
+        let got = d.agglomerate(noisy)
+        check("clustering matches member-pair average linkage (\(speakers) voices, spread \(spread))",
+              partition(got) == partition(want),
+              "\(Set(got).count) clusters vs reference \(Set(want).count)")
+    }
+
     check("similarity of a vector with itself is 1",
           abs(SpeakerEmbedder.similarity(twoSpeakers[0], twoSpeakers[0]) - 1) < 1e-4)
     check("different speakers score below the merge threshold",

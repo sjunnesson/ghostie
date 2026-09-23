@@ -336,11 +336,24 @@ func cmdProcess(_ config: Config, dir: String) {
     let stamp = DateFormatter()
     stamp.dateFormat = "yyyy-MM-dd_HH-mm-ss"
     stamp.locale = Locale(identifier: "en_US_POSIX")
-    let startedAt = stamp.date(from: url.lastPathComponent) ?? Date()
+    // A backlog entry (live or given-up) carries its call's meta: reuse its
+    // start time, source and roster so the re-run upgrades the queued note in
+    // place (`<stamp>_Zoom-Call.md`) instead of writing a second, generic one
+    // beside it. Pre-source entries default to "Teams", as the drain does.
+    let meta = FileManager.default.contents(atPath: url.appendingPathComponent("meta.json").path)
+        .flatMap { try? JSONDecoder().decode(Backlog.Meta.self, from: $0) }
+    let startedAt = meta.map { Date(timeIntervalSince1970: $0.startedAt) }
+        ?? stamp.date(from: url.lastPathComponent) ?? Date()
     let duration = max(WavLevel.probe(mic)?.seconds ?? 0, WavLevel.probe(sys)?.seconds ?? 0)
     let result = AudioRecorder.Result(sessionDir: url, micWav: mic,
                                       systemWav: sys, duration: duration)
-    Pipeline(config: config).process(result, startedAt: startedAt)
+    if let meta {
+        Pipeline(config: config).process(result, startedAt: startedAt,
+                                         source: meta.source ?? "Teams",
+                                         roster: meta.meetingRoster)
+    } else {
+        Pipeline(config: config).process(result, startedAt: startedAt)
+    }
 }
 
 /// Headless twin of the menu's "Import Audio File…": one session folder and
@@ -1294,6 +1307,7 @@ case "lid-probe":
 case "update":
     cmdUpdate(config, install: args.contains("--install"))
 case "selftest":
+    Log.writesToFile = false
     let cleanerOK = runTranscriptCleanerSelfTest()
     print("")
     let echoOK = runEchoSuppressorSelfTest()

@@ -248,30 +248,115 @@ enum TranscriptIndex {
     /// describes is gone (deleted or moved out of the notes folder) — a record
     /// pointing at a file that no longer exists is not a call the user has.
     static func load(id: String) -> CallRecord? {
-        guard let data = try? Data(contentsOf: url(for: id)),
-              let record = try? makeDecoder().decode(CallRecord.self, from: data),
-              record.schema == currentSchema,
+        let path = url(for: id).path
+        guard let stamp = FileStamp(path: path) else { return nil }
+        let record: CallRecord
+        if let hit = cache.record(id: id, stamp: stamp) {
+            record = hit
+        } else {
+            guard let data = FileManager.default.contents(atPath: path),
+                  let decoded = try? makeDecoder().decode(CallRecord.self, from: data)
+            else { return nil }
+            cache.store(record: decoded, id: id, stamp: stamp)
+            record = decoded
+        }
+        guard record.schema == currentSchema,
               FileManager.default.fileExists(atPath: record.notePath)
         else { return nil }
         return record
     }
 
     /// Every indexed call, newest first, without decoding any turns.
+    ///
+    /// Each file is decoded once per change, not once per request: `ghostie
+    /// mcp` lives as long as its client and answers every tool call from
+    /// this listing, and re-parsing the whole index each time (turns and all
+    /// — `CallSummary` skips them but JSONDecoder still reads them) grew with
+    /// every call recorded. Entries are keyed on mtime + size.
     static func summaries() -> [CallSummary] {
         let fm = FileManager.default
         guard let names = try? fm.contentsOfDirectory(atPath: root) else { return [] }
         let decoder = makeDecoder()
         var out: [CallSummary] = []
+        var live: Set<String> = []
         for name in names where name.hasSuffix(".json") {
-            let path = URL(fileURLWithPath: root).appendingPathComponent(name)
-            guard let data = try? Data(contentsOf: path),
-                  let summary = try? decoder.decode(CallSummary.self, from: data),
-                  summary.schema == currentSchema,
+            let path = URL(fileURLWithPath: root).appendingPathComponent(name).path
+            guard let stamp = FileStamp(path: path) else { continue }
+            live.insert(path)
+            let summary: CallSummary
+            if let hit = cache.summary(path: path, stamp: stamp) {
+                summary = hit
+            } else {
+                guard let data = fm.contents(atPath: path),
+                      let decoded = try? decoder.decode(CallSummary.self, from: data)
+                else { continue }
+                cache.store(summary: decoded, path: path, stamp: stamp)
+                summary = decoded
+            }
+            guard summary.schema == currentSchema,
                   fm.fileExists(atPath: summary.notePath)
             else { continue }
             out.append(summary)
         }
+        cache.retainSummaries(live)
         return out.sorted { $0.startedAt > $1.startedAt }
+    }
+
+    // MARK: Read cache
+
+    /// What a cached decode is valid for: the file as it was when decoded.
+    struct FileStamp: Equatable {
+        let mtime: Date
+        let size: Int
+
+        init?(path: String) {
+            guard let a = try? FileManager.default.attributesOfItem(atPath: path),
+                  let m = a[.modificationDate] as? Date,
+                  let n = a[.size] as? Int else { return nil }
+            mtime = m; size = n
+        }
+    }
+
+    private static let cache = ReadCache()
+
+    /// Summaries for every file (small), full records for the few most
+    /// recently read (a transcript is tens of kB decoded; holding all of them
+    /// in a process that runs for days would grow with every call).
+    private final class ReadCache: @unchecked Sendable {
+        private let lock = NSLock()
+        private var summaries: [String: (FileStamp, CallSummary)] = [:]
+        private var records: [(id: String, stamp: FileStamp, record: CallRecord)] = []
+        private let recordCapacity = 8
+
+        func summary(path: String, stamp: FileStamp) -> CallSummary? {
+            lock.withLock {
+                guard let (s, v) = summaries[path], s == stamp else { return nil }
+                return v
+            }
+        }
+        func store(summary: CallSummary, path: String, stamp: FileStamp) {
+            lock.withLock { summaries[path] = (stamp, summary) }
+        }
+        /// Forget files that are no longer in the index directory.
+        func retainSummaries(_ paths: Set<String>) {
+            lock.withLock { summaries = summaries.filter { paths.contains($0.key) } }
+        }
+        func record(id: String, stamp: FileStamp) -> CallRecord? {
+            lock.withLock {
+                guard let i = records.firstIndex(where: { $0.id == id }) else { return nil }
+                let hit = records.remove(at: i)
+                guard hit.stamp == stamp else { return nil }
+                records.append(hit)            // most recent last
+                return hit.record
+            }
+        }
+        func store(record: CallRecord, id: String, stamp: FileStamp) {
+            lock.withLock {
+                records.removeAll { $0.id == id }
+                records.append((id, stamp, record))
+                if records.count > recordCapacity { records.removeFirst() }
+            }
+        }
     }
 
     /// The written analysis, read from the note itself so hand edits are

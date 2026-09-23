@@ -157,6 +157,40 @@ func runUpdaterSelfTest() -> Bool {
           (UpdateError.rateLimited(retryAfter: Date(timeIntervalSince1970: 1))
               .errorDescription ?? "").contains("try again shortly"))
 
+    // Watched children (whisper-cli's runner): output comes back, and a hung
+    // child is killed at its deadline instead of wedging the caller.
+    do {
+        let echo = Process()
+        echo.executableURL = URL(fileURLWithPath: "/bin/echo")
+        echo.arguments = ["hello"]
+        let r = try? runWatched(echo, timeout: 10)
+        check("runWatched returns a finished child's status and output",
+              r?.status == 0 && r?.output == "hello\n", "\(String(describing: r))")
+
+        let hung = Process()
+        hung.executableURL = URL(fileURLWithPath: "/bin/sleep")
+        hung.arguments = ["30"]
+        let t0 = Date()
+        var timedOut = false
+        do { _ = try runWatched(hung, timeout: 0.5) } catch is ProcessTimedOut { timedOut = true }
+        catch {}
+        let took = Date().timeIntervalSince(t0)
+        check("runWatched kills a hung child at its deadline",
+              timedOut && !hung.isRunning && took < 5, "timedOut=\(timedOut) took=\(took)s")
+    }
+
+    // Backlog drain lock: exclusive across holders, released cleanly.
+    if let first = Backlog.DrainLock() {
+        check("a second drain is refused while the backlog lock is held",
+              Backlog.DrainLock() == nil)
+        first.release()
+        let again = Backlog.DrainLock()
+        check("the backlog lock can be taken again once released", again != nil)
+        again?.release()
+    } else {
+        print("  – backlog lock held by a running Ghostie; lock checks skipped")
+    }
+
     print("\nupdater self-test: \(passed) passed, \(failed) failed")
     return failed == 0
 }

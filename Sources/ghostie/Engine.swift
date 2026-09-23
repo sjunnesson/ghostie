@@ -26,7 +26,11 @@ enum EngineState: Equatable {
 /// `…Locked` helpers must only run on `gate`.
 final class Engine: @unchecked Sendable {
     private(set) var config: Config
+    /// Written on `gate` (see `applyConfig`); read there or via `gate.sync`.
     private var detector: CallDetector
+    /// Roster collected by a detector that a Settings save replaced mid-call,
+    /// merged into the live one at finalize. Gate-only.
+    private var carriedRoster = MeetingRoster()
     /// The live call's recorder. Gate-only; handed off to a finalizer exactly
     /// once via `takeRecorderLocked()` (stop, fatal stream error and shutdown
     /// all race for it, whoever wins owns the stop).
@@ -63,6 +67,8 @@ final class Engine: @unchecked Sendable {
     private var listening = false
     /// Flipped on `work` (serial) so the orphan sweep runs exactly once.
     private var orphanSweepDone = false
+    /// A `drainBacklog` work item is queued and has not started yet.
+    private let drainQueued = Locked(false)
 
     /// Called (on an arbitrary queue) whenever state changes; UI must hop to main.
     var onStateChange: ((EngineState) -> Void)?
@@ -89,11 +95,16 @@ final class Engine: @unchecked Sendable {
     /// The four detector callbacks, shared by init and applyConfig. Tentative
     /// start/discard bracket the candidate window so the confirm window's
     /// audio (a call's opening seconds) is captured, not lost.
+    ///
+    /// Each closure reads *its own* detector, never `self.detector`: the
+    /// callbacks run on the detector's queue while `applyConfig` may be
+    /// swapping the property on another.
     private func wireDetector() {
-        detector.onCallStart = { [weak self] in self?.handleStart() }
-        detector.onCallStop  = { [weak self] in self?.handleStop() }
-        detector.onTentativeStart = { [weak self] in self?.handleTentativeStart() }
-        detector.onTentativeDiscard = { [weak self] in self?.handleStop() }
+        let d = detector
+        d.onCallStart = { [weak self, weak d] in self?.handleStart(source: d?.currentCallSource()) }
+        d.onCallStop  = { [weak self] in self?.handleStop() }
+        d.onTentativeStart = { [weak self] in self?.handleTentativeStart() }
+        d.onTentativeDiscard = { [weak self] in self?.handleStop() }
     }
 
     var isListening: Bool { listening }
@@ -169,15 +180,53 @@ final class Engine: @unchecked Sendable {
     /// Swap in a new configuration at runtime (from the Settings window).
     /// Recording/transcription/summary already reload `Config.load()` per call;
     /// the detector is rebuilt here so detection settings take effect too.
+    ///
+    /// A save can land mid-call. The old detector is silenced before it is
+    /// stopped — its teardown `forceStop` must not end the recording, or every
+    /// save during a call would split it into two notes — and the new one
+    /// normally re-detects the call and owns its end. When it can't (the save
+    /// landed in the old detector's 30 s end grace, or changed what counts as
+    /// a call), nothing would ever stop the recording; `reconcileAfterSwap`
+    /// is that backstop. The roster gathered so far is carried across.
     func applyConfig(_ newConfig: Config) {
         let wasListening = listening
-        if wasListening { detector.stop() }
-        config = newConfig
-        detector = CallDetector(config: newConfig)
+        let old = gate.sync { detector }
+        let roster = old.currentRoster()
+        old.onCallStart = nil; old.onCallStop = nil
+        old.onTentativeStart = nil; old.onTentativeDiscard = nil
+        if wasListening { old.stop() }
+        let fresh = CallDetector(config: newConfig)
+        gate.sync {
+            config = newConfig
+            detector = fresh
+            carriedRoster = carriedRoster.merged(with: roster)
+        }
         wireDetector()
-        if wasListening { detector.start() }
+        if wasListening {
+            fresh.start()
+            reconcileAfterSwap(fresh)
+        }
         Log.info("Settings updated\(wasListening ? " — detector restarted" : "").")
         drainBacklog()   // settings may have fixed whisper / Claude Code
+    }
+
+    /// Seconds after a detector swap before a recording the new detector has
+    /// not picked up is ended: past its 3 s confirm window with room to spare.
+    private static let swapGraceSeconds: Double = 15
+
+    private func reconcileAfterSwap(_ fresh: CallDetector) {
+        // Off `gate`: the snapshot waits on the detector queue, which can sit
+        // in a slow AX call; gate must never block on that.
+        DispatchQueue.global(qos: .utility).asyncAfter(
+            deadline: .now() + Self.swapGraceSeconds) { [weak self, weak fresh] in
+            guard let self, let fresh,
+                  self.gate.sync(execute: { self.detector === fresh }),
+                  fresh.stage() == .idle else { return }
+            let orphaned = self.gate.sync { self.recorder != nil && !self.isManual }
+            guard orphaned else { return }
+            Log.info("Settings changed mid-call and the restarted detector sees no call — finishing the recording.")
+            self.handleStop()
+        }
     }
 
     func startListening() {
@@ -208,8 +257,20 @@ final class Engine: @unchecked Sendable {
     /// 10-min timer tick, normally — is answered by one directory listing
     /// (`Backlog.isEmpty`) before `Config.load()` (which stats binaries and
     /// re-reads the model catalog) or any entry parsing happens.
+    ///
+    /// Coalesced: a drain already queued and not yet started covers this
+    /// request too. Triggers arrive in bursts (a Settings save right after a
+    /// call, repeated "Process Now" clicks) and each used to queue a full
+    /// drain — re-running whisper over a still-failing entry once per click,
+    /// all of it ahead of the next call's pipeline on this serial queue.
     func drainBacklog() {
+        guard drainQueued.withLock({ (queued: inout Bool) -> Bool in
+            if queued { return false }
+            queued = true
+            return true
+        }) else { return }
         work.async {
+            self.drainQueued.withLock { $0 = false }
             // One-shot launch sweep, sequenced on this same serial queue so
             // it always lands before the first drain: recording dirs orphaned
             // by a crash/kill mid-call would otherwise sit in workDir forever.
@@ -241,8 +302,8 @@ final class Engine: @unchecked Sendable {
     /// is simply adopted (recordingStartedAt keeps the tentative start, so
     /// the menu timer matches the audio). Falls back to a fresh start when
     /// no tentative capture exists — e.g. its start() failed.
-    private func handleStart() {
-        startRecorderLocked(tentative: false, source: detector.currentCallSource())
+    private func handleStart(source: CallSource?) {
+        startRecorderLocked(tentative: false, source: source)
     }
 
     /// Menu "Start Recording": user-initiated capture, independent of call
@@ -320,7 +381,7 @@ final class Engine: @unchecked Sendable {
             // the detector's own onCallStop firing later is a harmless
             // no-op. (For a tentative capture the same path discards
             // instead of processing.)
-            rec.onFatalError = { [weak self] in self?.finalizeRecorder(.fatal) }
+            rec.onFatalError = { [weak engine = self] in engine?.finalizeRecorder(.fatal) }
             self.startTask = Task {
                 do {
                     try await rec.start()
@@ -406,8 +467,12 @@ final class Engine: @unchecked Sendable {
                 let sourceLabel = callSource?.rawValue ?? "Call"
                 // Read before clearing: the roster accumulates across the
                 // whole session and this is the last moment it is available.
-                let roster = self.detector.currentRoster()
-                self.detector.clearRoster()
+                let (detector, carried) = self.gate.sync {
+                    defer { self.carriedRoster = MeetingRoster() }
+                    return (self.detector, self.carriedRoster)
+                }
+                let roster = carried.merged(with: detector.currentRoster())
+                detector.clearRoster()
                 self.gate.async {
                     self.processingCount += 1
                     self.settleStateLocked()
@@ -528,30 +593,42 @@ final class Engine: @unchecked Sendable {
     /// Hops through `gate` (this used to poke `recorder` straight from the
     /// caller's thread, racing handleStart/handleStop) and waits out an
     /// in-flight start exactly like handleStop does.
+    ///
+    /// Quitting is prompt. A live call is finalized and queued to the backlog
+    /// (`Pipeline.queueForLater`) rather than processed — that used to hold
+    /// the app on "Finishing up…" for the whole pipeline. Children still
+    /// running for earlier work (whisper-cli, `claude -p`) are stopped rather
+    /// than left to run on after we exit; their sessions carry a pending
+    /// marker, so the next launch's sweep and drain pick them up.
     func shutdown(then: @escaping () -> Void) {
+        let finish = {
+            ChildProcesses.terminateAll()
+            then()
+        }
         gate.async {
-            guard self.recorder != nil else { then(); return }
+            guard self.recorder != nil else { finish(); return }
             let pendingStart = self.startTask
             Task {
                 await pendingStart?.value
                 guard let (rec, started, tentative, callSource) =
                     (self.gate.sync { self.takeRecorderLocked() })
-                else { then(); return }
+                else { finish(); return }
                 if tentative {
                     // Quit during an unconfirmed candidate: not a call.
                     if let r = await rec.stop(discardIfBelowMinCallSeconds: false) {
                         try? FileManager.default.removeItem(at: r.sessionDir)
                     }
-                    then()
+                    finish()
                     return
                 }
-                if let r = await rec.stop(), r.duration >= self.config.minCallSeconds {
-                    let sourceLabel = callSource?.rawValue ?? "Call"
-                    self.work.async {
-                        _ = Pipeline(config: Config.load()).process(r, startedAt: started, source: sourceLabel)
-                        then()
-                    }
-                } else { then() }
+                if let r = await rec.stop() {
+                    let (detector, carried) = self.gate.sync { (self.detector, self.carriedRoster) }
+                    Pipeline(config: Config.load()).queueForLater(
+                        r, startedAt: started, source: callSource?.rawValue ?? "Call",
+                        roster: carried.merged(with: detector.currentRoster()))
+                    Log.info("Quitting mid-call — the recording is queued and will be processed on the next launch.")
+                }
+                finish()
             }
         }
     }

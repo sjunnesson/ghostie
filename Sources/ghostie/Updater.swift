@@ -229,7 +229,16 @@ final class Updater: NSObject, URLSessionDownloadDelegate {
 
     /// True only when the *running* bundle is a notarized Developer ID build
     /// signed by our team — the only builds OTA can cryptographically verify.
-    static func runningBuildSupportsOTA() -> Bool {
+    ///
+    /// Computed once per process: the running bundle cannot change under us,
+    /// and the codesign + spctl round trip costs over a second (spctl may go
+    /// to the network) — it was being paid on the main thread every time
+    /// Settings opened or a check ran. `MenuBarApp` warms it off-main at launch.
+    static func runningBuildSupportsOTA() -> Bool { supportsOTA }
+
+    private static let supportsOTA: Bool = computeSupportsOTA()
+
+    private static func computeSupportsOTA() -> Bool {
         let path = Bundle.main.bundlePath
         guard path.hasSuffix(".app") else { return false }
         guard run("/usr/bin/codesign",
@@ -399,7 +408,11 @@ final class Updater: NSObject, URLSessionDownloadDelegate {
     }
 
     private static func recordCheckTime() {
-        var c = Config.loadRaw()
+        // Never through `loadRaw`: it answers an unreadable file with
+        // defaults, and saving those back from this background completion
+        // would wipe every setting just to stamp a timestamp.
+        guard let data = FileManager.default.contents(atPath: Config.configPath),
+              var c = try? JSONDecoder().decode(Config.self, from: data) else { return }
         c.lastUpdateCheck = Date()
         c.save()
     }
@@ -594,18 +607,27 @@ final class Updater: NSObject, URLSessionDownloadDelegate {
         #!/bin/bash
         set -e
         PID="$1"; SRC="$2"; DEST="$3"; SELF="$0"
-        while kill -0 "$PID" 2>/dev/null; do sleep 0.2; done
         DIR="$(dirname "$DEST")"
         TMP="$DIR/.Ghostie.app.incoming.$$"
         OLD="$DIR/.Ghostie.app.old.$$"
+        # Whatever happens below, Ghostie is already gone: always clean up,
+        # put the old app back if the new one never landed, and relaunch.
+        # (A failed ditto — full disk — used to exit here under `set -e` and
+        # leave Ghostie quit, with a half-copied bundle beside it.)
+        finish() {
+            rm -rf "$TMP"
+            if [ ! -d "$DEST" ] && [ -d "$OLD" ]; then mv "$OLD" "$DEST"; fi
+            rm -rf "$OLD"
+            [ -d "$DEST" ] && /usr/bin/open "$DEST"
+            rm -f "$SELF"
+        }
+        trap finish EXIT
+        while kill -0 "$PID" 2>/dev/null; do sleep 0.2; done
         rm -rf "$TMP" "$OLD"
         /usr/bin/ditto "$SRC" "$TMP"
         mv "$DEST" "$OLD"
-        mv "$TMP" "$DEST" || { mv "$OLD" "$DEST"; rm -f "$SELF"; exit 1; }
-        rm -rf "$OLD"
+        mv "$TMP" "$DEST"
         /usr/bin/xattr -dr com.apple.quarantine "$DEST" 2>/dev/null || true
-        /usr/bin/open "$DEST"
-        rm -f "$SELF"
         """
         let scriptURL = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("ghostie-update-\(UUID().uuidString).sh")

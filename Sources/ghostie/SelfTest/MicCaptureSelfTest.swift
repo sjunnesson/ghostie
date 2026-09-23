@@ -147,6 +147,33 @@ func runMicCaptureSelfTest() -> Bool {
               return MicCapture.firstChannelWithSignal(b) == nil
           }())
 
+    // Participants track: stereo is averaged, not cut to the left channel.
+    if let rightOnly = makeBuffer(channels: 2, frames: 4_800, value: { c, f in
+        c == 1 ? Float(sin(Double(f) * 2 * .pi * 440 / 48_000)) * 0.5 : 0
+    }) {
+        let out = AudioChunkConverter().convert(
+            rightOnly, asbd: rightOnly.format.streamDescription.pointee) ?? []
+        let peak = out.map { abs(Int($0)) }.max() ?? 0
+        check("a speaker panned hard right still reaches the Participants track",
+              peak > 3_000, "peak \(peak) over \(out.count) samples")
+    } else {
+        check("stereo fixture", false, "could not build a 2-channel buffer")
+    }
+
+    // Track realignment: 16 kHz, 10 s accounted since an anchor at t=100.
+    func realign(_ pts: Double) -> AudioRecorder.Realignment {
+        AudioRecorder.realignment(firstPTS: 100, accounted: 160_000, pts: pts,
+                                  rate: 16_000, maxLag: 1_600, maxGapSeconds: 120)
+    }
+    check("realign: on time needs nothing", realign(110) == .none)
+    check("realign: jitter under 100 ms needs nothing", realign(110.05) == .none)
+    check("realign: a 1.5 s mic-rebuild gap is padded, not dropped",
+          realign(111.5) == .pad(24_000), "\(realign(111.5))")
+    check("realign: a clock jump past 2 min rebases instead of padding",
+          realign(100 + 10 + 3_600) == .rebase(firstPTS: 3_700), "\(realign(3_710))")
+    check("realign: a clock that went backwards rebases",
+          realign(50) == .rebase(firstPTS: 40), "\(realign(50))")
+
     print("mic-capture self-test: \(passed) passed, \(failed) failed")
     return failed == 0
 }

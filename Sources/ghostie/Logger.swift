@@ -35,6 +35,12 @@ enum Log {
     /// `main.swift`, which flips it above the command switch).
     nonisolated(unsafe) static var echoesToStdout = true
 
+    /// When false, nothing is appended to ~/.ghostie/ghostie.log. `selftest`
+    /// turns it off: its fixtures log real-looking lines ("Call detected
+    /// (Meet, …)" from a fake pid 300), and mixed into the production log they
+    /// made the real detection history unreadable.
+    nonisolated(unsafe) static var writesToFile = true
+
     static func line(_ level: String, _ msg: String) {
         let stamp = df.string(from: Date())
         let text = "[\(stamp)] \(level) \(msg)"
@@ -44,7 +50,7 @@ enum Log {
         } else {
             FileHandle.standardError.write(Data((text + "\n").utf8))
         }
-        guard let data = (text + "\n").data(using: .utf8) else { return }
+        guard writesToFile, let data = (text + "\n").data(using: .utf8) else { return }
         queue.async { appendLocked(data) }
     }
 
@@ -59,10 +65,16 @@ enum Log {
                 FileManager.default.createFile(atPath: logFileURL.path, contents: nil)
             }
             handle = try? FileHandle(forWritingTo: logFileURL)
-            handle?.seekToEndOfFile()
+            _ = try? handle?.seekToEnd()
         }
         guard let h = handle else { return }
-        h.write(data)
+        // Throwing API: the legacy `write(_:)` raises an ObjC exception on a
+        // full disk, and a log line is the last thing that should crash the app.
+        guard (try? h.write(contentsOf: data)) != nil else {
+            try? h.close()
+            handle = nil
+            return
+        }
         bytesWritten += Int64(data.count)
     }
 

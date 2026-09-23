@@ -23,7 +23,7 @@ import CoreMediaIO
 /// reads.
 final class CoreMediaIOCameraActivityProvider: CameraActivityProvider {
 
-    private let listenerQueue = DispatchQueue(label: "ghostie.coremediaio.listener")
+    private let listenerQueue = ListenerQueues.make(label: "ghostie.coremediaio.listener")
     private let stateLock = NSLock()
     private let fanout = ChangeFanout()
     private var perDeviceTeardowns: [CMIOObjectID: () -> Void] = [:]
@@ -42,7 +42,7 @@ final class CoreMediaIOCameraActivityProvider: CameraActivityProvider {
         // Drain any in-flight CoreMediaIO callback before tearing down (a
         // listener block could be partway through `reconcileDeviceListeners`
         // when the last strong ref drops).
-        listenerQueue.sync { }
+        ListenerQueues.drain(listenerQueue)
         deviceListTeardown?()
         for (_, tear) in perDeviceTeardowns { tear() }
     }

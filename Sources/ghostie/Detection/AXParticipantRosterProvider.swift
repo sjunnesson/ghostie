@@ -141,9 +141,10 @@ enum RosterHeuristics {
     }
 }
 
-/// Live implementation. Walks only the windows of browsers the tab probe
-/// already flagged as showing a meeting, bounded in depth and node count —
-/// this runs during a call, on a Chrome tree that can be enormous.
+/// Live implementation. Walks only the window showing the meeting (the one
+/// whose title the tab probe matched — not every window of that browser),
+/// bounded in depth and node count, and abandons a browser whose AX calls
+/// time out — this runs during a call, on a Chrome tree that can be enormous.
 final class AXParticipantRosterProvider: ParticipantRosterProvider {
 
     /// A meeting page's roster sits well inside the web area; 45 clears it
@@ -164,30 +165,44 @@ final class AXParticipantRosterProvider: ParticipantRosterProvider {
             guard AXUIElementCopyAttributeValue(
                     app, kAXWindowsAttribute as CFString, &ref) == .success,
                   let windows = ref as? [AXUIElement] else { continue }
-            for window in windows {
+            for window in windows where Self.showsMeeting(window) {
                 var budget = maxNodes
-                let tree = Self.snapshot(window, depth: 0, maxDepth: maxDepth, budget: &budget)
+                var hung = false
+                let tree = Self.snapshot(window, depth: 0, maxDepth: maxDepth,
+                                         budget: &budget, hung: &hung)
+                if hung { break }       // unresponsive: don't pay per node
                 out = out.merged(with: RosterHeuristics.roster(in: tree))
             }
         }
         return out
     }
 
+    /// Same title rule the tab probe used to flag this browser: other
+    /// windows (a dozen unrelated tabs' windows) are never walked, and never
+    /// made to build accessibility trees they did not need.
+    private static func showsMeeting(_ window: AXUIElement) -> Bool {
+        AXBrowserTabProvider.meetingSite(forTitle: string(window, kAXTitleAttribute as CFString)) != nil
+    }
+
     /// Depth- and budget-bounded lift of an AX subtree into `RosterNode`.
+    /// Sets `hung` and stops at the first message the app failed to answer in
+    /// time (`.cannotComplete`), rather than timing out once per node.
     private static func snapshot(_ element: AXUIElement, depth: Int,
-                                 maxDepth: Int, budget: inout Int) -> RosterNode {
+                                 maxDepth: Int, budget: inout Int,
+                                 hung: inout Bool) -> RosterNode {
         budget -= 1
         var node = RosterNode(role: string(element, kAXRoleAttribute as CFString),
                               title: label(element))
-        guard depth < maxDepth, budget > 0 else { return node }
+        guard depth < maxDepth, budget > 0, !hung else { return node }
         var ref: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(
-                element, kAXChildrenAttribute as CFString, &ref) == .success,
-              let kids = ref as? [AXUIElement] else { return node }
+        let status = AXUIElementCopyAttributeValue(
+            element, kAXChildrenAttribute as CFString, &ref)
+        if status == .cannotComplete { hung = true; return node }
+        guard status == .success, let kids = ref as? [AXUIElement] else { return node }
         for kid in kids {
-            if budget <= 0 { break }
-            node.children.append(snapshot(kid, depth: depth + 1,
-                                          maxDepth: maxDepth, budget: &budget))
+            if budget <= 0 || hung { break }
+            node.children.append(snapshot(kid, depth: depth + 1, maxDepth: maxDepth,
+                                          budget: &budget, hung: &hung))
         }
         return node
     }

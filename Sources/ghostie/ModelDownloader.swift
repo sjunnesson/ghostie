@@ -71,6 +71,12 @@ final class ModelDownloader: NSObject, URLSessionDataDelegate {
         var sha = SHA256()
         var fh: FileHandle
         var bytesWritten: Int64 = 0
+        /// Bytes already in `partial` from an earlier attempt, requested
+        /// past with a Range header. 0 = a fresh download.
+        var resumeOffset: Int64 = 0
+        /// The task whose events count; a superseded one (a restart after a
+        /// failed resume) is ignored when its cancellation arrives.
+        var taskId = -1
         var expectedSize: Int64 = 0
         var expectedEtag: String = ""
         var startedAt = Date()
@@ -83,6 +89,15 @@ final class ModelDownloader: NSObject, URLSessionDataDelegate {
     private var onFinish: ((Error?) -> Void)?
     private var finished = false
     private(set) var isRunning = false
+    /// The session's delegate queue. Serial, and ours, so `cancel()` can
+    /// close the file handle *on* it — closing it from main while a
+    /// `didReceive` is mid-write raised an uncatchable exception.
+    private let delegateOps: OperationQueue = {
+        let q = OperationQueue()
+        q.maxConcurrentOperationCount = 1
+        q.name = "ghostie.modeldownload"
+        return q
+    }()
 
     // MARK: - Public start variants
 
@@ -118,11 +133,13 @@ final class ModelDownloader: NSObject, URLSessionDataDelegate {
         guard isRunning else { return }
         finished = true; isRunning = false
         session?.invalidateAndCancel(); session = nil
-        if let a = current {
-            try? a.fh.close()
-            try? FileManager.default.removeItem(at: a.partial)
+        delegateOps.addOperation { [self] in
+            if let a = current {
+                try? a.fh.close()
+                try? FileManager.default.removeItem(at: a.partial)
+            }
+            current = nil
         }
-        current = nil
     }
 
     // MARK: - Queue management
@@ -146,10 +163,16 @@ final class ModelDownloader: NSObject, URLSessionDataDelegate {
         queue = needed
 
         let cfg = URLSessionConfiguration.default
-        cfg.timeoutIntervalForResource = 3600
+        // Stall detection is the idle timeout's job; the resource cap only
+        // bounds the whole transfer. An hour made large-v3 (1.08 GB)
+        // impossible below ~2.4 Mbit/s.
+        cfg.timeoutIntervalForRequest = 120
+        cfg.timeoutIntervalForResource = 24 * 3600
         cfg.waitsForConnectivity = true
-        session = URLSession(configuration: cfg, delegate: self, delegateQueue: nil)
-        next()
+        session = URLSession(configuration: cfg, delegate: self, delegateQueue: delegateOps)
+        // On the delegate queue like every later `next()`: resuming re-hashes
+        // what is already on disk, which is not work for the main thread.
+        delegateOps.addOperation { [self] in next() }
     }
 
     private static func looksAlreadyComplete(model: Model, dest: URL) -> Bool {
@@ -172,23 +195,51 @@ final class ModelDownloader: NSObject, URLSessionDataDelegate {
             at: dest.deletingLastPathComponent(), withIntermediateDirectories: true)
 
         // Stream into <dest>.partial so a crash never leaves a half-file at
-        // the final path.
+        // the final path. A `.partial` left by an interrupted attempt is
+        // resumed rather than thrown away — a dropped connection 900 MB into
+        // large-v3 used to mean starting over. Its bytes are hashed first, so
+        // the SHA-256 checked at the end still covers the whole file, and a
+        // resumed file that fails that check is deleted like any other.
+        let fm = FileManager.default
         let partial = URL(fileURLWithPath: dest.path + ".partial")
-        try? FileManager.default.removeItem(at: partial)
-        FileManager.default.createFile(atPath: partial.path, contents: nil)
-        guard let fh = try? FileHandle(forWritingTo: partial) else {
+        var sha = SHA256()
+        var resumeFrom: Int64 = 0
+        if let size = (try? fm.attributesOfItem(atPath: partial.path))?[.size] as? Int64,
+           size > 0, let rh = try? FileHandle(forReadingFrom: partial) {
+            while let chunk = try? rh.read(upToCount: 8 << 20), !chunk.isEmpty {
+                chunk.withUnsafeBytes { sha.update(bufferPointer: $0) }
+                resumeFrom += Int64(chunk.count)
+            }
+            try? rh.close()
+        } else {
+            try? fm.removeItem(at: partial)
+            fm.createFile(atPath: partial.path, contents: nil)
+        }
+        guard let fh = try? FileHandle(forWritingTo: partial),
+              (try? fh.seekToEnd()) != nil else {
             complete(NSError(domain: "ghostie", code: 1, userInfo: [
                 NSLocalizedDescriptionKey: "Could not open \(partial.lastPathComponent) for writing."
             ]))
             return
         }
 
-        current = Active(model: model, label: label, dest: dest,
-                         partial: partial, fh: fh)
-        post("Downloading \(label)… 0%")
+        var active = Active(model: model, label: label, dest: dest,
+                            partial: partial, sha: sha, fh: fh)
+        active.bytesWritten = resumeFrom
+        active.resumeOffset = resumeFrom
+        current = active
         var req = URLRequest(url: model.url)
         req.httpMethod = "GET"
-        session?.dataTask(with: req).resume()
+        if resumeFrom > 0 {
+            req.setValue("bytes=\(resumeFrom)-", forHTTPHeaderField: "Range")
+            post("Resuming \(label) from \(mbString(resumeFrom))…")
+        } else {
+            post("Downloading \(label)… 0%")
+        }
+        if let task = session?.dataTask(with: req) {
+            current?.taskId = task.taskIdentifier
+            task.resume()
+        }
     }
 
     private func complete(_ err: Error?) {
@@ -222,16 +273,52 @@ final class ModelDownloader: NSObject, URLSessionDataDelegate {
     func urlSession(_ s: URLSession, dataTask: URLSessionDataTask,
                     didReceive response: URLResponse,
                     completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
-        guard var a = current else { completionHandler(.cancel); return }
+        guard var a = current, dataTask.taskIdentifier == a.taskId else {
+            completionHandler(.cancel); return
+        }
         if let http = response as? HTTPURLResponse {
-            if http.statusCode != 200 {
+            if a.resumeOffset > 0 {
+                switch http.statusCode {
+                case 206 where Self.contentRangeStart(http) == a.resumeOffset:
+                    break                                   // resumed where we left off
+                case 200, 206, 416:
+                    // Range ignored, answered from the wrong offset, or not
+                    // satisfiable (the partial is stale or oversized): start
+                    // this file over from byte 0.
+                    Log.info("Model download: \(a.label) could not resume — starting it over.")
+                    let restart = http.statusCode == 200
+                    guard (try? a.fh.truncate(atOffset: 0)) != nil else {
+                        completionHandler(.cancel)
+                        complete(DLError.http(http.statusCode, a.label)); return
+                    }
+                    a.sha = SHA256(); a.bytesWritten = 0; a.resumeOffset = 0
+                    current = a
+                    if !restart {
+                        // No usable body on this response; ask again, fresh.
+                        completionHandler(.cancel)
+                        var req = URLRequest(url: a.model.url)
+                        req.httpMethod = "GET"
+                        let task = s.dataTask(with: req)
+                        current?.taskId = task.taskIdentifier
+                        task.resume()
+                        return
+                    }
+                default:
+                    complete(DLError.http(http.statusCode, a.label))
+                    completionHandler(.cancel); return
+                }
+            } else if http.statusCode != 200 {
                 complete(DLError.http(http.statusCode, a.label))
                 completionHandler(.cancel); return
             }
             // Fallback for non-HF mirrors: the canonical headers may sit on
             // the 200 itself. Already-captured values from the 302 win.
             captureSigningHeaders(from: http)
-            if a.expectedSize == 0 { a.expectedSize = max(0, response.expectedContentLength) }
+            if a.expectedSize == 0 {
+                a.expectedSize = http.statusCode == 206
+                    ? (Self.contentRangeTotal(http) ?? 0)
+                    : max(0, response.expectedContentLength)
+            }
             current = current ?? a   // captureSigningHeaders may have updated current
         }
         completionHandler(.allow)
@@ -251,8 +338,18 @@ final class ModelDownloader: NSObject, URLSessionDataDelegate {
 
     func urlSession(_ s: URLSession, dataTask: URLSessionDataTask,
                     didReceive data: Data) {
-        guard var a = current else { return }
-        a.fh.write(data)
+        guard !finished, var a = current, dataTask.taskIdentifier == a.taskId else { return }
+        do {
+            // Throwing API: the legacy `write(_:)` raises an ObjC exception on
+            // a full disk and took the whole app (and any live call) with it.
+            try a.fh.write(contentsOf: data)
+        } catch {
+            dataTask.cancel()
+            try? a.fh.close()
+            try? FileManager.default.removeItem(at: a.partial)
+            complete(error)
+            return
+        }
         a.bytesWritten += Int64(data.count)
         data.withUnsafeBytes { a.sha.update(bufferPointer: $0) }
         current = a
@@ -261,13 +358,17 @@ final class ModelDownloader: NSObject, URLSessionDataDelegate {
 
     func urlSession(_ s: URLSession, task: URLSessionTask,
                     didCompleteWithError error: Error?) {
+        // A task we replaced (restarting a failed resume) reports its own
+        // cancellation here; that is not the download failing.
+        if let a = current, task.taskIdentifier != a.taskId { return }
         guard !finished, let a = current else {
             if let error = error, !finished { complete(error) }
             return
         }
         if let error = error {
+            // Keep the `.partial`: the next attempt resumes from it. (A
+            // corrupt or cancelled one is removed on those paths instead.)
             try? a.fh.close()
-            try? FileManager.default.removeItem(at: a.partial)
             complete(error); return
         }
         try? a.fh.close()
@@ -307,6 +408,20 @@ final class ModelDownloader: NSObject, URLSessionDataDelegate {
         if !queue.isEmpty { queue.removeFirst() }
         current = nil
         next()
+    }
+
+    /// `Content-Range: bytes 1000-1999/5000` → 1000.
+    private static func contentRangeStart(_ http: HTTPURLResponse) -> Int64? {
+        guard let v = http.value(forHTTPHeaderField: "Content-Range"),
+              let r = v.range(of: #"bytes (\d+)-"#, options: .regularExpression) else { return nil }
+        return Int64(v[r].dropFirst(6).dropLast())
+    }
+
+    /// `Content-Range: bytes 1000-1999/5000` → 5000.
+    private static func contentRangeTotal(_ http: HTTPURLResponse) -> Int64? {
+        guard let v = http.value(forHTTPHeaderField: "Content-Range"),
+              let slash = v.lastIndex(of: "/") else { return nil }
+        return Int64(v[v.index(after: slash)...])
     }
 
     private func emitProgress() {

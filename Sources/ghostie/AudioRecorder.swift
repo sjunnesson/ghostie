@@ -122,6 +122,8 @@ final class AudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
     private var systemAnchor = TrackAnchor()
     /// ~100 ms at the output rate; lags beyond this get silence-padded.
     private var maxLagSamples: Int { outputSampleRate / 10 }
+    /// A lag past this is a clock discontinuity, not missing audio.
+    private let maxPlausibleGapSeconds: Double = 120
 
     // MARK: - Mic liveness watchdog
     //
@@ -146,10 +148,21 @@ final class AudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
     //           Echo may return, and `EchoSuppressor` handles that at text level.
     //   300 s → nothing works (permission, hardware); say so once, loudly.
     //
-    /// Guards the two liveness latches, which are written from the sample
-    /// queues and read from the watchdog queue and stop().
+    // A track that *had* signal and then went digitally silent mid-call is a
+    // different case (a device swap the graph did not survive, AirPods
+    // reconnecting) and gets its own, gentler ladder: rebuild the graph after
+    // 60 s of zeros, up to `micMidCallRebuildLimit` times two minutes apart,
+    // and never switch to the raw tap — a user who muted their headset also
+    // produces zeros, and trading their echo cancellation for the rest of the
+    // call to cover a mute would be the wrong trade. A system-level input
+    // mute is recognised outright and never escalates. The watchdog used to
+    // stop at the first non-zero sample, so this case went unwatched.
+    //
+    /// Guards the liveness state, which is written from the sample queues and
+    /// read from the watchdog queue and stop().
     private let signalLock = NSLock()
-    private var micEverHadSignal = false
+    /// When the "Me" track last carried a non-zero sample; nil = never.
+    private var micLastSignalAt: Date?
     private var systemEverHadSignal = false
 
     private var watchdog: DispatchSourceTimer?
@@ -158,6 +171,12 @@ final class AudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
     private var streamConfig: SCStreamConfiguration?
     private var micEscalation = 0
     private var deadMicReported = false
+    /// Mid-call silence ladder (watchdogQueue-owned); see above.
+    private var micMidCallAlarm = false
+    private var micMidCallRebuilds = 0
+    private var micMidCallLastRebuildAt: Date?
+    private let micMidCallRebuildLimit = 3
+    private let micMidCallRebuildSpacing: Double = 120
 
     /// How long to wait at startup for the voice-processed path to prove it
     /// is alive. A healthy graph latches on its first buffer (~20 ms), so this
@@ -243,24 +262,19 @@ final class AudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
         return cap.hasEverHadSignal
     }
 
-    /// Latches "this track has carried real audio". Written from the sample
-    /// queues; the scan costs one pass over the first non-silent buffer and
-    /// nothing thereafter. Realignment padding bypasses this (it is appended
-    /// below `ingest*`), so inserted silence can never latch a dead track.
+    /// Records that a track carried real audio. Written from the sample
+    /// queues. The system track latches once; the mic keeps a timestamp so
+    /// the watchdog can see it go silent mid-call (the scan stops at the
+    /// first non-zero sample, which on a live mic is the first one).
+    /// Realignment padding bypasses this (it is appended below `ingest*`), so
+    /// inserted silence can never count as signal.
     private func noteSignal(_ samples: [Int16], mic: Bool) {
-        let already = signalLock.withLock { mic ? micEverHadSignal : systemEverHadSignal }
-        guard !already, samples.contains(where: { $0 != 0 }) else { return }
+        if !mic, signalLock.withLock({ systemEverHadSignal }) { return }
+        guard samples.contains(where: { $0 != 0 }) else { return }
+        let now = Date()
         signalLock.withLock {
-            if mic { micEverHadSignal = true } else { systemEverHadSignal = true }
+            if mic { micLastSignalAt = now } else { systemEverHadSignal = true }
         }
-    }
-
-    /// Re-anchors the "Me" track's PTS clock after the mic source changes.
-    /// A new source starts a fresh timeline, so without this the next buffer
-    /// would look hours late and `realignmentPaddingLocked` would inject a
-    /// correspondingly enormous block of silence.
-    private func reanchorMicTrack() {
-        bufferQueue.async { [self] in micAnchor = TrackAnchor() }
     }
 
     private func startMicWatchdog() {
@@ -280,16 +294,18 @@ final class AudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
         }
     }
 
-    /// Runs on `watchdogQueue` every 5 s until the "Me" track proves itself.
-    /// See the escalation ladder documented with the liveness state above.
+    /// Runs on `watchdogQueue` every 5 s for the whole call. See the two
+    /// escalation ladders documented with the liveness state above.
     private func checkMicLiveness() {
-        let (micOK, sysOK) = signalLock.withLock {
-            (micEverHadSignal, systemEverHadSignal)
+        let (lastSignal, sysOK) = signalLock.withLock {
+            (micLastSignalAt, systemEverHadSignal)
         }
-        if micOK {
-            if micEscalation > 0 { Log.ok("'Me' track is receiving audio again.") }
-            watchdog?.cancel()
-            watchdog = nil
+        if let lastSignal {
+            if micEscalation > 0 {
+                Log.ok("'Me' track is receiving audio again.")
+                micEscalation = 0
+            }
+            checkMidCallSilence(since: lastSignal, callHasAudio: sysOK)
             return
         }
         // Gate on the other track: before it has heard anything there is no
@@ -321,31 +337,64 @@ final class AudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
                 deadMicReported = true
                 Log.error("'Me' track has recorded no audio at all after \(Int(elapsed))s — this call will be transcribed from the other participants only. Check System Settings ▸ Privacy & Security ▸ Microphone, and which input device is selected.")
             }
-            watchdog?.cancel()
-            watchdog = nil
+            // The timer keeps running: if the mic comes back, the mid-call
+            // ladder takes over from here.
         }
+    }
+
+    /// The "Me" track carried audio once and has been digitally silent since
+    /// `since`. Rebuild-only; see the liveness notes above for why this never
+    /// falls back to the raw tap.
+    private func checkMidCallSilence(since: Date, callHasAudio: Bool) {
+        let silentFor = Date().timeIntervalSince(since)
+        guard silentFor >= micRebuildAfterSeconds else {
+            if micMidCallAlarm {
+                Log.ok("'Me' track is receiving audio again.")
+                micMidCallAlarm = false
+                micMidCallRebuilds = 0
+                micMidCallLastRebuildAt = nil
+            }
+            return
+        }
+        // Muted at the system level (menu bar, AirPods): zeros are expected.
+        guard callHasAudio, !AVAudioApplication.shared.isInputMuted else { return }
+        guard let cap = micCapture else {
+            if !micMidCallAlarm {
+                micMidCallAlarm = true
+                Log.warn("'Me' track (raw microphone tap) has been digitally silent for \(Int(silentFor))s — the input device may have gone away. Check which input device is selected.")
+            }
+            return
+        }
+        if let last = micMidCallLastRebuildAt,
+           Date().timeIntervalSince(last) < micMidCallRebuildSpacing { return }
+        guard micMidCallRebuilds < micMidCallRebuildLimit else { return }
+        micMidCallAlarm = true
+        micMidCallRebuilds += 1
+        micMidCallLastRebuildAt = Date()
+        Log.warn("'Me' track has been digitally silent for \(Int(silentFor))s after carrying audio — rebuilding the voice-processing mic graph (\(micMidCallRebuilds)/\(micMidCallRebuildLimit)).")
+        cap.restart(reason: "the 'Me' track went silent mid-call")
     }
 
     /// Last resort: drop voice processing and switch the *live* SCStream over
     /// to its raw microphone tap. Echo can return on the "Me" track — that is
     /// what `EchoSuppressor` is for, and a track with echo is recoverable
     /// where a silent one is not.
-    private func switchToRawMicTap() {
+    private func switchToRawMicTap(because reason: String? = nil) {
         guard let cap = micCapture else { return }
         guard let cfg = streamConfig,
               let s = stateLock.withLock({ stream }) else {
             Log.error("'Me' track is silent and the raw microphone tap is unavailable — the local side of this call cannot be recovered.")
             return
         }
-        Log.warn("Voice-processed mic still silent after \(Int(micFallbackAfterSeconds))s and \(cap.rebuildCount) rebuild(s) — switching the 'Me' track to the raw ScreenCaptureKit tap. Speaker echo may appear on that track; the transcript's echo guard removes it.")
+        Log.warn("\(reason ?? "Voice-processed mic still silent after \(Int(micFallbackAfterSeconds))s and \(cap.rebuildCount) rebuild(s)") — switching the 'Me' track to the raw ScreenCaptureKit tap. Speaker echo may appear on that track; the transcript's echo guard removes it.")
         cap.stop()
         micCapture = nil
         cfg.captureMicrophone = true
-        Task { [weak self] in
-            guard let self else { return }
+        Task {
             do {
+                // No re-anchor: the raw tap stamps on the same host clock,
+                // so the switch-over gap is real time and gets padded.
                 try await s.updateConfiguration(cfg)
-                self.reanchorMicTrack()
                 Log.info("'Me' track switched to the raw microphone tap.")
             } catch {
                 Log.error("Could not switch the 'Me' track to the raw microphone tap: \(error.localizedDescription).")
@@ -386,7 +435,13 @@ final class AudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
                 guard let self else { return }
                 self.micQueue.async { self.ingestMic(samples, pts: pts) }
             }
-            cap.onRebuilt = { [weak self] in self?.reanchorMicTrack() }
+            cap.onRebuildFailed = { [weak self] in
+                guard let self else { return }
+                self.watchdogQueue.async {
+                    self.micEscalation = max(self.micEscalation, 2)
+                    self.switchToRawMicTap(because: "The voice-processing mic graph could not be rebuilt")
+                }
+            }
             do {
                 try cap.start()
                 micCapture = cap
@@ -407,7 +462,6 @@ final class AudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
             cap.stop()
             micCapture = nil
             micQueue.sync { }
-            reanchorMicTrack()
         } else if micCapture != nil {
             Log.info("Mic capture: voice-processed (echo-cancelled), signal confirmed.")
         }
@@ -535,6 +589,9 @@ final class AudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
         guard let dir = sessionDir,
               let mic = micWriter?.url,
               let sys = systemWriter?.url else { return nil }
+        // Finalized audio now exists on disk; if Ghostie dies before the
+        // pipeline turns it into a note, the launch sweep finds it by this.
+        Pipeline.markPending(dir)
         return Result(sessionDir: dir, micWav: mic, systemWav: sys, duration: dur)
     }
 
@@ -693,11 +750,48 @@ final class AudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
             anchor.firstPTS = pts
             return nil
         }
-        let expected = Int(((pts - first) * Double(outputSampleRate)).rounded())
-        let lag = expected - anchor.samples
-        guard lag > maxLagSamples else { return nil }
-        Log.warn("'\(track)' track fell \(String(format: "%.2f", Double(lag) / Double(outputSampleRate)))s behind its capture clock (dropped buffers or conversion failure) — inserting silence to re-align.")
-        return [Int16](repeating: 0, count: lag)
+        switch Self.realignment(firstPTS: first, accounted: anchor.samples, pts: pts,
+                                rate: outputSampleRate, maxLag: maxLagSamples,
+                                maxGapSeconds: maxPlausibleGapSeconds) {
+        case .none:
+            return nil
+        case .rebase(let newFirst):
+            let jump = (pts - first) - Double(anchor.samples) / Double(outputSampleRate)
+            anchor.firstPTS = newFirst
+            Log.warn("'\(track)' track's capture clock jumped (\(String(format: "%.1f", jump))s) — continuing without padding.")
+            return nil
+        case .pad(let lag):
+            Log.warn("'\(track)' track fell \(String(format: "%.2f", Double(lag) / Double(outputSampleRate)))s behind its capture clock (dropped buffers, conversion failure or a mic source change) — inserting silence to re-align.")
+            return [Int16](repeating: 0, count: lag)
+        }
+    }
+
+    enum Realignment: Equatable {
+        case none
+        /// Insert this many samples of silence.
+        case pad(Int)
+        /// Timeline discontinuity: move the anchor, pad nothing.
+        case rebase(firstPTS: Double)
+    }
+
+    /// The pure core of `realignmentPaddingLocked`; internal for the selftest.
+    ///
+    /// Every source here (SCK audio, SCK mic, the voice-processed mic) stamps
+    /// on the host clock, so a mic rebuild or a switch to the raw tap leaves a
+    /// gap that is real time — padded, keeping "Me" aligned with
+    /// "Participants". (It used to re-anchor on every source change, dropping
+    /// that gap: each device swap moved the Me track ~1–2 s earlier, and the
+    /// shifts added up.) A jump no gap explains, or a clock that went
+    /// backwards, is a timeline discontinuity instead: continue from where
+    /// the track is rather than pad for it.
+    static func realignment(firstPTS: Double, accounted: Int, pts: Double, rate: Int,
+                            maxLag: Int, maxGapSeconds: Double) -> Realignment {
+        let expected = Int(((pts - firstPTS) * Double(rate)).rounded())
+        let lag = expected - accounted
+        if pts < firstPTS || Double(lag) / Double(rate) > maxGapSeconds {
+            return .rebase(firstPTS: pts - Double(accounted) / Double(rate))
+        }
+        return lag > maxLag ? .pad(lag) : .none
     }
 
     private func appendMicLocked(_ samples: [Int16]) {

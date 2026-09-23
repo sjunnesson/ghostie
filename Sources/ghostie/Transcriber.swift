@@ -73,36 +73,44 @@ struct Transcriber {
             args += ["--vad", "--vad-model", config.vadModel]
         }
         proc.arguments = args
-        let pipe = Pipe()
-        proc.standardOutput = pipe
-        proc.standardError = pipe
 
         Log.info("Transcribing \(speaker) track…")
-        try proc.run()
-        // Drain the pipe BEFORE waiting: whisper-cli prints the transcript to
-        // stdout, so on long calls it fills the ~64 KB pipe buffer and blocks
-        // on write — waitUntilExit() would then never return.
-        let outData = pipe.fileHandleForReading.readDataToEndOfFile()
-        proc.waitUntilExit()
-        guard proc.terminationStatus == 0 else {
-            let out = String(data: outData, encoding: .utf8) ?? ""
+        // `runWatched` drains the pipe while waiting (whisper-cli prints the
+        // transcript to stdout and would block on a full pipe) and kills a
+        // decode that has hung.
+        let (status, out) = try runWatched(proc, timeout: Self.timeout(for: wav))
+        guard status == 0 else {
             throw NSError(domain: "ghostie", code: 3, userInfo: [
-                NSLocalizedDescriptionKey: "whisper exited \(proc.terminationStatus): \(out)"
+                NSLocalizedDescriptionKey: "whisper exited \(status): \(out)"
             ])
         }
 
         let jsonURL = URL(fileURLWithPath: prefix + ".json")
-        return Self.parse(jsonURL)
+        return try Self.parse(jsonURL)
+    }
+
+    /// Budget for one whisper-cli pass over `wav`: four times its length, and
+    /// never under 15 minutes. Measured decode speed is ~0.18× real time
+    /// (10.6 s per audio minute on large-v3), so this only trips on a decode
+    /// that has stopped making progress — which then throws, and the call
+    /// goes to the backlog instead of wedging the pipeline queue.
+    static func timeout(for wav: URL) -> TimeInterval {
+        let bytes = (try? FileManager.default.attributesOfItem(atPath: wav.path))?[.size] as? Int ?? 0
+        let seconds = Double(max(0, bytes - 44)) / 32_000   // 16 kHz mono Int16
+        return max(15 * 60, 4 * seconds)
     }
 
     /// Parses whisper.cpp's JSON output. Schema:
     /// { "transcription": [ { "offsets": { "from": <ms>, ... }, "text": "..." } ] }
-    static func parse(_ url: URL) -> [Segment] {
-        guard let data = try? Data(contentsOf: url),
-              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let items = root["transcription"] as? [[String: Any]] else {
-            return []
-        }
+    ///
+    /// Throws when the file is missing or is not that shape. whisper-cli
+    /// ignores its JSON writer's result, so a full disk exits 0 with a
+    /// truncated file or none; reading that as "no speech" wrote a "No speech
+    /// detected" note and deleted the recording. Silence is a *present*
+    /// `"transcription": []` (checked against whisper-cli 1.8 with and
+    /// without `--vad`), and still parses to no segments.
+    static func parse(_ url: URL) throws -> [Segment] {
+        let items = try transcriptionItems(url)
         var segments: [Segment] = []
         for item in items {
             let text = (item["text"] as? String)?
@@ -117,5 +125,20 @@ struct Transcriber {
                                     endMs: to.map { max($0, from) }))
         }
         return segments
+    }
+
+    /// The `transcription` array of a whisper-cli `-oj` file. Throws when the
+    /// file is absent or unreadable as that shape — see `parse`.
+    static func transcriptionItems(_ url: URL) throws -> [[String: Any]] {
+        guard let data = try? Data(contentsOf: url) else {
+            throw NSError(domain: "ghostie", code: 3, userInfo: [
+                NSLocalizedDescriptionKey: "whisper wrote no output at \(url.lastPathComponent)"])
+        }
+        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let items = root["transcription"] as? [[String: Any]] else {
+            throw NSError(domain: "ghostie", code: 3, userInfo: [
+                NSLocalizedDescriptionKey: "whisper output \(url.lastPathComponent) is truncated or malformed"])
+        }
+        return items
     }
 }

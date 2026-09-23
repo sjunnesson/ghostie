@@ -160,16 +160,27 @@ final class ORTSession {
             throw ORTError.failed(
                 "shape \(dims) does not describe \(data.count) values")
         }
+        // ORT wraps the caller's buffer without copying it, so the tensor is
+        // only valid while that buffer is borrowed: create it, run it and
+        // copy the output out all inside the one borrow. (It used to escape
+        // `withUnsafeMutableBytes`, which also copied the whole input.)
+        return try data.withUnsafeBufferPointer { buf in
+            try run(tensorData: UnsafeMutableRawPointer(mutating: buf.baseAddress!),
+                    byteCount: buf.count * MemoryLayout<Float>.stride, shape: dims)
+        }
+    }
+
+    /// `data` must stay valid for the whole call — ORT reads it during `Run`.
+    /// It is never written: inputs are read-only to the session.
+    private func run(tensorData: UnsafeMutableRawPointer, byteCount: Int,
+                     shape dims: [Int64]) throws -> [Float] {
         var input: OpaquePointer?
         var shape = dims
-        var data = data
-        let created = data.withUnsafeMutableBytes { buf in
-            shape.withUnsafeMutableBufferPointer { dims in
-                check(api, api.pointee.CreateTensorWithDataAsOrtValue(
-                    memoryInfo, buf.baseAddress, buf.count,
-                    dims.baseAddress, dims.count,
-                    ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &input))
-            }
+        let created = shape.withUnsafeMutableBufferPointer { dims in
+            check(api, api.pointee.CreateTensorWithDataAsOrtValue(
+                memoryInfo, tensorData, byteCount,
+                dims.baseAddress, dims.count,
+                ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &input))
         }
         guard created, input != nil else { throw ORTError.failed("could not create input tensor") }
         defer { api.pointee.ReleaseValue(input) }

@@ -74,8 +74,7 @@ struct CodeSwitchTranscriber {
         defer { lid.shutdown() }
         let seg = LanguageSegmenter(config: config, installed: installed, identifier: lid)
 
-        let meSegs = try seg.segments(for: me)
-        let partSegs = try seg.segments(for: participants)
+        let (meSegs, partSegs) = try segmentBoth(seg, me: me, participants: participants)
         if meSegs.isEmpty && partSegs.isEmpty { return ([], []) }
 
         // Read each track's PCM once here and thread it through detect → snap →
@@ -277,7 +276,11 @@ struct CodeSwitchTranscriber {
         // The track's loudness over time, so each run is spliced down to the
         // parts that carry speech. One pass over PCM already in memory.
         let voice = cs.decodeSpeechOnly ? WavLevel.envelope(pcm: pcm) : nil
-        let scratch = URL(fileURLWithPath: "\(NSHomeDirectory())/.ghostie/scratch")
+        // Filed under this process's PID so `sweepScratch` can tell a crashed
+        // run's leftovers from a live one's (the app and a `ghostie process`
+        // run can decode at the same time).
+        let scratch = Self.scratchRoot.appendingPathComponent(
+            "\(ProcessInfo.processInfo.processIdentifier)")
             .appendingPathComponent(callID)
         try? FileManager.default.createDirectory(at: scratch,
                                                  withIntermediateDirectories: true)
@@ -357,25 +360,63 @@ struct CodeSwitchTranscriber {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: config.whisperBinary)
         p.arguments = args
-        let pipe = Pipe()
-        p.standardOutput = pipe
-        p.standardError = pipe
         Log.info("Decoding \(language) run-batch (\(wav.lastPathComponent))…")
-        do { try p.run() } catch {
+        let status: Int32, out: String
+        do {
+            (status, out) = try runWatched(p, timeout: Transcriber.timeout(for: wav))
+        } catch {
             throw CSError.whisperFailed(-1, error.localizedDescription)
         }
-        let outData = pipe.fileHandleForReading.readDataToEndOfFile()
-        p.waitUntilExit()
-        guard p.terminationStatus == 0 else {
-            throw CSError.whisperFailed(p.terminationStatus,
-                                        String(data: outData, encoding: .utf8) ?? "")
-        }
-        let segs = Transcriber.parse(URL(fileURLWithPath: prefix + ".json"))
-        try? FileManager.default.removeItem(atPath: prefix + ".json")
+        guard status == 0 else { throw CSError.whisperFailed(status, out) }
+        defer { try? FileManager.default.removeItem(atPath: prefix + ".json") }
+        let segs = try Transcriber.parse(URL(fileURLWithPath: prefix + ".json"))
         return segs
     }
 
     // MARK: Helpers
+
+    /// The VAD pass over both tracks. It only needs offsets, so it runs on the
+    /// smallest installed model, and when that model is small the two tracks
+    /// are segmented at the same time — two independent whisper-cli processes
+    /// over different files. With only a large model installed they stay in
+    /// series: two resident large models is exactly the peak-RAM spike the
+    /// serial decode exists to avoid.
+    private func segmentBoth(_ seg: LanguageSegmenter, me: URL, participants: URL)
+        throws -> ([VADSegment], [VADSegment]) {
+        let model = LanguageSegmenter.resolveSegmentationModel(config: config,
+                                                               installed: installed)
+        let bytes = (try? FileManager.default.attributesOfItem(atPath: model))?[.size] as? Int64 ?? .max
+        guard bytes <= Self.concurrentVADModelBytes else {
+            return (try seg.segments(for: me), try seg.segments(for: participants))
+        }
+        var meResult: Result<[VADSegment], Error> = .success([])
+        let group = DispatchGroup()
+        DispatchQueue.global(qos: .userInitiated).async(group: group) {
+            meResult = Result { try seg.segments(for: me) }
+        }
+        let partResult = Result { try seg.segments(for: participants) }
+        group.wait()       // both finish before either error is thrown
+        return (try meResult.get(), try partResult.get())
+    }
+
+    /// Up to this size (base/small-class models) the two VAD passes overlap.
+    static let concurrentVADModelBytes: Int64 = 600_000_000
+
+    static let scratchRoot = URL(fileURLWithPath: "\(NSHomeDirectory())/.ghostie/scratch")
+
+    /// Remove scratch left by processes that are gone — a crash mid-decode
+    /// skips the `defer` that normally clears it, and stitched run-batches of
+    /// a long call are hundreds of MB. Live processes' folders are kept.
+    static func sweepScratch() {
+        let fm = FileManager.default
+        guard let names = try? fm.contentsOfDirectory(atPath: scratchRoot.path) else { return }
+        for name in names {
+            // Anything not named by a live PID (including the pre-per-process
+            // loose files) is stale.
+            if let pid = pid_t(name), kill(pid, 0) == 0 || errno == EPERM { continue }
+            try? fm.removeItem(at: scratchRoot.appendingPathComponent(name))
+        }
+    }
 
     private func preflightModels() throws {
         let active = languages

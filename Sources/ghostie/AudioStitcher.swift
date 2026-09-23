@@ -46,10 +46,12 @@ struct AudioStitcher {
 
     enum StitchError: Error, LocalizedError {
         case unreadable(URL)
+        case unwritable(URL)
         case noRuns
         var errorDescription: String? {
             switch self {
             case .unreadable(let u): return "could not read PCM from \(u.lastPathComponent)"
+            case .unwritable(let u): return "could not write \(u.lastPathComponent)"
             case .noRuns: return "no language runs to stitch"
             }
         }
@@ -159,17 +161,26 @@ struct AudioStitcher {
         }
 
         let padBytes = Data(count: max(0, silencePadMs) * sampleRate / 1000 * bytesPerSample)
-        var body = Data()
         var entries: [OffsetEntry] = []
         let sorted = runs.sorted { $0.startMs < $1.startMs }
+        let spansPerRun = sorted.map { Self.spans(for: $0, voice: voice) }
 
-        for (i, run) in sorted.enumerated() {
-            for span in Self.spans(for: run, voice: voice) {
+        // Sized up front: a run-batch of a two-hour track is ~200 MB, and
+        // growing `body` span by span re-allocated and copied it repeatedly.
+        var body = Data()
+        body.reserveCapacity(spansPerRun.joined().reduce(0) { sum, span in
+            sum + max(0, sampleIndex(span.endMs) - sampleIndex(span.startMs)) * bytesPerSample
+        } + max(0, sorted.count - 1) * padBytes.count)
+
+        for (i, spans) in spansPerRun.enumerated() {
+            for span in spans {
                 let lo = sampleIndex(span.startMs) * bytesPerSample
                 let hi = sampleIndex(span.endMs) * bytesPerSample
                 guard hi > lo else { continue }
                 let stitchedStartMs = body.count / bytesPerSample * 1000 / sampleRate
-                body.append(pcm.subdata(in: lo..<hi))
+                // A slice, not `subdata`: appended straight from `pcm`
+                // without an intermediate copy.
+                body.append(pcm[(pcm.startIndex + lo)..<(pcm.startIndex + hi)])
                 let stitchedEndMs = body.count / bytesPerSample * 1000 / sampleRate
                 entries.append(OffsetEntry(stitchedStartMs: stitchedStartMs,
                                            stitchedEndMs: stitchedEndMs,
@@ -185,8 +196,16 @@ struct AudioStitcher {
 
     /// Returns the raw PCM payload of a 16-bit WAV (scans chunks; tolerant of
     /// extra chunks before `data`).
+    ///
+    /// A `data` chunk that claims 0 bytes, or more than the file holds, is
+    /// read to end of file: that is a WAV whose header was never finalized
+    /// (Ghostie killed mid-call), and trusting the 0 read an hour of audio as
+    /// empty — while `WavLevel`, which reads to EOF, saw all of it.
     static func readPCM(_ url: URL) throws -> Data {
-        guard let data = try? Data(contentsOf: url), data.count > 44 else {
+        // Mapped, so the only resident copy is the payload `subdata` makes —
+        // not the whole file plus that copy (~460 MB at peak on a 2 h track).
+        guard let data = try? Data(contentsOf: url, options: .alwaysMapped),
+              data.count > 44 else {
             throw StitchError.unreadable(url)
         }
         func tag(_ off: Int) -> String {
@@ -205,7 +224,8 @@ struct AudioStitcher {
             let size = u32(p + 4)
             let start = p + 8
             if id == "data" {
-                let end = min(data.count, start + size)
+                let end = size == 0 || start + size > data.count
+                    ? data.count : start + size
                 return data.subdata(in: start..<end)
             }
             p = start + size + (size & 1)   // chunks are word-aligned
@@ -299,6 +319,14 @@ struct AudioStitcher {
         le32(UInt32(sampleRate)); le32(UInt32(byteRate))
         le16(UInt16(channels * bits / 8)); le16(UInt16(bits))
         a("data"); le32(UInt32(pcm.count))
-        try (h + pcm).write(to: url)
+        // Header then body through one handle — `h + pcm` made a third full
+        // copy of the audio just to write it.
+        guard FileManager.default.createFile(atPath: url.path, contents: h),
+              let fh = try? FileHandle(forWritingTo: url) else {
+            throw StitchError.unwritable(url)
+        }
+        defer { try? fh.close() }
+        try fh.seekToEnd()
+        try fh.write(contentsOf: pcm)
     }
 }

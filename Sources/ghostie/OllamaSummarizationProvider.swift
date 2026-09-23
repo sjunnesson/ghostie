@@ -204,26 +204,34 @@ struct OllamaSummarizationProvider: SummarizationProvider {
         cfg.timeoutIntervalForResource = timeout
         let session = URLSession(configuration: cfg)
         let sem = DispatchSemaphore(value: 0)
-        var result: Result<(Data, HTTPURLResponse), Error> =
-            .failure(NSError(domain: "ghostie", code: 99,
-                             userInfo: [NSLocalizedDescriptionKey: "no response"]))
+        let lock = NSLock()
+        var result: Result<(Data, HTTPURLResponse), Error>?
         let task = session.dataTask(with: request) { data, response, error in
+            let r: Result<(Data, HTTPURLResponse), Error>
             if let error {
-                result = .failure(error)
+                r = .failure(error)
             } else if let http = response as? HTTPURLResponse {
-                result = .success((data ?? Data(), http))
+                r = .success((data ?? Data(), http))
             } else {
-                result = .failure(NSError(domain: "ghostie", code: 98, userInfo: [
+                r = .failure(NSError(domain: "ghostie", code: 98, userInfo: [
                     NSLocalizedDescriptionKey: "Unexpected response from Ollama."
                 ]))
             }
+            lock.withLock { result = r }
             sem.signal()
         }
         task.resume()
         // Wait a bit beyond the per-request timeout so URLSession can fire its
         // own timeout error instead of us racing it.
-        _ = sem.wait(timeout: .now() + timeout + 5)
-        session.finishTasksAndInvalidate()
-        return result
+        if sem.wait(timeout: .now() + timeout + 5) == .timedOut {
+            // Cancel rather than let it finish: Ollama would otherwise keep
+            // generating on the GPU while the retry queues up behind it.
+            session.invalidateAndCancel()
+        } else {
+            session.finishTasksAndInvalidate()
+        }
+        return lock.withLock { result } ?? .failure(NSError(
+            domain: "ghostie", code: 99,
+            userInfo: [NSLocalizedDescriptionKey: "Ollama did not answer within \(Int(timeout)) s."]))
     }
 }

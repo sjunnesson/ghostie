@@ -410,7 +410,11 @@ struct Config: Codable {
         let dir = (Config.configPath as NSString).deletingLastPathComponent
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
         guard let data = try? enc.encode(self) else { return false }
-        return (try? data.write(to: URL(fileURLWithPath: Config.configPath))) != nil
+        // Atomic: a plain write truncates in place, and a reader that lands
+        // mid-write (or a crash) sees a torn file, which `loadRaw` reads as
+        // defaults — and the next save makes that permanent.
+        return (try? data.write(to: URL(fileURLWithPath: Config.configPath),
+                                options: .atomic)) != nil
     }
 
     static func load() -> Config {
@@ -585,7 +589,7 @@ struct Config: Codable {
         // Write pristine defaults — never persist auto-detected binary paths,
         // so resolution (incl. the bundled binary) re-runs on every machine.
         if let data = try? enc.encode(Config()) {
-            try? data.write(to: URL(fileURLWithPath: Config.configPath))
+            try? data.write(to: URL(fileURLWithPath: Config.configPath), options: .atomic)
         }
     }
 }

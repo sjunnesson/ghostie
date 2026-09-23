@@ -76,3 +76,24 @@ protocol MeetingWindowProvider: AnyObject {
     @discardableResult
     func promptForPermissionIfNeeded() -> Bool
 }
+
+/// Lets a provider's `deinit` drain its listener queue without deadlocking
+/// when that `deinit` is itself running *on* the queue — which happens when a
+/// listener block's temporary `self?` reference turns out to be the last one
+/// (the coordinator was dropped mid-callback). `sync` onto the current queue
+/// traps in libdispatch.
+enum ListenerQueues {
+    private static let key = DispatchSpecificKey<ObjectIdentifier>()
+
+    static func make(label: String) -> DispatchQueue {
+        let q = DispatchQueue(label: label)
+        q.setSpecific(key: key, value: ObjectIdentifier(q))
+        return q
+    }
+
+    /// Wait out any in-flight block on `queue`, unless we are that block.
+    static func drain(_ queue: DispatchQueue) {
+        guard DispatchQueue.getSpecific(key: key) != ObjectIdentifier(queue) else { return }
+        queue.sync { }
+    }
+}

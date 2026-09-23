@@ -65,6 +65,8 @@ struct ClaudeSummarizationProvider: SummarizationProvider {
                 NSLocalizedDescriptionKey: "Could not launch claude: \(error.localizedDescription)"
             ])
         }
+        ChildProcesses.register(proc)
+        defer { ChildProcesses.unregister(proc) }
 
         // All pipe I/O happens on background queues so the only thing this
         // thread ever blocks on is the watchdog below. Inline reads/writes

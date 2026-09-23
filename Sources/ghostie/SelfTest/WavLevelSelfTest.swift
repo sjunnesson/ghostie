@@ -113,6 +113,41 @@ func runWavLevelSelfTest() -> Bool {
         check("envelope fixtures", false, "could not write or read fixtures")
     }
 
+    // ---- WAV I/O resilience: a recording cut off before `close()`.
+    let cut = dir.appendingPathComponent("cut.wav")
+    if let w = WavWriter(url: cut) {
+        for _ in 0..<25 { w.append([Int16](repeating: 100, count: 16_000)) }
+        // Not closed: this is the file a crash or kill mid-call leaves.
+        let bytes = (try? Data(contentsOf: cut)) ?? Data()
+        let claimed = bytes.count >= 44
+            ? bytes[40..<44].enumerated().reduce(0) { $0 | Int($1.element) << (8 * $1.offset) } : -1
+        check("an unclosed WAV's header covers audio up to the last patch",
+              claimed == 20 * 32_000, "data size \(claimed), want \(20 * 32_000)")
+        w.close()
+    } else {
+        check("cut.wav fixture", false, "could not open a WavWriter")
+    }
+    if var bytes = try? Data(contentsOf: cut), bytes.count > 44 {
+        bytes.replaceSubrange(4..<8, with: [0, 0, 0, 0])
+        bytes.replaceSubrange(40..<44, with: [0, 0, 0, 0])
+        let zeroed = dir.appendingPathComponent("zeroed.wav")
+        try? bytes.write(to: zeroed)
+        let pcm = try? AudioStitcher.readPCM(zeroed)
+        check("readPCM reads a never-finalized header (data size 0) to end of file",
+              pcm?.count == 25 * 32_000, "got \(pcm?.count ?? -1) bytes")
+    }
+
+    // ---- whisper output: an empty result is not the same as no result.
+    let json = dir.appendingPathComponent("w.json")
+    try? Data(#"{"transcription":[]}"#.utf8).write(to: json)
+    check("whisper JSON with no segments parses to no speech",
+          (try? Transcriber.parse(json))?.isEmpty == true)
+    try? Data(#"{"transcription":[{"offsets":{"from":0,"to":2000},"text":" Hi"#.utf8).write(to: json)
+    check("truncated whisper JSON throws instead of reading as silence",
+          (try? Transcriber.parse(json)) == nil)
+    check("missing whisper JSON throws instead of reading as silence",
+          (try? Transcriber.parse(dir.appendingPathComponent("absent.json"))) == nil)
+
     print("WavLevel self-test: \(passed) passed, \(failed) failed")
     return failed == 0
 }

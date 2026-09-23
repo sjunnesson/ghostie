@@ -13,7 +13,7 @@ import CoreAudio
 /// quiescence and had to ride the plain 30 s end grace.
 final class CoreAudioDefaultDeviceProvider: DefaultInputDeviceProvider {
 
-    private let listenerQueue = DispatchQueue(label: "ghostie.defaultdevice")
+    private let listenerQueue = ListenerQueues.make(label: "ghostie.defaultdevice")
     private let fanout = ChangeFanout()
     private var teardowns: [() -> Void] = []
 
@@ -47,7 +47,7 @@ final class CoreAudioDefaultDeviceProvider: DefaultInputDeviceProvider {
     }
 
     deinit {
-        listenerQueue.sync { }
+        ListenerQueues.drain(listenerQueue)
         teardowns.forEach { $0() }
     }
 

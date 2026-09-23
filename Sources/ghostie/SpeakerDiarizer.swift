@@ -1,3 +1,4 @@
+import Accelerate
 import Foundation
 
 /// Splits one track into individual speakers.
@@ -118,17 +119,32 @@ struct SpeakerDiarizer {
               segments.count > 1 else { return nil }
 
         // ---- 1 + 2: one embedding per segment, averaged over its windows.
-        var embeddings: [[Float]?] = []
-        var durations: [Float] = []
-        for (i, seg) in segments.enumerated() {
-            let endMs = seg.endMs ?? (i + 1 < segments.count
-                                      ? segments[i + 1].startMs
-                                      : seg.startMs + SpeakerEmbedder.windowMs)
-            let (emb, seconds) = segmentEmbedding(
-                startMs: seg.startMs, endMs: endMs,
-                samples: samples, embedder: embedder)
-            embeddings.append(emb)
-            durations.append(seconds)
+        // Segments are independent, so they are embedded several at a time:
+        // the ORT session is thread-safe, Fbank keeps only per-call buffers,
+        // and each worker writes only its own slots. Striped rather than one
+        // task per segment, and at about half the cores, because each `Run`
+        // already uses `ORTSession`'s two intra-op threads. The result is the
+        // same as the serial loop it replaced, which left most of the machine
+        // idle through this stage.
+        var embeddings = [[Float]?](repeating: nil, count: segments.count)
+        var durations = [Float](repeating: 0, count: segments.count)
+        let workers = min(segments.count, max(1, ProcessInfo.processInfo.activeProcessorCount / 2))
+        embeddings.withUnsafeMutableBufferPointer { embOut in
+            durations.withUnsafeMutableBufferPointer { durOut in
+                DispatchQueue.concurrentPerform(iterations: workers) { worker in
+                    for i in stride(from: worker, to: segments.count, by: workers) {
+                        let seg = segments[i]
+                        let endMs = seg.endMs ?? (i + 1 < segments.count
+                                                  ? segments[i + 1].startMs
+                                                  : seg.startMs + SpeakerEmbedder.windowMs)
+                        let (emb, seconds) = segmentEmbedding(
+                            startMs: seg.startMs, endMs: endMs,
+                            samples: samples, embedder: embedder)
+                        embOut[i] = emb
+                        durOut[i] = seconds
+                    }
+                }
+            }
         }
 
         let indexed = embeddings.enumerated().compactMap { i, e in e.map { (i, $0) } }
@@ -183,8 +199,18 @@ struct SpeakerDiarizer {
         guard count > 0 else { return [] }
         var out = [Float](repeating: 0, count: count)
         pcm.withUnsafeBytes { raw in
-            for i in 0..<count {
-                out[i] = Float(raw.loadUnaligned(fromByteOffset: i * 2, as: Int16.self)) / 32768
+            out.withUnsafeMutableBufferPointer { dst in
+                if Int(bitPattern: raw.baseAddress) % MemoryLayout<Int16>.alignment == 0 {
+                    // Vectorized: the per-sample loop was ~115 M iterations on
+                    // a two-hour track.
+                    let src = raw.bindMemory(to: Int16.self)
+                    vDSP.convertElements(of: src.prefix(count), to: &dst)
+                    vDSP.multiply(1 / Float(32768), dst, result: &dst)
+                } else {
+                    for i in 0..<count {
+                        dst[i] = Float(raw.loadUnaligned(fromByteOffset: i * 2, as: Int16.self)) / 32768
+                    }
+                }
             }
         }
         return out
@@ -233,45 +259,53 @@ struct SpeakerDiarizer {
     /// Internal for the self-test.
     func agglomerate(_ embeddings: [[Float]]) -> [Int] {
         let n = embeddings.count
-        var cluster = Array(0..<n)
-        var members: [Int: [Int]] = Dictionary(
-            uniqueKeysWithValues: (0..<n).map { ($0, [$0]) })
-
-        // Pairwise similarity, computed once.
-        var sim = [Float](repeating: 0, count: n * n)
+        // `total[a*n+b]` is the *sum* of member-pair similarities between
+        // clusters a and b, so average linkage is `total / (size·size)` and a
+        // merge is one row addition (Lance–Williams) instead of re-summing
+        // every member pair on every pass. Double so the running sums don't
+        // drift from what summing the pairs afresh would give.
+        var total = [Double](repeating: 0, count: n * n)
         for i in 0..<n {
             for j in (i + 1)..<n {
-                let s = SpeakerEmbedder.similarity(embeddings[i], embeddings[j])
-                sim[i * n + j] = s
-                sim[j * n + i] = s
+                let s = Double(SpeakerEmbedder.similarity(embeddings[i], embeddings[j]))
+                total[i * n + j] = s
+                total[j * n + i] = s
             }
         }
-        func linkage(_ a: [Int], _ b: [Int]) -> Float {
-            var total: Float = 0
-            for i in a { for j in b { total += sim[i * n + j] } }
-            return total / Float(a.count * b.count)
-        }
+        var size = [Int](repeating: 1, count: n)
+        var members = (0..<n).map { [$0] }
+        // Live cluster ids, ascending — the scan order, and so the tie-break,
+        // the dictionary version had.
+        var alive = Array(0..<n)
 
-        while members.count > 1 {
-            var best: (a: Int, b: Int, sim: Float)?
-            let keys = members.keys.sorted()
-            for (x, a) in keys.enumerated() {
-                for b in keys[(x + 1)...] {
-                    let s = linkage(members[a]!, members[b]!)
-                    if best == nil || s > best!.sim { best = (a, b, s) }
+        while alive.count > 1 {
+            var best: (x: Int, y: Int, sim: Double)?
+            for (x, a) in alive.enumerated() {
+                for y in (x + 1)..<alive.count {
+                    let b = alive[y]
+                    let s = total[a * n + b] / Double(size[a] * size[b])
+                    if best == nil || s > best!.sim { best = (x, y, s) }
                 }
             }
             guard let best else { break }
             // Keep merging past the threshold while there are still more
             // clusters than a far end plausibly holds.
-            let distance = 1 - best.sim
-            if distance > mergeThreshold && members.count <= maxSpeakers { break }
-            members[best.a]!.append(contentsOf: members[best.b]!)
-            members[best.b] = nil
+            let distance = 1 - Float(best.sim)
+            if distance > mergeThreshold && alive.count <= maxSpeakers { break }
+            let a = alive[best.x], b = alive[best.y]
+            for c in alive where c != a && c != b {
+                total[a * n + c] += total[b * n + c]
+                total[c * n + a] = total[a * n + c]
+            }
+            size[a] += size[b]
+            members[a].append(contentsOf: members[b])
+            members[b] = []
+            alive.remove(at: best.y)
         }
 
-        for (id, group) in members.enumerated().map({ ($0.offset, $0.element.value) }) {
-            for m in group { cluster[m] = id }
+        var cluster = Array(0..<n)
+        for (id, a) in alive.enumerated() {
+            for m in members[a] { cluster[m] = id }
         }
         return cluster
     }

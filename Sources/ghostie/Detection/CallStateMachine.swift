@@ -61,7 +61,13 @@ final class CallStateMachine {
     private(set) var sessionId: UUID?
     private(set) var stageEnteredAt: VirtualTime
     private(set) var lastEvidence: CallEvidence?
+    /// The most recent `transitionHistory` transitions, oldest first. Each
+    /// carries a full `CallEvidence`, and the machine lives as long as the
+    /// app — unbounded, days of candidate flapping (a browser's mic, a Teams
+    /// mic test) only ever grew it. `transitionCount` is the lifetime total.
     private(set) var transitions: [Transition] = []
+    private(set) var transitionCount = 0
+    static let transitionHistory = 64
 
     /// Fires when candidate is promoted to confirmed.
     var onCallStart: ((UUID) -> Void)?
@@ -292,6 +298,10 @@ final class CallStateMachine {
 
         let t = Transition(from: from, to: newStage, at: at, reason: reason, evidence: evidence)
         transitions.append(t)
+        if transitions.count > Self.transitionHistory {
+            transitions.removeFirst(transitions.count - Self.transitionHistory)
+        }
+        transitionCount += 1
         onTransition?(t)
     }
 

@@ -51,6 +51,8 @@ final class CallDetector {
     /// Everyone the meeting window named during this call; empty when there
     /// was no readable roster (see `AXParticipantRosterProvider`).
     func currentRoster() -> MeetingRoster { coordinator.currentRoster() }
+    /// Where the state machine is right now (hops to the detector queue).
+    func stage() -> CallStateMachine.Stage { coordinator.stage() }
     func clearRoster() { coordinator.clearRoster() }
 
     /// System default input device id (used by `cmdDoctor`).
