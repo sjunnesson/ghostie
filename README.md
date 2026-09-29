@@ -133,16 +133,21 @@ header, no Dock icon, always watching.
 The menu bar icon reflects state (watching · ● recording 02:13 · summarizing)
 and its menu gives quick access to everything:
 
-- **Start / Stop Recording** — record without call detection (in-person
-  meetings, anything the detector doesn't cover)
+- **Start / Stop Recording** (`⌘R`) — record without call detection
+  (in-person meetings, anything the detector doesn't cover)
 - **Import Audio File…** (`⌘I`) — run a recording made elsewhere (a voice
   memo, a phone recording, an exported call: m4a, mp3, wav, mov…) through
   the same transcribe → diarize → summarize pipeline. Everyone in the file
   lands on the Participants track, you included, and the note is dated by
   the file's own creation date.
 - **Pause / Resume Listening**
-- **Open Notes Folder** · **Open Last Summary**
-- **Run 15-Second Test** (verifies the whole pipeline)
+- **Open Last Summary**
+- **Copy Last Summary & Transcript** — the same call as one markdown block on
+  the clipboard: its title, the summary, then the full transcript (read from
+  the `_transcript.md` file, so your corrections come along), ready to paste
+  into a doc, a chat or an email
+- **Run 30-Second Test** (verifies the whole pipeline)
+- **Check for Updates…**
 - **Settings…** (`⌘,`) — a real settings window for the notes folder, audio
   options, detection timing, whisper model/language/prompt, VAD, hallucination
   guard, and the summarizer (Claude CLI path & model, or the Ollama server URL
@@ -452,7 +457,7 @@ a durable backlog at `~/.ghostie/backlog/`:
 The note is still written immediately with a "⏳ queued" banner and the full
 transcript, then **upgraded in place** once processing succeeds. The backlog
 drains automatically: on launch, after every successful call, when settings
-change, and every 10 minutes. The menu shows **Process Backlog (N pending)**
+change, and every 10 minutes. The menu shows **⏳ N calls queued — Process Now**
 and `ghostie process-backlog` forces a drain. Entries that keep failing are
 given up after a few attempts with a best-effort note (never an endless queue).
 

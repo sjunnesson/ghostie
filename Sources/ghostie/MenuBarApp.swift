@@ -165,6 +165,9 @@ final class MenuBarApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         lastNoteItem = item("Open Last Summary", #selector(openLastNote))
         lastNoteItem.isEnabled = false
         menu.addItem(lastNoteItem)
+        // The same call as the item above, as one block of text for pasting
+        // into a doc, a chat or an email.
+        menu.addItem(item("Copy Last Summary & Transcript", #selector(copyLastCall)))
         menu.addItem(item("Run 30-Second Test", #selector(runTest)))
         menu.addItem(.separator())
 
@@ -329,10 +332,41 @@ final class MenuBarApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSWorkspace.shared.open(url)
     }
 
+    /// The call "Open Last Summary" and "Copy Last Summary & Transcript"
+    /// both act on, so the two neighbouring items can't disagree.
+    private var lastNoteURL: URL? {
+        engine.lastNote ?? engineLastNoteFallback ?? mostRecentNote()
+    }
+
     @objc private func openLastNote() {
-        if let n = engine.lastNote ?? engineLastNoteFallback ?? mostRecentNote() {
+        if let n = lastNoteURL {
             NSWorkspace.shared.open(n)
         }
+    }
+
+    @objc private func copyLastCall() {
+        guard let note = lastNoteURL,
+              let doc = try? String(contentsOf: note, encoding: .utf8) else {
+            notify("Nothing to copy", "No call has been summarized yet.")
+            return
+        }
+        let sidecar = note.deletingLastPathComponent().appendingPathComponent(
+            note.deletingPathExtension().lastPathComponent + "_transcript.md")
+        guard let text = TranscriptIndex.pasteableText(
+                ofNote: doc, sidecar: try? String(contentsOf: sidecar, encoding: .utf8))
+        else {
+            notify("Nothing to copy", "\(note.lastPathComponent) has no summary or transcript.")
+            return
+        }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+        // Name the call: straight after hanging up, the last *finished* call
+        // is the one before, and this is where that becomes visible.
+        var body = note.deletingPathExtension().lastPathComponent
+        if case .processing = engine.state {
+            body += " — another recording is still being processed."
+        }
+        notify("Copied summary & transcript", body)
     }
 
     @objc private func runTest() {

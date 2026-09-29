@@ -368,6 +368,10 @@ enum TranscriptIndex {
     /// `##` headings (it always does) and its own `---` rules (it may).
     static func summaryText(ofNoteAt path: String) -> String? {
         guard let doc = try? String(contentsOfFile: path, encoding: .utf8) else { return nil }
+        return summaryText(ofNote: doc)
+    }
+
+    static func summaryText(ofNote doc: String) -> String? {
         guard let firstRule = doc.range(of: "\n---\n") else { return nil }
         let afterMeta = doc[firstRule.upperBound...]
         let end = afterMeta.range(of: "\n---\n\n## Full Transcript")?.lowerBound
@@ -375,6 +379,51 @@ enum TranscriptIndex {
         let summary = afterMeta[afterMeta.startIndex..<end]
             .trimmingCharacters(in: .whitespacesAndNewlines)
         return summary.isEmpty ? nil : summary
+    }
+
+    /// The spoken record, as `Pipeline.render` wrote it. Preferred from the
+    /// `_transcript.md` sidecar, like `rebuild` — it is the transcript people
+    /// open and correct — and otherwise from the note's own copy, which is
+    /// the only one when `saveTranscript` is off. The note wraps that copy in
+    /// a `<details>` fold when a sidecar exists; the fold is for the vault,
+    /// not for whatever the text is pasted into.
+    static func transcriptText(ofNote doc: String, sidecar: String?) -> String? {
+        if let sidecar, let rule = sidecar.range(of: "\n---\n") {
+            let body = sidecar[rule.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines)
+            if !body.isEmpty { return body }
+        }
+        guard let heading = doc.range(of: "\n## Full Transcript\n") else { return nil }
+        var body = doc[heading.upperBound...]
+        if let open = body.range(of: "<summary>Inline transcript</summary>") {
+            body = body[open.upperBound...]
+            if let close = body.range(of: "</details>", options: .backwards) {
+                body = body[..<close.lowerBound]
+            }
+        }
+        let text = body.trimmingCharacters(in: .whitespacesAndNewlines)
+        return text.isEmpty ? nil : text
+    }
+
+    /// A call as one pasteable document — the note's title, the written
+    /// summary, then the transcript — for the menu's copy action. The meta
+    /// block is left out: its date is already in the title and the rest
+    /// ("Captured locally via ScreenCaptureKit") describes Ghostie, not the
+    /// call. Nil only when the note holds neither a summary nor a transcript.
+    static func pasteableText(ofNote doc: String, sidecar: String?) -> String? {
+        let summary = summaryText(ofNote: doc)
+        let transcript = transcriptText(ofNote: doc, sidecar: sidecar)
+        guard summary != nil || transcript != nil else { return nil }
+        var parts: [String] = []
+        if let title = doc.split(separator: "\n", maxSplits: 1).first,
+           title.hasPrefix("# ") {
+            parts.append(String(title))
+        }
+        if let summary { parts.append(summary) }
+        if let transcript {
+            if summary != nil { parts.append("---") }
+            parts.append("## Transcript\n\n" + transcript)
+        }
+        return parts.joined(separator: "\n\n") + "\n"
     }
 
     // MARK: Rebuilding

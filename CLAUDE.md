@@ -63,7 +63,7 @@ concurrent batching, all against a stub provider), `runEchoSuppressorSelfTest()`
 real-call echo fixtures — pure echo, mixed real+echo segments, ASR variance,
 plus the never-engage guards for headphone/solo calls), `runTranscriptIndexSelfTest()` (exercises `TranscriptIndex` — the
 round trip from `Pipeline.render` back to turns, note-name parsing, the
-note-vs-transcript filter and summary extraction),
+note-vs-transcript filter, summary extraction and the menu's copy text),
 `runMCPSetupSelfTest()` (exercises the MCP client registry — unique ids,
 per-client servers key, the copyable snippet's shape; **no client needs to be
 installed**), and

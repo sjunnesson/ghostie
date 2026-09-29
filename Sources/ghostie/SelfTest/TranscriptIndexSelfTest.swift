@@ -164,6 +164,90 @@ func runTranscriptIndexSelfTest() -> Bool {
           summary?.contains("## Decisions") == true && summary?.contains("## Context") == true,
           summary ?? "nil")
 
+    // MARK: Pasteable text (menu "Copy Last Summary & Transcript")
+
+    // `writeNote`'s layout when `saveTranscript` is on: the transcript is in
+    // the sidecar and folded inside `<details>` in the note.
+    let folded = """
+    # Zoom Call — Monday 21 Sep 2026 at 20:59
+
+    - Date: Monday 21 Sep 2026 at 20:59
+    - Duration: 50.1 minutes
+    - Captured locally via ScreenCaptureKit (no bot joined the call)
+
+    ---
+
+    ## Context
+    We talked about pricing.
+
+    ---
+
+    ## Full Transcript
+
+    [Separate file](2026-09-21_20-59-58_Zoom-Call_transcript.md)
+
+    <details><summary>Inline transcript</summary>
+
+    **[00:03] David:** Inline copy.
+
+    </details>
+
+    """
+    let sidecar = """
+    # Transcript — Monday 21 Sep 2026 at 20:59
+
+    - Date: Monday 21 Sep 2026 at 20:59
+    - Duration: 50.1 minutes
+
+    ---
+
+    **[00:03] David:** Corrected in the sidecar.
+
+    """
+    let pasted = TranscriptIndex.pasteableText(ofNote: folded, sidecar: sidecar) ?? ""
+    check("pasted text opens with the note's title",
+          pasted.hasPrefix("# Zoom Call — Monday 21 Sep 2026 at 20:59\n"), pasted)
+    check("pasted text carries summary then transcript",
+          (pasted.range(of: "We talked about pricing.")?.lowerBound).map { s in
+              pasted.range(of: "Corrected in the sidecar.").map { $0.lowerBound > s } ?? false
+          } ?? false, pasted)
+    check("pasted text prefers the sidecar transcript over the note's copy",
+          !pasted.contains("Inline copy."), pasted)
+    check("pasted text leaves out the meta block and the vault-only markup",
+          !pasted.contains("ScreenCaptureKit") && !pasted.contains("Duration:")
+              && !pasted.contains("<details>") && !pasted.contains("[Separate file]"), pasted)
+
+    let unfoldedTranscript = TranscriptIndex.transcriptText(ofNote: folded, sidecar: nil)
+    check("without a sidecar the note's folded copy is unwrapped",
+          unfoldedTranscript == "**[00:03] David:** Inline copy.", unfoldedTranscript ?? "nil")
+
+    // `saveTranscript` off: no sidecar and no fold, the transcript follows
+    // the heading directly.
+    let inline = TranscriptIndex.transcriptText(ofNote: note, sidecar: nil)
+    check("an unfolded note transcript is read after its heading",
+          inline == "**[00:03] David:** Actual speech.", inline ?? "nil")
+
+    let noSummary = TranscriptIndex.pasteableText(ofNote: """
+    # Call — Monday 21 Sep 2026 at 20:59
+
+    - Date: Monday 21 Sep 2026 at 20:59
+
+    ---
+
+
+
+    ---
+
+    ## Full Transcript
+
+    **[00:03] David:** Only speech.
+    """, sidecar: nil)
+    check("a note without a summary still copies its transcript",
+          noSummary?.contains("Only speech.") == true
+              && noSummary?.contains("## Transcript") == true, noSummary ?? "nil")
+    check("a file that is not a note has nothing to paste",
+          TranscriptIndex.pasteableText(ofNote: "Weekly planning", sidecar: nil) == nil)
+
     // MARK: Round trip through the encoder
 
     let record = TranscriptIndex.CallRecord(
