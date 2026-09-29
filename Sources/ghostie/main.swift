@@ -580,7 +580,7 @@ func cmdDoctor(_ config: Config) {
     row(diarizeOK, "speaker diarization",
         !config.diarization ? "disabled in config — the far end stays one 'Participants' label"
             : !spkModel ? "no embedding model — `ghostie fetch-models --diarization`"
-            : !ortOK ? "ONNX Runtime not found — `brew install onnxruntime`, or use a bundled build"
+            : !ortOK ? ORTRuntime.unavailableReason
             : "on — the Participants track is split per speaker")
     row(config.nameSpeakers && s.isConfigured, "speaker naming",
         !config.nameSpeakers ? "disabled in config — labels stay generic"

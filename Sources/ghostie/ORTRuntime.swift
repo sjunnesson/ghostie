@@ -39,23 +39,70 @@ final class ORTRuntime {
     /// a warning if you create more than one env). nil when no dylib is
     /// installed or the ABI handshake fails — callers treat that as "the
     /// ONNX LID is not available on this machine".
-    static let shared: ORTRuntime? = {
+    static let shared: ORTRuntime? = resolution.runtime
+
+    /// A dylib that was on disk and could not be used, with the reason.
+    struct LoadFailure: Error {
+        let path: String
+        let reason: String
+    }
+
+    /// Every candidate that existed and was refused, in lookup order. Empty
+    /// when one loaded, or when none was installed at all.
+    static var refused: [LoadFailure] { resolution.refused }
+
+    private static let resolution: (runtime: ORTRuntime?, refused: [LoadFailure]) = {
+        var refused: [LoadFailure] = []
         for path in dylibCandidates() where FileManager.default.fileExists(atPath: path) {
-            if let rt = ORTRuntime(dylibPath: path) { return rt }
+            do {
+                return (try ORTRuntime(dylibPath: path), refused)
+            } catch let failure as LoadFailure {
+                refused.append(failure)
+            } catch {
+                refused.append(LoadFailure(path: path, reason: error.localizedDescription))
+            }
         }
-        return nil
+        return (nil, refused)
     }()
+
+    /// What every "diarization is off" message says about the runtime.
+    static var unavailableReason: String { unavailableReason(refused: refused) }
+
+    /// "Not installed" and "installed but refused" need opposite advice, and
+    /// telling them apart is the point. A signed Ghostie runs under the
+    /// hardened runtime, whose library validation refuses a dylib signed by
+    /// another team — Homebrew's copy is ad-hoc signed — so on a build
+    /// without its own copy, `brew install onnxruntime` is advice that
+    /// cannot work. The 2026-09-29 call lost speaker separation that way, on
+    /// a Mac where Homebrew's runtime was installed all along.
+    static func unavailableReason(refused: [LoadFailure]) -> String {
+        guard let first = refused.first else {
+            return "ONNX Runtime not found — install it with `brew install onnxruntime`, or use a build that bundles it"
+        }
+        if first.reason.contains("different Team IDs")
+            || first.reason.contains("not valid for use in process") {
+            return "macOS refused the ONNX Runtime at \(first.path) — a signed Ghostie can only load the copy bundled inside the app, so reinstall Ghostie from a release build"
+        }
+        return "the ONNX Runtime at \(first.path) could not be loaded: \(first.reason)"
+    }
 
     let dylibPath: String
     private let api: UnsafePointer<OrtApi>
     private var env: OpaquePointer?
 
-    private init?(dylibPath: String) {
-        guard let handle = dlopen(dylibPath, RTLD_NOW | RTLD_LOCAL) else { return nil }
+    private init(dylibPath: String) throws {
+        func refuse(_ reason: String) -> LoadFailure {
+            LoadFailure(path: dylibPath, reason: reason)
+        }
+        guard let handle = dlopen(dylibPath, RTLD_NOW | RTLD_LOCAL) else {
+            throw refuse(dlerror().map { String(cString: $0) } ?? "dlopen failed")
+        }
         typealias GetApiBaseFn = @convention(c) () -> UnsafePointer<OrtApiBase>?
-        guard let sym = dlsym(handle, "OrtGetApiBase") else { return nil }
+        guard let sym = dlsym(handle, "OrtGetApiBase") else {
+            throw refuse("no OrtGetApiBase symbol — not an ONNX Runtime library")
+        }
         let getBase = unsafeBitCast(sym, to: GetApiBaseFn.self)
-        guard let base = getBase() else { return nil }
+        guard let base = getBase() else { throw refuse("OrtGetApiBase returned nothing") }
         // Ask for the exact API version the vendored header was compiled
         // against; ORT guarantees returned tables for version V match V's
         // struct layout. An older installed runtime returns NULL — walk down
@@ -67,12 +114,14 @@ final class ORTRuntime {
             table = base.pointee.GetApi(version)
             if table == nil { version -= 1 }
         }
-        guard let api = table else { return nil }
+        guard let api = table else {
+            throw refuse("API version \(ORT_API_VERSION) and every fallback down to 17 were refused — the runtime is too old")
+        }
         self.dylibPath = dylibPath
         self.api = api
         var env: OpaquePointer?
         guard check(api, api.pointee.CreateEnv(ORT_LOGGING_LEVEL_WARNING, "ghostie", &env)),
-              env != nil else { return nil }
+              env != nil else { throw refuse("CreateEnv failed") }
         self.env = env
     }
 

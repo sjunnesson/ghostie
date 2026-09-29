@@ -160,53 +160,62 @@ if [ "$SELFCONTAINED" = "1" ]; then
       -o "$MODEL_CACHE/ggml-silero-v5.1.2.bin"
   fi
   cp "$MODEL_CACHE/ggml-silero-v5.1.2.bin" "$APP/Contents/Resources/"
+fi
 
-  # Bundle the ONNX Runtime dylib. On by default since speaker diarization
-  # needs it — without it, a downloaded embedding model is inert and the far
-  # end silently stays one "Participants" label on every install that has no
-  # onnxruntime of its own. ORTRuntime.swift dlopens Contents/Frameworks first.
-  # Set GHOSTIE_BUNDLE_ORT=0 to build without it.
-  #
-  # Microsoft's official release, NOT Homebrew's: the Homebrew dylib is linked
-  # against /opt/homebrew/opt/onnx/lib/libonnx.dylib and friends, so bundling
-  # it produces an app that works only on a machine that already has Homebrew's
-  # onnxruntime — the exact machines that did not need it bundled. The official
-  # build depends on system frameworks alone. Pinned, not "latest", so a build
-  # is reproducible; ORTRuntime negotiates the API version at load.
-  if [ "${GHOSTIE_BUNDLE_ORT:-1}" = "1" ]; then
-    ORT_VERSION="${GHOSTIE_ORT_VERSION:-1.29.0}"
-    ORT_TGZ="$MODEL_CACHE/onnxruntime-osx-arm64-$ORT_VERSION.tgz"
-    ORT_LIB="$MODEL_CACHE/onnxruntime-osx-arm64-$ORT_VERSION/lib/libonnxruntime.$ORT_VERSION.dylib"
-    if [ ! -f "$ORT_LIB" ]; then
-      echo "==> Downloading ONNX Runtime $ORT_VERSION"
-      curl -fL --progress-bar \
-        "https://github.com/microsoft/onnxruntime/releases/download/v$ORT_VERSION/onnxruntime-osx-arm64-$ORT_VERSION.tgz" \
-        -o "$ORT_TGZ" || rm -f "$ORT_TGZ"
-      [ -f "$ORT_TGZ" ] && tar xzf "$ORT_TGZ" -C "$MODEL_CACHE" \
-        "onnxruntime-osx-arm64-$ORT_VERSION/lib/libonnxruntime.$ORT_VERSION.dylib"
+# ---- ONNX Runtime (every build, not only --dmg) ------------------------------
+# Bundle the ONNX Runtime dylib. On by default since speaker diarization
+# needs it — without it, a downloaded embedding model is inert and the far
+# end silently stays one "Participants" label on every install that has no
+# onnxruntime of its own. ORTRuntime.swift dlopens Contents/Frameworks first.
+# Set GHOSTIE_BUNDLE_ORT=0 to build without it.
+#
+# Outside the self-contained block on purpose. A plain install used to skip
+# it and fall back to Homebrew's copy, which a signed Ghostie cannot load:
+# the hardened runtime's library validation refuses a dylib from another
+# team (Homebrew's is ad-hoc signed). The 2026-09-29 call ran on such a build
+# and lost speaker separation while the log advised `brew install
+# onnxruntime` on a Mac that already had it.
+#
+# Microsoft's official release, NOT Homebrew's: the Homebrew dylib is linked
+# against /opt/homebrew/opt/onnx/lib/libonnx.dylib and friends, so bundling
+# it produces an app that works only on a machine that already has Homebrew's
+# onnxruntime — the exact machines that did not need it bundled. The official
+# build depends on system frameworks alone. Pinned, not "latest", so a build
+# is reproducible; ORTRuntime negotiates the API version at load.
+if [ "${GHOSTIE_BUNDLE_ORT:-1}" = "1" ]; then
+  ORT_VERSION="${GHOSTIE_ORT_VERSION:-1.29.0}"
+  ORT_TGZ="$MODEL_CACHE/onnxruntime-osx-arm64-$ORT_VERSION.tgz"
+  ORT_LIB="$MODEL_CACHE/onnxruntime-osx-arm64-$ORT_VERSION/lib/libonnxruntime.$ORT_VERSION.dylib"
+  if [ ! -f "$ORT_LIB" ]; then
+    mkdir -p "$MODEL_CACHE"
+    echo "==> Downloading ONNX Runtime $ORT_VERSION"
+    curl -fL --progress-bar \
+      "https://github.com/microsoft/onnxruntime/releases/download/v$ORT_VERSION/onnxruntime-osx-arm64-$ORT_VERSION.tgz" \
+      -o "$ORT_TGZ" || rm -f "$ORT_TGZ"
+    [ -f "$ORT_TGZ" ] && tar xzf "$ORT_TGZ" -C "$MODEL_CACHE" \
+      "onnxruntime-osx-arm64-$ORT_VERSION/lib/libonnxruntime.$ORT_VERSION.dylib"
+  fi
+  if [ -f "$ORT_LIB" ]; then
+    echo "==> Bundling ONNX Runtime $ORT_VERSION"
+    mkdir -p "$APP/Contents/Frameworks"
+    cp "$ORT_LIB" "$APP/Contents/Frameworks/libonnxruntime.dylib"
+    chmod u+w "$APP/Contents/Frameworks/libonnxruntime.dylib"
+    install_name_tool -id @rpath/libonnxruntime.dylib \
+      "$APP/Contents/Frameworks/libonnxruntime.dylib" 2>/dev/null || true
+    NESTED_BINS+=("$APP/Contents/Frameworks/libonnxruntime.dylib")
+    # `grep -v` exits 1 when it filters everything out, which under
+    # `set -o pipefail` is the *success* case here — hence `|| true`.
+    EXTERNAL_DEPS=$(otool -L "$APP/Contents/Frameworks/libonnxruntime.dylib" \
+      | tail -n +2 \
+      | { grep -vE "/System/|/usr/lib/|@rpath/libonnxruntime" || true; } \
+      | wc -l | tr -d " ")
+    if [ "$EXTERNAL_DEPS" != "0" ]; then
+      echo "!! bundled libonnxruntime has $EXTERNAL_DEPS non-system dependencies — it will not load on a clean Mac" >&2
+      exit 1
     fi
-    if [ -f "$ORT_LIB" ]; then
-      echo "==> Bundling ONNX Runtime $ORT_VERSION"
-      mkdir -p "$APP/Contents/Frameworks"
-      cp "$ORT_LIB" "$APP/Contents/Frameworks/libonnxruntime.dylib"
-      chmod u+w "$APP/Contents/Frameworks/libonnxruntime.dylib"
-      install_name_tool -id @rpath/libonnxruntime.dylib \
-        "$APP/Contents/Frameworks/libonnxruntime.dylib" 2>/dev/null || true
-      NESTED_BINS+=("$APP/Contents/Frameworks/libonnxruntime.dylib")
-      # `grep -v` exits 1 when it filters everything out, which under
-      # `set -o pipefail` is the *success* case here — hence `|| true`.
-      EXTERNAL_DEPS=$(otool -L "$APP/Contents/Frameworks/libonnxruntime.dylib" \
-        | tail -n +2 \
-        | { grep -vE "/System/|/usr/lib/|@rpath/libonnxruntime" || true; } \
-        | wc -l | tr -d " ")
-      if [ "$EXTERNAL_DEPS" != "0" ]; then
-        echo "!! bundled libonnxruntime has $EXTERNAL_DEPS non-system dependencies — it will not load on a clean Mac" >&2
-        exit 1
-      fi
-      echo "    self-contained ($(lipo -info "$APP/Contents/Frameworks/libonnxruntime.dylib" | sed 's/.*: //'))"
-    else
-      echo "    Could not fetch ONNX Runtime — building without it; speaker diarization will be unavailable on installs that lack their own."
-    fi
+    echo "    self-contained ($(lipo -info "$APP/Contents/Frameworks/libonnxruntime.dylib" | sed 's/.*: //'))"
+  else
+    echo "    Could not fetch ONNX Runtime — building without it; speaker diarization will be unavailable (a signed build cannot load Homebrew's copy)."
   fi
 fi
 

@@ -174,6 +174,41 @@ func runMicCaptureSelfTest() -> Bool {
     check("realign: a clock that went backwards rebases",
           realign(50) == .rebase(firstPTS: 40), "\(realign(50))")
 
+    // Conversion-loss alarm. The 2026-09-29 false alarm: voice processing's
+    // sub-LSB residue during far-end speech rounds to 0, correctly.
+    typealias Watch = MicCapture.ConversionLossWatch
+    let zeros = [Int16](repeating: 0, count: 320)
+    let voiced = [Int16](repeating: 900, count: 320)
+    let loud: Float = 0.2
+    var residue = Watch()
+    var residueAlarmed = false
+    for _ in 0..<50 { residueAlarmed = residue.note(inputPeak: 1e-6, output: zeros) || residueAlarmed }
+    check("conversion alarm: sub-LSB input rounding to silence is not a loss",
+          !residueAlarmed && residue.total == 0, "total \(residue.total)")
+
+    var dead = Watch()
+    let alarms = (0..<20).filter { _ in dead.note(inputPeak: loud, output: zeros) }.count
+    check("conversion alarm: a converter zeroing every sounding buffer is named once",
+          alarms == 1 && dead.total == 20, "alarms \(alarms), total \(dead.total)")
+
+    var stray = Watch()
+    var strayAlarmed = false
+    for _ in 0..<40 {   // one lost buffer per four, across a long stretch
+        strayAlarmed = stray.note(inputPeak: loud, output: zeros) || strayAlarmed
+        for _ in 0..<3 { strayAlarmed = stray.note(inputPeak: loud, output: voiced) || strayAlarmed }
+    }
+    check("conversion alarm: scattered losses never add up to a run",
+          !strayAlarmed && stray.total == 40, "total \(stray.total)")
+
+    var quietGap = Watch()
+    var quietAlarmed = false
+    for i in 0..<5 {
+        quietAlarmed = quietGap.note(inputPeak: loud, output: zeros) || quietAlarmed
+        if i < 4 { _ = quietGap.note(inputPeak: 0, output: zeros) }
+    }
+    check("conversion alarm: silence between lost buffers does not break the run",
+          quietAlarmed, "total \(quietGap.total)")
+
     print("mic-capture self-test: \(passed) passed, \(failed) failed")
     return failed == 0
 }

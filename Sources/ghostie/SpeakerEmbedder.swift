@@ -55,7 +55,7 @@ final class SpeakerEmbedder {
             return nil
         }
         guard let runtime = ORTRuntime.shared else {
-            Log.info("Speaker diarization off: ONNX Runtime is not available (install it with `brew install onnxruntime`, or use a build that bundles it).")
+            Log.info("Speaker diarization off: \(ORTRuntime.unavailableReason).")
             return nil
         }
         do {

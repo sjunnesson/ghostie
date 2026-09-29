@@ -414,9 +414,15 @@ A dedicated **VoxLingua107 ECAPA-TDNN** identifier (faster and better on
 sub-2 s segments) activates automatically when two things are on disk:
 
 ```bash
-brew install onnxruntime                 # the runtime (MIT), loaded at run time
 python3 scripts/export-voxlingua-lid.py  # one-time model export (Apache-2.0)
 ```
+
+The runtime (ONNX Runtime, MIT) ships inside Ghostie.app — every build of the
+app bundles Microsoft's official dylib, the same one speaker labelling uses.
+Only the bare `.build/release/ghostie` binary needs `brew install onnxruntime`:
+a signed Ghostie.app cannot load Homebrew's copy (macOS library validation
+refuses a library signed by another developer), and `ghostie doctor` says so
+by name if that is what happened.
 
 The export script converts `speechbrain/lang-id-voxlingua107-ecapa` to
 `~/.ghostie/models/lid-voxlingua107.onnx` with the feature pipeline inside

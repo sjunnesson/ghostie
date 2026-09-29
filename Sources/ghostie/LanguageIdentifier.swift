@@ -693,7 +693,7 @@ final class VoxLingua107LID: LanguageIdentifier {
         let missing = !FileManager.default.fileExists(atPath: modelPath)
             ? "model not installed — run scripts/export-voxlingua-lid.py"
             : (ORTRuntime.shared == nil
-                ? "onnxruntime dylib not found — brew install onnxruntime"
+                ? ORTRuntime.unavailableReason
                 : "labels sidecar missing")
         return "VoxLingua107 ECAPA-TDNN (ONNX, \(missing))"
     }

@@ -135,7 +135,11 @@ the same code drives the menu-bar app and the headless daemon.
   `adaptChannelIfDead` moves to another channel if 0 goes silent while another
   is live (Apple renumbered this layout once already), and a converted-to-
   silence counter names the conversion in the log so this failure can never
-  again be mistaken for a dead microphone. `ghostie mic-probe [secs]` is the
+  again be mistaken for a dead microphone. It (`ConversionLossWatch`) counts
+  only input loud enough to survive 16-bit (`WavLevel.activeThreshold`) and
+  alarms on a *run* of five: voice processing emits sub-LSB residue while it
+  suppresses echo, which rounds to zero correctly, and the first version
+  reported that as data loss on the 2026-09-29 call. `ghostie mic-probe [secs]` is the
   diagnostic: it runs a plain tap and a voice-processed tap in the same
   process, so "all zeros" can be told apart from denied microphone permission
   — **run it first on a new macOS release.** The Me/
@@ -164,7 +168,14 @@ the same code drives the menu-bar app and the headless daemon.
   clustering cannot ignore) and are backfilled from their neighbours instead.
   The 0.70 merge threshold is measured, not guessed — see the doc comment.
   Entirely optional: no ONNX runtime or no model means the far end keeps one
-  "Participants" label. `diarize` returns nil **only** when there was too
+  "Participants" label. **Every `build-app.sh` build bundles Microsoft's ORT
+  dylib, not only `--dmg`**: a signed Ghostie runs under the hardened runtime,
+  whose library validation refuses Homebrew's ad-hoc-signed copy, so a plain
+  install used to lose diarization while the log advised `brew install
+  onnxruntime` on a Mac that had it (the 2026-09-29 call).
+  `ORTRuntime.refused` keeps each dylib that was on disk and failed, with
+  `dlerror()`, and `unavailableReason` turns that into the one message every
+  surface shows — "not installed" and "refused" need opposite advice. `diarize` returns nil **only** when there was too
   little to judge on; audio that was clustered and held one voice comes back
   as an `Assignment` with `speakerCount == 1`, so the transcript can say
   "Participant 1" (a person) rather than "Participants" (a track).

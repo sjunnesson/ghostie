@@ -423,7 +423,9 @@ final class TranscriptionPane: NSView {
             sub: canDiarize
                 ? "When several people share the other end of the call, label each of them separately instead of lumping them together."
                 : (spkOnDisk
-                   ? "Needs the ONNX Runtime — install it with `brew install onnxruntime`, or reinstall Ghostie from a build that includes it."
+                   ? (ORTRuntime.refused.isEmpty
+                      ? "Needs the ONNX Runtime — install it with `brew install onnxruntime`, or reinstall Ghostie from a build that includes it."
+                      : "This build can't load the ONNX Runtime on this Mac. Reinstall Ghostie from a release build, which carries its own.")
                    : "Downloading the speaker model (~27 MB). Until it arrives, everyone on the other end shares one label."),
             on: cfg.diarization && canDiarize) { [weak self] on in
                 self?.change { c in c.diarization = on }

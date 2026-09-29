@@ -54,7 +54,7 @@ final class MicCapture {
     private var rebuilds = 0
     private var sawSignal = false
     private var delivered = 0
-    private var lostInConversion = 0
+    private var conversionWatch = ConversionLossWatch()
     /// Which input channel carries the processed voice. Channel 0 today; see
     /// `adaptChannelIfDead`.
     private var activeChannel = 0
@@ -65,9 +65,6 @@ final class MicCapture {
     private static let rebuildDebounce: TimeInterval = 0.4
     /// A device that renegotiates forever must not spin the graph forever.
     private static let maxRebuilds = 12
-    /// Converted-to-silence buffers tolerated before saying so. The converter
-    /// legitimately yields nothing while priming.
-    private static let conversionLossAlarm = 5
     /// Consecutive buffers where the chosen channel is silent and another is
     /// not, before switching. Long enough that a pause in speech cannot move
     /// us; short enough to recover within a second.
@@ -101,7 +98,42 @@ final class MicCapture {
     /// converter carrying none. Distinguishes "the microphone gave us
     /// nothing" from "we destroyed what it gave us" — which are identical
     /// downstream and were confused for each other for two releases.
-    var buffersLostInConversion: Int { stateLock.withLock { lostInConversion } }
+    var buffersLostInConversion: Int { stateLock.withLock { conversionWatch.total } }
+
+    /// Names the one failure that looks exactly like a dead microphone:
+    /// audio that arrived carrying sound and left the converter as zeros.
+    ///
+    /// "Carrying sound" means loud enough to survive the trip to 16-bit —
+    /// `WavLevel.activeThreshold`, ≈ −42 dBFS. The first version counted any
+    /// non-zero float, and voice processing hands over sub-LSB residue while
+    /// it suppresses echo, which rounds to 0 correctly. On the 2026-09-29
+    /// call that tripped the alarm a minute in; measured afterwards, 4 161 of
+    /// the Me track's 4 165 all-zero 50 ms windows fell while the far end was
+    /// talking, and 0.1 s fell inside the user's own speech with the far end
+    /// quiet — echo cancellation doing its job, reported as data loss.
+    ///
+    /// And it alarms on a *run*: a buffer whose sound converts to something
+    /// resets it. The converter bug this exists for zeroes every buffer, so a
+    /// run of five catches it at once, while a stray filtered-out click never
+    /// accumulates across an hour into a false verdict.
+    struct ConversionLossWatch {
+        static let alarmRun = 5
+        static let audibleInput = Float(WavLevel.activeThreshold) / 32768
+
+        /// Every buffer lost, for the whole capture.
+        private(set) var total = 0
+        private var run = 0
+
+        /// Records one converted buffer; true exactly when it completes a run
+        /// worth reporting. Buffers without sound say nothing either way.
+        mutating func note(inputPeak: Float, output: [Int16]) -> Bool {
+            guard inputPeak >= Self.audibleInput else { return false }
+            guard !output.contains(where: { $0 != 0 }) else { run = 0; return false }
+            total += 1
+            run += 1
+            return run == Self.alarmRun
+        }
+    }
 
     func start() throws {
         try control.sync {
@@ -302,14 +334,12 @@ final class MicCapture {
         adaptChannelIfDead(rawBuffer)
         let channel = stateLock.withLock { activeChannel }
         guard let buffer = Self.monoise(rawBuffer, channel: channel) else { return }
-        // Did the device give us anything? Compared against the conversion
-        // result below, this is what tells a silent microphone apart from a
-        // conversion that ate the signal.
-        var inputHadSignal = false
+        // How loud was what the device gave us? Compared against the
+        // conversion result below, this is what tells a silent microphone
+        // apart from a conversion that ate the signal.
+        var inputPeak: Float = 0
         if let f = buffer.floatChannelData {
-            for i in 0..<Int(buffer.frameLength) where f[0][i] != 0 {
-                inputHadSignal = true; break
-            }
+            for i in 0..<Int(buffer.frameLength) { inputPeak = max(inputPeak, abs(f[0][i])) }
         }
         let ratio = outFormat.sampleRate / buffer.format.sampleRate
         let capacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 16
@@ -329,17 +359,8 @@ final class MicCapture {
               let ch = out.int16ChannelData else { return }
         let samples = Array(UnsafeBufferPointer(start: ch[0],
                                                 count: Int(out.frameLength)))
-        if inputHadSignal, !samples.contains(where: { $0 != 0 }) {
-            let n = stateLock.withLock { () -> Int in
-                lostInConversion += 1
-                return lostInConversion
-            }
-            // The converter primes on its first buffer or two, so a single
-            // empty result at start-up is normal. A *run* of them is the
-            // failure this counter exists to name.
-            if n == Self.conversionLossAlarm {
-                Log.warn("Mic capture: the device delivered audio but the 16 kHz conversion produced silence \(n) times — the 'Me' track is being lost in conversion, not at the microphone.")
-            }
+        if stateLock.withLock({ conversionWatch.note(inputPeak: inputPeak, output: samples) }) {
+            Log.warn("Mic capture: \(ConversionLossWatch.alarmRun) buffers in a row arrived with sound and left the 16 kHz conversion as silence — the 'Me' track is being lost in conversion, not at the microphone.")
         }
         noteSignal(in: samples)
         stateLock.withLock { delivered += 1 }

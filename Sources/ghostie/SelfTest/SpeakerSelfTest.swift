@@ -393,6 +393,23 @@ func runSpeakerSelfTest() -> Bool {
               && !SpeakerNamer.isPlausibleName("Participant"))
     }
 
+    // ONNX Runtime availability. "Not installed" and "installed but refused"
+    // need opposite advice; the 2026-09-29 log advised `brew install` on a
+    // Mac that already had it, because a signed build cannot load it.
+    let notFound = ORTRuntime.unavailableReason(refused: [])
+    check("ORT: nothing on disk says how to install it", notFound.contains("brew install onnxruntime"), notFound)
+    let homebrew = "/opt/homebrew/lib/libonnxruntime.dylib"
+    let validation = ORTRuntime.unavailableReason(refused: [ORTRuntime.LoadFailure(
+        path: homebrew,
+        reason: "dlopen(\(homebrew), 0x000A): tried: '\(homebrew)' (code signature in <1A2B> '\(homebrew)' not valid for use in process: mapping process and mapped file (non-platform) have different Team IDs)")])
+    check("ORT: a library-validation refusal names the file and never says `brew install`",
+          validation.contains(homebrew) && validation.contains("release build")
+              && !validation.contains("brew install"), validation)
+    let other = ORTRuntime.unavailableReason(refused: [ORTRuntime.LoadFailure(
+        path: homebrew, reason: "incompatible architecture")])
+    check("ORT: any other refusal is quoted as it happened",
+          other.contains("incompatible architecture") && other.contains(homebrew), other)
+
     print("speaker self-test: \(passed) passed, \(failed) failed")
     return failed == 0
 }
