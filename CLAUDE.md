@@ -103,6 +103,13 @@ the same code drives the menu-bar app and the headless daemon.
   away. At confirm the coordinator freezes a `CallSource` (Teams / Zoom /
   Meet, from the evidence's bundle ids / tab site); Engine reads it via
   `currentCallSource()` and threads it to the pipeline for note naming.
+  **A browser's audio runs in helpers LaunchServices never launched**:
+  Chrome's AudioService helper — the process carrying a Meet call's mic —
+  has no `NSRunningApplication`, so its bundle came back nil and the browser
+  path could never fire (the 2026-09-29 Meet call was recorded by hand).
+  `CoreAudioActivityProvider.resolvedBundleID` falls back to CoreAudio's own
+  `kAudioProcessPropertyBundleID`. The selftest's fake helpers always carry a
+  bundle, which is why nothing caught it.
 - **`RecordingImporter.swift`** — recordings made outside Ghostie (menu
   "Import Audio File…", `ghostie import`, `Engine.importRecording`). Decodes
   via AVAudioFile, folds channels by hand and lets `AVAudioConverter` do only

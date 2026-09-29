@@ -698,6 +698,17 @@ func runDetectorStateMachineSelfTest() -> Bool {
             cameraPids: [], deviceSwapWithinLast3s: false)
         check("buildEvidence: a meeting tab's helper process (own pid) is primary",
               helper.primarySignal && helper.triggerInputPids == [301])
+        // The helper above only matches if its bundle is known at all. Chrome's
+        // AudioService helper is not a LaunchServices app, so the bundle has
+        // to come from CoreAudio (2026-09-30).
+        check("bundle: LaunchServices' answer wins when it has one",
+              CoreAudioActivityProvider.resolvedBundleID(
+                  running: "us.zoom.xos", coreAudio: "us.zoom.xos.helper") == "us.zoom.xos")
+        check("bundle: a helper LaunchServices doesn't know is named by CoreAudio",
+              CoreAudioActivityProvider.resolvedBundleID(
+                  running: nil, coreAudio: "com.google.Chrome.helper") == "com.google.Chrome.helper")
+        check("bundle: an empty answer is no answer",
+              CoreAudioActivityProvider.resolvedBundleID(running: "", coreAudio: "") == nil)
         let otherBrowser = DetectionCoordinator.buildEvidence(
             audio: [AudioProcessInfo(pid: 401, bundleId: "com.brave.browser.helper",
                                      isRunningInput: true, isRunningOutput: false)],

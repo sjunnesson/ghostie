@@ -272,7 +272,9 @@ final class CoreAudioActivityProvider: AudioActivityProvider {
     private static func buildInfo(processObject: AudioObjectID) -> AudioProcessInfo? {
         let pid = fetchPID(processObject)
         guard pid > 0 else { return nil }
-        let bundle = NSRunningApplication(processIdentifier: pid)?.bundleIdentifier
+        let bundle = resolvedBundleID(
+            running: NSRunningApplication(processIdentifier: pid)?.bundleIdentifier,
+            coreAudio: fetchBundleID(processObject))
         let input = fetchUInt32(processObject, kAudioProcessPropertyIsRunningInput) != 0
         let output = fetchUInt32(processObject, kAudioProcessPropertyIsRunningOutput) != 0
         return AudioProcessInfo(pid: pid, bundleId: bundle,
@@ -289,6 +291,38 @@ final class CoreAudioActivityProvider: AudioActivityProvider {
         var size = UInt32(MemoryLayout<pid_t>.size)
         let status = AudioObjectGetPropertyData(obj, &address, 0, nil, &size, &pid)
         return status == noErr ? pid : 0
+    }
+
+    /// Which bundle a process belongs to, for matching against the trigger
+    /// and browser lists.
+    ///
+    /// `NSRunningApplication` only knows processes LaunchServices launched,
+    /// and Chrome spawns its helpers itself. Measured 2026-09-30 on Chrome
+    /// 154: the video-capture helper resolved, but the **AudioService** helper
+    /// — the one process that runs every Meet call's microphone and speaker —
+    /// came back nil, so its I/O never reached the detector, the tab probe
+    /// (gated on a browser using the mic) never ran, and a Meet call on
+    /// 2026-09-29 had to be recorded by hand. CoreAudio names the process
+    /// itself (`com.google.Chrome.helper`), so ask it when LaunchServices
+    /// can't say. LaunchServices stays first: it is what Teams and Zoom have
+    /// always matched on.
+    static func resolvedBundleID(running: String?, coreAudio: String?) -> String? {
+        if let running, !running.isEmpty { return running }
+        if let coreAudio, !coreAudio.isEmpty { return coreAudio }
+        return nil
+    }
+
+    private static func fetchBundleID(_ obj: AudioObjectID) -> String? {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioProcessPropertyBundleID,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var value: Unmanaged<CFString>?
+        var size = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+        guard AudioObjectGetPropertyData(obj, &address, 0, nil, &size, &value) == noErr,
+              let value else { return nil }
+        return value.takeRetainedValue() as String
     }
 
     private static func fetchUInt32(_ obj: AudioObjectID,
