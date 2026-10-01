@@ -81,6 +81,30 @@ final class AudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
     /// stream: queues still drain and whatever audio was captured survives.
     var onFatalError: (() -> Void)?
 
+    /// Things about the microphone the user should hear about *during* the
+    /// call, not in a log afterwards — the 2026-10-01 call logged a dead
+    /// "Me" track at 62 s and nobody saw it for 29 minutes. Fired on an
+    /// arbitrary queue.
+    var onMicNotice: ((MicNotice) -> Void)?
+
+    enum MicNotice: Equatable {
+        /// Recording a different mic than the system default, because the
+        /// default cannot work (lid closed). A chosen mic is not announced.
+        case switchedForLid(to: String)
+        /// Lid closed, built-in mic only: nothing to record "Me" from.
+        case noWorkingMic
+        /// The "Me" track is digital silence while the call has audio.
+        /// `midCall`: it carried audio earlier (could also be a hardware mute).
+        case notHearing(midCall: Bool)
+        /// Audio returned after `notHearing`.
+        case hearingAgain
+    }
+
+    /// The default-input switch made for this call, undone at stop. Guarded
+    /// by `stateLock`.
+    private var micSwitch: MicRouter.Switch?
+    private var noWorkingMicReported = false
+
     // MARK: - In-memory ring buffer
     //
     // For the first `bufferCapSeconds` of capture, PCM samples accumulate in
@@ -177,6 +201,11 @@ final class AudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
     private var micMidCallLastRebuildAt: Date?
     private let micMidCallRebuildLimit = 3
     private let micMidCallRebuildSpacing: Double = 120
+    /// watchdogQueue-owned: `onMicNotice(.notHearing)` is showing.
+    private var micAlerted = false
+    /// watchdogQueue-owned: this stretch of mid-call silence already tried
+    /// another microphone.
+    private var micMidCallRerouteTried = false
 
     /// How long to wait at startup for the voice-processed path to prove it
     /// is alive. A healthy graph latches on its first buffer (~20 ms), so this
@@ -201,6 +230,11 @@ final class AudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
     /// check does not report our own choice as a symptom.
     private var micProbeDelaySeconds: Double = 0
     private let micRebuildAfterSeconds: Double = 60
+    /// When the user is told a never-heard mic is silent. A live mic latches
+    /// on its first buffer, so this is not about patience with a quiet user —
+    /// it only has to outlast the far end saying hello before anyone local
+    /// would have spoken, and it is the first minute that can still be saved.
+    private let micAlertAfterSeconds: Double = 20
     private let micFallbackAfterSeconds: Double = 150
     private let micDeadAfterSeconds: Double = 300
 
@@ -226,15 +260,72 @@ final class AudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
         } catch {
             // Settle the state machine so a stop() parked on `.starting`
             // (or one yet to come) sees a clean, fully-down recorder.
-            stopMicCapture()
+            releaseMic()
             finishStart(as: .stopped)
             throw error
         }
     }
 
-    private func stopMicCapture() {
+    /// Stops the voice-processed path and puts back the input device this
+    /// call switched away from.
+    private func releaseMic() {
         micCapture?.stop()
         micCapture = nil
+        if let s = stateLock.withLock({ () -> MicRouter.Switch? in
+            defer { micSwitch = nil }
+            return micSwitch
+        }) {
+            MicRouter.restore(s)
+        }
+    }
+
+    /// Points the system default input at the mic this call should record
+    /// (see `MicRoute`). Returns true if it switched. A second switch in the
+    /// same call keeps the *first* previous device, so stop restores what the
+    /// user had before the call.
+    @discardableResult
+    private func routeMic() -> Bool {
+        let (route, switched) = MicRouter.apply(preferredUID: config.micDeviceUID)
+        if route == .noWorkingMic,
+           stateLock.withLock({ () -> Bool in
+               defer { noWorkingMicReported = true }
+               return !noWorkingMicReported
+           }) {
+            onMicNotice?(.noWorkingMic)
+        }
+        guard let switched else { return false }
+        stateLock.withLock {
+            micSwitch = MicRouter.Switch(previous: micSwitch?.previous ?? switched.previous,
+                                         to: switched.to, reason: switched.reason)
+        }
+        if switched.reason == .lidClosed { onMicNotice?(.switchedForLid(to: switched.to.name)) }
+        return true
+    }
+
+    /// Mid-call re-route (the lid closed after the call started). Voice
+    /// processing follows the new default by itself — the switch posts the
+    /// configuration change `MicCapture` rebuilds on — but the raw tap was
+    /// configured with a device id and has to be told.
+    private func rerouteMic() -> Bool {
+        guard routeMic() else { return false }
+        if micCapture == nil, let cfg = streamConfig, let s = stateLock.withLock({ stream }) {
+            cfg.microphoneCaptureDeviceID = stateLock.withLock { micSwitch?.to.uid }
+            Task { try? await s.updateConfiguration(cfg) }
+        }
+        return true
+    }
+
+    /// Tells the user once per stretch of silence; `hearingAgain` re-arms it.
+    private func alertNotHearing(midCall: Bool) {
+        guard !micAlerted else { return }
+        micAlerted = true
+        onMicNotice?(.notHearing(midCall: midCall))
+    }
+
+    private func clearNotHearingAlert() {
+        guard micAlerted else { return }
+        micAlerted = false
+        onMicNotice?(.hearingAgain)
     }
 
     // MARK: - Mic liveness
@@ -305,6 +396,9 @@ final class AudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
                 Log.ok("'Me' track is receiving audio again.")
                 micEscalation = 0
             }
+            if Date().timeIntervalSince(lastSignal) < micRebuildAfterSeconds {
+                clearNotHearingAlert()
+            }
             checkMidCallSilence(since: lastSignal, callHasAudio: sysOK)
             return
         }
@@ -313,7 +407,15 @@ final class AudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
         guard sysOK else { return }
         let elapsed = Date().timeIntervalSince(startedAt)
 
+        if elapsed >= micAlertAfterSeconds { alertNotHearing(midCall: false) }
+
         if micEscalation == 0, elapsed >= micRebuildAfterSeconds {
+            // The mic may be fine and simply not the one being recorded.
+            if rerouteMic() {
+                Log.warn("'Me' track has recorded only digital silence for \(Int(elapsed))s while the call has audio — switched microphones; watching again.")
+                micEscalation = 1
+                return
+            }
             if let cap = micCapture {
                 micEscalation = 1
                 Log.warn("'Me' track has recorded only digital silence for \(Int(elapsed))s while the call has audio — rebuilding the voice-processing mic graph.")
@@ -353,11 +455,24 @@ final class AudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
                 micMidCallAlarm = false
                 micMidCallRebuilds = 0
                 micMidCallLastRebuildAt = nil
+                micMidCallRerouteTried = false
             }
             return
         }
         // Muted at the system level (menu bar, AirPods): zeros are expected.
         guard callHasAudio, !AVAudioApplication.shared.isInputMuted else { return }
+        alertNotHearing(midCall: true)
+        // The lid closed mid-call: the built-in mic went dead, not muted. One
+        // try per stretch of silence — the switch either is the fix or is not.
+        if !micMidCallRerouteTried {
+            micMidCallRerouteTried = true
+            if rerouteMic() {
+                micMidCallAlarm = true
+                micMidCallLastRebuildAt = Date()
+                Log.warn("'Me' track has been digitally silent for \(Int(silentFor))s after carrying audio — switched microphones.")
+                return
+            }
+        }
         guard let cap = micCapture else {
             if !micMidCallAlarm {
                 micMidCallAlarm = true
@@ -390,6 +505,7 @@ final class AudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
         cap.stop()
         micCapture = nil
         cfg.captureMicrophone = true
+        cfg.microphoneCaptureDeviceID = stateLock.withLock { micSwitch?.to.uid }
         Task {
             do {
                 // No re-anchor: the raw tap stamps on the same host clock,
@@ -426,6 +542,10 @@ final class AudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
         let filter = SCContentFilter(display: display,
                                      excludingApplications: [],
                                      exceptingWindows: [])
+
+        // Both mic paths record the system default input, so make it the
+        // right one first (chosen in Settings, or not the lid-closed built-in).
+        routeMic()
 
         // Prefer the echo-cancelled mic path (see MicCapture). Routed through
         // micQueue so the drain fences in stop() cover it exactly like the
@@ -475,6 +595,9 @@ final class AudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
         // healthy; the watchdog flips it on via `updateConfiguration` if that
         // path turns out to be recording silence.
         cfg.captureMicrophone = micCapture == nil
+        // nil = the default, which `routeMic` already pointed the right way;
+        // naming it too keeps the raw tap on it if the default moves again.
+        cfg.microphoneCaptureDeviceID = stateLock.withLock { micSwitch?.to.uid }
         // Minimal video — required to keep the stream alive; frames are dropped.
         cfg.width = 2
         cfg.height = 2
@@ -511,7 +634,7 @@ final class AudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
         }
         if cancelled {
             try? await s.stopCapture()
-            stopMicCapture()
+            releaseMic()
             finishStart(as: .stopped)
             Log.info("stop() arrived during startup — capture torn down immediately.")
             return
@@ -642,7 +765,7 @@ final class AudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
                 // that is fine — the queues still drain and the WAVs close.
                 stopMicWatchdog()
                 if let s { try? await s.stopCapture() }
-                stopMicCapture()
+                releaseMic()
                 stateLock.withLock { lifecycle = .stopped }
                 return
             }

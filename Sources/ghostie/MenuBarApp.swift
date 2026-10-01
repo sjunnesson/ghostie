@@ -12,6 +12,8 @@ final class MenuBarApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let menu = NSMenu()
     private var statusMenuItem: NSMenuItem!
     private var axWarningItem: NSMenuItem!
+    /// Shown while a capture is not hearing the user's microphone.
+    private var micWarningItem: NSMenuItem!
     private var backlogItem: NSMenuItem!
     private var lastEventItem: NSMenuItem!
     private var toggleItem: NSMenuItem!
@@ -61,6 +63,9 @@ final class MenuBarApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self?.notify("Call summarized", note.lastPathComponent)
                 self?.refreshLastNote()
             }
+        }
+        engine.onMicNotice = { [weak self] notice in
+            DispatchQueue.main.async { self?.surfaceMicNotice(notice) }
         }
         engine.onBacklogChange = { [weak self] pending in
             // Full backlog detail lives in Settings → Notes → Advanced, but a
@@ -122,6 +127,15 @@ final class MenuBarApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusMenuItem = NSMenuItem(title: "Starting…", action: nil, keyEquivalent: "")
         statusMenuItem.isEnabled = false
         menu.addItem(statusMenuItem)
+
+        // Mic warning: during a capture whose "Me" track is silent. Clicking
+        // opens the microphone setting.
+        micWarningItem = NSMenuItem(
+            title: "⚠︎ Not hearing your microphone",
+            action: #selector(openMicrophoneSettings), keyEquivalent: "")
+        micWarningItem.target = self
+        micWarningItem.isHidden = true
+        menu.addItem(micWarningItem)
 
         // AX denial warning. Hidden when permission is granted; clicking opens
         // the relevant System Settings pane so the user can grant in one step.
@@ -251,6 +265,7 @@ final class MenuBarApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             title = String(format: "● %@ %02d:%02d", what, secs / 60, secs % 60)
         }
         statusMenuItem.title = title
+        if case .recording = state {} else { micWarningItem.isHidden = true }
         toggleItem.title = engine.isListening ? "Pause Listening" : "Resume Listening"
         recordItem.title = engine.canStopRecording ? "Stop Recording" : "Start Recording"
 
@@ -325,6 +340,37 @@ final class MenuBarApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             notify("Ghostie", "A test recording is running — wait for it to finish.")
         }
         render(engine.state)
+    }
+
+    @objc private func openMicrophoneSettings() {
+        ensureSettings().show(pane: .listening)
+    }
+
+    /// Microphone trouble is the one failure that cannot wait for the note:
+    /// by then the user's side of the call is gone. So it is a notification
+    /// and a menu line, while there is still time to fix it.
+    private func surfaceMicNotice(_ notice: AudioRecorder.MicNotice) {
+        switch notice {
+        case .switchedForLid(let name):
+            notify("Recording from \(name)",
+                   "Your Mac's lid is closed, which turns off its built-in microphone.")
+        case .noWorkingMic:
+            micWarningItem.isHidden = false
+            notify("Your side of this call isn't being recorded",
+                   "The lid is closed, which turns off the built-in microphone, and no other microphone is connected.")
+        case .notHearing(let midCall):
+            micWarningItem.isHidden = false
+            if midCall {
+                notify("Your microphone went silent",
+                       "Ghostie hasn't heard it for a minute. If you aren't muted, check the microphone in Ghostie's Settings ▸ Listening.")
+            } else {
+                notify("Ghostie can't hear your microphone",
+                       "Your side of the call isn't being recorded. Check the microphone in Ghostie's Settings ▸ Listening.")
+            }
+        case .hearingAgain:
+            micWarningItem.isHidden = true
+            notify("Hearing your microphone again", "Your side of the call is being recorded.")
+        }
     }
 
     @objc private func openAccessibilitySettings() {

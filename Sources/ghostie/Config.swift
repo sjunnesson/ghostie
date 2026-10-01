@@ -83,6 +83,11 @@ struct Config: Codable {
     /// cannot start; set false to force the raw tap.
     var micEchoCancellation: Bool = true
 
+    /// CoreAudio UID of the microphone to record. Empty = the system default.
+    /// Recording a chosen mic makes it the default input for the call (voice
+    /// processing records nothing else); see `MicRoute`.
+    var micDeviceUID: String = ""
+
     // MARK: Speaker labelling
 
     /// Split the Participants track into individual speakers when more than
@@ -283,7 +288,7 @@ struct Config: Codable {
     enum CodingKeys: String, CodingKey {
         case notesFolder, keepAudio, saveTranscript, triggerBundlePrefixes
         case triggerBundleIds, detectBrowserMeetings, browserBundleIds
-        case endGraceSeconds, minCallSeconds, micEchoCancellation
+        case endGraceSeconds, minCallSeconds, micEchoCancellation, micDeviceUID
         case diarization, speakerModel, nameSpeakers, userName
         case whisperBinary, whisperServerBinary, whisperModel, language
         case initialPrompt, vadModel
@@ -349,6 +354,7 @@ struct Config: Codable {
         endGraceSeconds = g(.endGraceSeconds, d.endGraceSeconds)
         minCallSeconds = g(.minCallSeconds, d.minCallSeconds)
         micEchoCancellation = g(.micEchoCancellation, d.micEchoCancellation)
+        micDeviceUID = g(.micDeviceUID, d.micDeviceUID)
         diarization = g(.diarization, d.diarization)
         speakerModel = g(.speakerModel, d.speakerModel)
         nameSpeakers = g(.nameSpeakers, d.nameSpeakers)

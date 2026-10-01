@@ -14,6 +14,12 @@ final class ListeningPane: NSView {
     private var liveStatusRow: LiveStatusRow!
     private var permsContainer = NSStackView()
     private var advancedContainer = NSStackView()
+    private var recordingContainer = NSStackView()
+    /// The microphone setting as last applied here (the pane's `cfg` is a
+    /// snapshot from when the window opened).
+    private var micUID: String
+    private var echoCancellation: Bool
+    private var micMenuDelegate: MicMenuDelegate?
     private var paneStack = NSStackView()
     private var timer: Timer?
     private var disclosureToken: NSObjectProtocol?
@@ -26,6 +32,8 @@ final class ListeningPane: NSView {
         self.engineState = engineState
         self.onPause = onPause
         self.changes = changes
+        self.micUID = cfg.micDeviceUID
+        self.echoCancellation = cfg.micEchoCancellation
         super.init(frame: .zero)
         build()
         disclosureToken = NotificationCenter.default.addObserver(
@@ -98,16 +106,14 @@ final class ListeningPane: NSView {
         paneStack.addArrangedSubview(detection)
         detection.widthAnchor.constraint(equalTo: paneStack.widthAnchor).isActive = true
 
-        // Recording group.
-        let recording = GroupCard(title: "Recording")
-        recording.addRow(buildToggleRow(
-            label: "Cancel speaker echo",
-            sub: "Keeps the other participants' voices out of your own track when you're not wearing headphones. Leave this on unless your side of a recording sounds wrong.",
-            on: cfg.micEchoCancellation) { [weak self] on in
-                self?.changes { c in c.micEchoCancellation = on }
-            }, last: true)
-        paneStack.addArrangedSubview(recording)
-        recording.widthAnchor.constraint(equalTo: paneStack.widthAnchor).isActive = true
+        // Recording group. Rebuilt when the microphone changes, so the
+        // sentence under the picker describes what is selected.
+        recordingContainer.orientation = .vertical
+        recordingContainer.alignment = .leading
+        recordingContainer.translatesAutoresizingMaskIntoConstraints = false
+        paneStack.addArrangedSubview(recordingContainer)
+        recordingContainer.widthAnchor.constraint(equalTo: paneStack.widthAnchor).isActive = true
+        rebuildRecording()
 
         // Advanced container — driven by the global Disclosure toggle in the
         // sidebar; no per-pane disclosure footer.
@@ -144,6 +150,72 @@ final class ListeningPane: NSView {
     func stopLiveTick() {
         timer?.invalidate()
         timer = nil
+    }
+
+    private func rebuildRecording() {
+        recordingContainer.arrangedSubviews.forEach { $0.removeFromSuperview() }
+        let recording = GroupCard(title: "Recording")
+        recording.addRow(RowBuilder.row(
+            label: "Microphone",
+            sub: microphoneSentence(),
+            control: microphonePicker()))
+        recording.addRow(buildToggleRow(
+            label: "Cancel speaker echo",
+            sub: "Keeps the other participants' voices out of your own track when you're not wearing headphones. Leave this on unless your side of a recording sounds wrong.",
+            on: echoCancellation) { [weak self] on in
+                self?.echoCancellation = on
+                self?.changes { c in c.micEchoCancellation = on }
+            }, last: true)
+        recordingContainer.addArrangedSubview(recording)
+        recording.widthAnchor.constraint(equalTo: recordingContainer.widthAnchor).isActive = true
+    }
+
+    /// What will actually be recorded — the same decision a call makes.
+    private func microphoneSentence() -> String {
+        let devices = MicRouter.inputDevices()
+        let defaultID = MicRouter.defaultInput()
+        let current = devices.first { $0.id == defaultID }?.name
+        let route = MicRoute.decide(preferredUID: micUID, devices: devices,
+                                    defaultID: defaultID, lidClosed: MicRouter.isLidClosed())
+        if !micUID.isEmpty, !devices.contains(where: { $0.uid == micUID }) {
+            return "Not connected right now, so Ghostie records your Mac's input device"
+                + (current.map { " (\($0))" } ?? "") + " until it is."
+        }
+        switch route {
+        case .switchTo(let d, .lidClosed):
+            return "Your lid is closed, which turns off \(current ?? "the built-in microphone"). Ghostie will record \(d.name) instead."
+        case .noWorkingMic:
+            return "Your lid is closed, which turns off the built-in microphone, and no other microphone is connected. Your side of a call can't be recorded."
+        case .switchTo(_, .chosen):
+            return "While Ghostie records, this becomes your Mac's input device, then it goes back. Echo cancellation only works on the Mac's input device."
+        case .systemDefault:
+            if micUID.isEmpty {
+                return "Your Mac's input device" + (current.map { ", now \($0)" } ?? "")
+                    + ". If the lid is closed, Ghostie uses another microphone instead of the built-in one."
+            }
+            return "This is already your Mac's input device."
+        }
+    }
+
+    private func microphonePicker() -> NSPopUpButton {
+        let popup = NSPopUpButton(frame: .zero, pullsDown: false)
+        let delegate = MicMenuDelegate(popup: popup) { [weak self] in self?.micUID ?? "" }
+        delegate.rebuild()
+        popup.menu?.delegate = delegate
+        micMenuDelegate = delegate
+        let target = ToggleTarget { [weak self, weak delegate] in
+            guard let self, let uid = delegate?.selectedUID(), uid != self.micUID else { return }
+            self.micUID = uid
+            self.changes { c in c.micDeviceUID = uid }
+            // Next runloop turn: this rebuild removes the popup that is
+            // still delivering its action.
+            DispatchQueue.main.async { self.rebuildRecording() }
+        }
+        popup.target = target
+        popup.action = #selector(ToggleTarget.fire)
+        objc_setAssociatedObject(popup, &ToggleTarget.key, target, .OBJC_ASSOCIATION_RETAIN)
+        popup.widthAnchor.constraint(equalToConstant: 220).isActive = true
+        return popup
     }
 
     func refreshPermissions() {
@@ -501,5 +573,49 @@ private final class WarningCard: NSView {
         super.viewDidChangeEffectiveAppearance()
         layer?.borderColor = themedCG(Theme.warn)
         layer?.backgroundColor = themedCG(Theme.warnSoft)
+    }
+}
+
+/// Fills the microphone popup, and refills it each time it opens: devices
+/// come and go (a USB mic plugged in with Settings already open), and a stale
+/// list would offer a mic that isn't there.
+private final class MicMenuDelegate: NSObject, NSMenuDelegate {
+    private weak var popup: NSPopUpButton?
+    private let selected: () -> String
+    /// The UID behind each item, by index; "" is "System default".
+    private var uids: [String?] = []
+
+    init(popup: NSPopUpButton, selected: @escaping () -> String) {
+        self.popup = popup
+        self.selected = selected
+    }
+
+    func menuNeedsUpdate(_ menu: NSMenu) { rebuild() }
+
+    func rebuild() {
+        guard let popup else { return }
+        let chosen = selected()
+        // Loopback drivers ("Microsoft Teams Audio") are not microphones.
+        let devices = MicRouter.inputDevices().filter { !$0.isVirtual || $0.uid == chosen }
+        popup.removeAllItems()
+        uids = []
+        popup.addItem(withTitle: "System default")
+        uids.append("")
+        popup.menu?.addItem(.separator())
+        uids.append(nil)
+        for d in devices {
+            popup.addItem(withTitle: d.name)
+            uids.append(d.uid)
+        }
+        if !chosen.isEmpty, !devices.contains(where: { $0.uid == chosen }) {
+            popup.addItem(withTitle: "Chosen microphone (not connected)")
+            uids.append(chosen)
+        }
+        popup.selectItem(at: uids.firstIndex(where: { $0 == chosen }) ?? 0)
+    }
+
+    func selectedUID() -> String? {
+        guard let i = popup?.indexOfSelectedItem, i >= 0, i < uids.count else { return nil }
+        return uids[i]
     }
 }

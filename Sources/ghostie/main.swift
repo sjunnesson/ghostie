@@ -664,6 +664,22 @@ func cmdDoctor(_ config: Config) {
     row(meetingApp, "meeting app running (Teams/Zoom)",
         meetingApp ? "" : "(only needed during a call)")
     row(CallDetector.defaultInputDevice() != nil, "default input device detected")
+    // Which microphone a call would record right now — the same decision
+    // `AudioRecorder` makes, without switching anything.
+    let inputs = MicRouter.inputDevices()
+    let defaultIn = MicRouter.defaultInput()
+    let defaultName = inputs.first { $0.id == defaultIn }?.name ?? "none"
+    switch MicRoute.decide(preferredUID: config.micDeviceUID, devices: inputs,
+                           defaultID: defaultIn, lidClosed: MicRouter.isLidClosed()) {
+    case .systemDefault:
+        row(true, "microphone for calls", defaultName)
+    case .switchTo(let d, .chosen):
+        row(true, "microphone for calls", "\(d.name) (chosen in Settings; becomes the input while recording)")
+    case .switchTo(let d, .lidClosed):
+        row(true, "microphone for calls", "\(d.name) (lid closed — \(defaultName) is off)")
+    case .noWorkingMic:
+        row(false, "microphone for calls", "lid closed, so \(defaultName) is off, and no other mic is connected")
+    }
     if let free = freeDiskBytes(at: config.workDir) {
         row(free >= lowDiskThresholdBytes, "free disk space",
             free >= lowDiskThresholdBytes
@@ -1329,8 +1345,10 @@ case "selftest":
     let indexOK = runTranscriptIndexSelfTest()
     print("")
     let mcpOK = runMCPSetupSelfTest()
+    print("")
+    let micRouteOK = runMicRouteSelfTest()
     exit(cleanerOK && echoOK && refinerOK && codeSwitchOK && updaterOK && detectorOK
-         && micOK && wavOK && speakerOK && indexOK && mcpOK ? 0 : 1)
+         && micOK && wavOK && speakerOK && indexOK && mcpOK && micRouteOK ? 0 : 1)
 case "mcp":
     GhostieMCPServer.runBlocking(config: config)
 case "index":

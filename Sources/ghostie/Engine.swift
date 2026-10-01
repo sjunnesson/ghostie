@@ -75,6 +75,9 @@ final class Engine: @unchecked Sendable {
     var onNote: ((URL) -> Void)?
     /// Fires after a backlog drain with the remaining pending count.
     var onBacklogChange: ((Int) -> Void)?
+    /// Microphone trouble during a capture (see `AudioRecorder.MicNotice`);
+    /// arbitrary queue. The log has the detail; this is for the user.
+    var onMicNotice: ((AudioRecorder.MicNotice) -> Void)?
     private var backlogTimer: DispatchSourceTimer?
 
     /// Backing store for `state`. Gate-only, like every other mutable field;
@@ -382,6 +385,7 @@ final class Engine: @unchecked Sendable {
             // no-op. (For a tentative capture the same path discards
             // instead of processing.)
             rec.onFatalError = { [weak engine = self] in engine?.finalizeRecorder(.fatal) }
+            rec.onMicNotice = { [weak engine = self] notice in engine?.onMicNotice?(notice) }
             self.startTask = Task {
                 do {
                     try await rec.start()
@@ -510,6 +514,7 @@ final class Engine: @unchecked Sendable {
             if case .recording = _state { busy = true }
             guard !busy else { return nil }
             let r = AudioRecorder(config: config)
+            r.onMicNotice = { [weak engine = self] notice in engine?.onMicNotice?(notice) }
             testRecorder = r
             recordingStartedAt = started
             return r

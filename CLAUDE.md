@@ -167,6 +167,20 @@ the same code drives the menu-bar app and the headless daemon.
   mono itself, AVAudioConverter kept channel 0 and a right-panned speaker came
   out at peak 0 (selftest pins it).
   A 2×2 dropped video stream is required only to keep the stream alive.
+- **`MicRouting.swift`** — which microphone a call records. **Both mic paths
+  record only the system default input**: voice processing ignores
+  `kAudioOutputUnitProperty_CurrentDevice` (bound to a live RØDE it delivered
+  no buffers; made the default, the same RØDE delivered signal at once). So
+  `AudioRecorder` picks the mic by *switching the default* for the call
+  (`MicRouter.apply`) and switching back at stop (`restore`, skipped if the
+  user changed it meanwhile or the old one would not work now). Two reasons
+  to switch: the mic chosen in Settings ▸ Listening (`micDeviceUID`), or the
+  default being the built-in mic **under a closed lid — hardware-off, it opens
+  normally and delivers exact zeros** (the 2026-10-01 Teams call lost all 29
+  minutes of "Me" that way while Teams used the RØDE). `MicRoute.decide` is
+  pure and pinned in selftest (`runMicRouteSelfTest`). Mic trouble reaches the
+  user live through `AudioRecorder.onMicNotice` → `Engine.onMicNotice` → a
+  notification plus a menu line, starting 20 s into a silent "Me" track.
 - **`SpeakerDiarizer.swift` / `SpeakerEmbedder.swift` / `Fbank.swift`** —
   splits the Participants track per person. Kaldi-compatible 80-bin fbank →
   WeSpeaker ResNet34 (ONNX, `feats [1,T,80] → embs [1,256]`) → average-linkage

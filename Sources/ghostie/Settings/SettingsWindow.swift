@@ -29,6 +29,17 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         rebuildWindow()
     }
 
+    /// Opens (or brings forward) the window on one pane.
+    func show(pane: PaneId) {
+        if window == nil {
+            currentPaneId = pane
+            show()
+        } else {
+            show()
+            select(pane, animated: false)
+        }
+    }
+
     /// First-launch entry point used by MenuBarApp when a required model is
     /// missing locally. Opens to the Transcription pane and auto-starts the
     /// first missing download so the user sees progress immediately rather
