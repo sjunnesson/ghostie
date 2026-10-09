@@ -110,8 +110,46 @@ enum MicRoute: Equatable {
     }
 }
 
+/// Where the far end comes out, as far as echo is concerned.
+///
+/// Voice processing cancels whatever the default output plays — except
+/// through the Mac's **built-in headphone jack**, which it takes for
+/// headphones: echo cancellation off, automatic gain on. Desk speakers on that
+/// jack are exactly what it cannot see (measured 2026-10-06 with a RØDE 20 cm
+/// from them: raw mic −38.5 dBFS of echo, voice-processed −24 — louder; the
+/// MacBook's own speakers: −34.5 raw, −49 voice-processed). So on that route
+/// the recorder takes the raw mic and `EchoCanceller` does the cancelling.
+/// Real headphones on the jack lose nothing by it: there is no echo to cancel.
+enum OutputRoute {
+    /// CoreAudio's data source code for the built-in headphone port, `'hdpn'`
+    /// (the MacBook's speakers report `'ispk'`).
+    static let headphonePort: UInt32 = 0x6864_706E
+
+    static func voiceProcessingCancelsEcho(transport: UInt32, dataSource: UInt32?) -> Bool {
+        !(transport == kAudioDeviceTransportTypeBuiltIn && dataSource == headphonePort)
+    }
+}
+
 /// The CoreAudio side of `MicRoute`.
 enum MicRouter {
+
+    /// The default output's name, and whether voice processing will cancel
+    /// echo through it (`OutputRoute`). nil when there is no default output.
+    static func defaultOutput() -> (name: String, voiceProcessingCancelsEcho: Bool)? {
+        let id = uint32(AudioObjectID(kAudioObjectSystemObject),
+                        kAudioHardwarePropertyDefaultOutputDevice)
+        guard id != kAudioObjectUnknown else { return nil }
+        var addr = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyDataSource,
+                                              mScope: kAudioObjectPropertyScopeOutput,
+                                              mElement: kAudioObjectPropertyElementMain)
+        var source: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        let hasSource = AudioObjectGetPropertyData(id, &addr, 0, nil, &size, &source) == noErr
+        let cancels = OutputRoute.voiceProcessingCancelsEcho(
+            transport: uint32(id, kAudioDevicePropertyTransportType),
+            dataSource: hasSource ? source : nil)
+        return (string(id, kAudioObjectPropertyName) ?? "the default output", cancels)
+    }
 
     /// What `apply` changed, so `restore` can undo exactly that and nothing
     /// the user did in the meantime.

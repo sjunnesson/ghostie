@@ -60,7 +60,13 @@ struct CodeSwitchTranscriber {
         }
     }
 
-    func transcribeBoth(me: URL, participants: URL)
+    /// `meVoice`, when given, reshapes the Me track's loudness envelope before
+    /// the speech-bounded decode splices by it — `EchoGate.masking`, which
+    /// zeroes the stretches where the mic heard only the far end's echo so
+    /// whisper never decodes them. It has no effect with `decodeSpeechOnly`
+    /// off, which decodes every run whole.
+    func transcribeBoth(me: URL, participants: URL,
+                        meVoice: ((WavLevel.Envelope) -> WavLevel.Envelope)? = nil)
         throws -> (me: [Transcriber.Segment], participants: [Transcriber.Segment]) {
 
         try preflightModels()
@@ -137,7 +143,7 @@ struct CodeSwitchTranscriber {
 
         let callID = me.deletingLastPathComponent().lastPathComponent
         let meOut = try decode(runs: meVerified, pcm: mePcm,
-                               callID: callID, tag: "me")
+                               callID: callID, tag: "me", voiceFilter: meVoice)
         let partOut = try decode(runs: partVerified, pcm: partPcm,
                                  callID: callID, tag: "participants")
         return (meOut, partOut)
@@ -271,11 +277,14 @@ struct CodeSwitchTranscriber {
     // MARK: Per-track decode
 
     private func decode(runs: [LanguageRun], pcm: Data,
-                        callID: String, tag: String) throws -> [Transcriber.Segment] {
+                        callID: String, tag: String,
+                        voiceFilter: ((WavLevel.Envelope) -> WavLevel.Envelope)? = nil)
+        throws -> [Transcriber.Segment] {
         guard !runs.isEmpty else { return [] }
         // The track's loudness over time, so each run is spliced down to the
         // parts that carry speech. One pass over PCM already in memory.
-        let voice = cs.decodeSpeechOnly ? WavLevel.envelope(pcm: pcm) : nil
+        var voice = cs.decodeSpeechOnly ? WavLevel.envelope(pcm: pcm) : nil
+        if let filter = voiceFilter, let v = voice { voice = filter(v) }
         // Filed under this process's PID so `sweepScratch` can tell a crashed
         // run's leftovers from a live one's (the app and a `ghostie process`
         // run can decode at the same time).
@@ -318,12 +327,13 @@ struct CodeSwitchTranscriber {
             }
             let segs = try whisperDecode(stitched.url, language: lang)
             for s in segs {
-                if let orig = stitched.table.toOriginal(s.startMs) {
-                    // Shift the end by the same amount as the start so the
-                    // span survives the run-batch offset remap intact.
+                // Start and end each mapped onto the splice they belong to:
+                // a segment crossing a splice must not keep the span of the
+                // audio removed between them (`OffsetTable.span`).
+                if let orig = stitched.table.span(stitchedStartMs: s.startMs,
+                                                  stitchedEndMs: s.endMs) {
                     out.append(Transcriber.Segment(
-                        startMs: orig, text: s.text,
-                        endMs: s.endMs.map { $0 + (orig - s.startMs) }))
+                        startMs: orig.startMs, text: s.text, endMs: orig.endMs))
                 } else {
                     // Segments inside the silence pads map to nil. Usually
                     // whisper hallucinating into the gap — but if it decoded

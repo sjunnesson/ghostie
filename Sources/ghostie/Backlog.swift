@@ -45,6 +45,10 @@ enum Backlog {
         /// When `attempts` last went up (epoch seconds). Optional, so older
         /// meta.json decodes to nil — see `bump`.
         var lastAttemptAt: Double?
+        /// ⚠️ lines learned from the audio (`Pipeline.Transcription.notices`),
+        /// kept so a summarize-stage retry — which has only the transcript —
+        /// writes the same meta block. Optional: older entries decode to nil.
+        var notices: [String]?
 
         var meetingRoster: MeetingRoster {
             MeetingRoster(others: roster ?? [], selfName: rosterSelf)
@@ -198,7 +202,8 @@ enum Backlog {
     /// Queue a finished transcript whose summary failed (audio not needed).
     static func enqueueTranscript(startedAt: Date, durationMins: String,
                                   transcript: String, source: String,
-                                  roster: MeetingRoster = MeetingRoster()) {
+                                  roster: MeetingRoster = MeetingRoster(),
+                                  notices: [String] = []) {
         ensureRoot()
         let dir = URL(fileURLWithPath: root)
             .appendingPathComponent(stamp.string(from: startedAt))
@@ -209,7 +214,8 @@ enum Backlog {
                        durationMins: durationMins, stage: "summarize",
                        attempts: 0, source: source,
                        roster: roster.others.isEmpty ? nil : roster.others,
-                       rosterSelf: roster.selfName), to: dir)
+                       rosterSelf: roster.selfName,
+                       notices: notices.isEmpty ? nil : notices), to: dir)
         Log.info("Queued transcript to backlog (summary pending): \(dir.lastPathComponent)")
     }
 
@@ -221,10 +227,12 @@ enum Backlog {
     /// with no audio — the next drain read that as silence and replaced the
     /// note with "No speech detected". If either write fails the audio stays
     /// and the entry simply re-transcribes.
-    static func convertToSummarize(_ entry: Entry, transcript: String) {
+    static func convertToSummarize(_ entry: Entry, transcript: String,
+                                   notices: [String] = []) {
         guard (try? transcript.write(to: entry.transcriptFile, atomically: true,
                                      encoding: .utf8)) != nil else { return }
         var m = entry.meta; m.stage = "summarize"; m.attempts = 0; m.lastAttemptAt = nil
+        m.notices = notices.isEmpty ? nil : notices
         guard writeMeta(m, to: entry.dir) else { return }
         try? FileManager.default.removeItem(at: entry.micWav)
         try? FileManager.default.removeItem(at: entry.systemWav)

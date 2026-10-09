@@ -1372,6 +1372,40 @@ func runCodeSwitchSelfTest() -> Bool {
         }
 
         do {
+            // Segments that cross a splice. A: 2 s from 10.0 s; B: 2 s from
+            // 50.0 s (38 s spliced out between them); a run pad; C: 1 s from
+            // 60.0 s. Whisper starts a segment where the last one ended, so
+            // the one after a splice usually begins in the tail of the span
+            // before — on the 2026-10-09 call that put a sentence 100 s early.
+            let table = AudioStitcher.OffsetTable(entries: [
+                .init(stitchedStartMs: 0, stitchedEndMs: 2_000, originalStartMs: 10_000),
+                .init(stitchedStartMs: 2_000, stitchedEndMs: 4_000, originalStartMs: 50_000),
+                .init(stitchedStartMs: 4_500, stitchedEndMs: 5_500, originalStartMs: 60_000)])
+            func span(_ s: Int, _ e: Int?) -> String {
+                guard let m = table.span(stitchedStartMs: s, stitchedEndMs: e) else { return "nil" }
+                return "\(m.startMs)–\(m.endMs.map(String.init) ?? "nil")"
+            }
+            check("span: inside one splice maps both ends exactly",
+                  span(500, 1_500) == "10500–11500", "got \(span(500, 1_500))")
+            check("span: a start clipping a splice's tail goes to the speech after it",
+                  span(1_600, 3_600) == "50000–51600", "got \(span(1_600, 3_600))")
+            check("span: mostly before a splice — clipped to it, never over the removed gap",
+                  span(500, 2_500) == "10500–12000", "got \(span(500, 2_500))")
+            check("span: a sliver either side still picks the bigger one",
+                  span(1_700, 2_200) == "11700–12000", "got \(span(1_700, 2_200))")
+            check("span: across three splices — the one holding most of it",
+                  span(1_000, 4_800) == "50000–52000", "got \(span(1_000, 4_800))")
+            check("span: a start in a run pad moves to the run it reaches into",
+                  span(4_200, 5_000) == "60000–60500", "got \(span(4_200, 5_000))")
+            check("span: a segment wholly inside a pad is dropped",
+                  span(4_100, 4_400) == "nil", "got \(span(4_100, 4_400))")
+            check("span: no end — start mapped where it lies",
+                  span(1_600, nil) == "11600–nil", "got \(span(1_600, nil))")
+            check("span: past the last splice is dropped",
+                  span(5_600, 5_800) == "nil", "got \(span(5_600, 5_800))")
+        }
+
+        do {
             // The scale a real call hits: ~1000 spans in one run, so
             // toOriginal has to binary search rather than scan.
             let loud = (0..<1_000).map { ($0 * 3_000, $0 * 3_000 + 500) }

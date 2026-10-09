@@ -27,6 +27,7 @@ swift build -c release            # release build (what the scripts use)
 .build/release/ghostie import <file>…      # external m4a/mp3/wav/mov → session dir → pipeline
 .build/release/ghostie fetch-models [v]    # download codeswitch models (KB v + large-v3 + VAD)
 .build/release/ghostie mic-probe [secs]   # is voice-processed mic capture working on this OS?
+.build/release/ghostie echo-probe <dir> [out.wav]  # run the after-call echo canceller (and echo gate) on a session
 .build/release/ghostie punctuate-probe <md>  # run the punctuation pass alone, timed
 .build/release/ghostie index               # rebuild the MCP index from the notes folder
 .build/release/ghostie connect [client…] [--remove|--status|--list|--print]  # (un)register
@@ -61,7 +62,16 @@ rules including backchannel crossing, `blocks`/`split` and their timestamp
 provenance, sentence splitting, the `preservesWording` guard, reply parsing and
 concurrent batching, all against a stub provider), `runEchoSuppressorSelfTest()` (exercises `EchoSuppressor.suppress` over
 real-call echo fixtures — pure echo, mixed real+echo segments, ASR variance,
-plus the never-engage guards for headphone/solo calls), `runTranscriptIndexSelfTest()` (exercises `TranscriptIndex` — the
+plus the never-engage guards for headphone/solo calls), `runEchoCancellerSelfTest()`
+(exercises `EchoCanceller` over a synthetic room — lag found either side of
+the reference, ≥20 dB removed including the opening seconds, the user's
+voice intact under double-talk, a no-op without echo, no block ever louder
+than the mic — and the `OutputRoute` jack rule; **no audio or device
+needed**), `runEchoGateSelfTest()` (exercises `EchoGate` over synthetic
+envelopes — echo-only stretches judged and masked, the user into silence,
+over the far end and as a one-block "yeah" kept, a lone hot echo peak still
+echo, a mid-call volume change followed, stand-down without a loud far end —
+plus `Pipeline.keepingSpans`), `runTranscriptIndexSelfTest()` (exercises `TranscriptIndex` — the
 round trip from `Pipeline.render` back to turns, note-name parsing, the
 note-vs-transcript filter, summary extraction and the menu's copy text),
 `runMCPSetupSelfTest()` (exercises the MCP client registry — unique ids,
@@ -71,7 +81,7 @@ installed**), and
 `LanguageDetection`s — single-language collapse, mixed 3-run split,
 cross-track flip vs. isolated fall-back; **no audio or models needed**, so
 it's green everywhere). **Any change to `TranscriptCleaner.swift`,
-`TranscriptRefiner.swift`, `EchoSuppressor.swift`, `Smoother.swift` or
+`TranscriptRefiner.swift`, `EchoSuppressor.swift`, `EchoCanceller.swift`, `EchoGate.swift`, `Smoother.swift` or
 `TranscriptIndex.swift` or `MCPSetup.swift` must keep `ghostie selftest` green**; add a `check(...)` case in the relevant suite
 rather than building a separate harness. Optional end-to-end audio fixtures under `Tests/Fixtures`
 are skipped cleanly when absent.
@@ -128,6 +138,16 @@ the same code drives the menu-bar app and the headless daemon.
   echo-cancelled out of the Me track. If VP can't start (or
   `config.micEchoCancellation` is off) it falls back to the raw SCK
   `.microphone` tap, which re-captures everything the speakers play.
+  **Through the built-in headphone jack the recorder skips VP on purpose**
+  (`OutputRoute`, built-in transport + data source `'hdpn'`): macOS takes
+  that port for headphones and turns echo cancellation *off* while keeping
+  its gain *on*, so desk speakers on the jack came back 14 dB louder than the
+  raw mic heard them (measured 2026-10-06: −24 vs −38.5 dBFS; the MacBook's
+  own speakers −49 VP vs −34.5 raw). The 2026-10-05 Zoom call is that case.
+  There the raw mic is recorded and `EchoCanceller` cancels after the call.
+  Dead ends, so nobody retries them: VP's extra channels are copies of
+  channel 0 (no reference to use), and an aggregate device wrapping the jack
+  makes VP deliver no buffers at all.
   **Enabling voice processing turns the input node into a 9-channel stream**
   (macOS 26.5; it used to be mono). `AVAudioConverter` asked to fold 9ch → 1ch
   returns `noErr`, fills the buffer to the expected length and writes **all
@@ -322,8 +342,60 @@ the same code drives the menu-bar app and the headless daemon.
   backlog meta.json — retries re-derive it to upgrade the queued note in
   place (pre-source entries default to "Teams"). `Pipeline.drain(config:)`
   is the backlog retry entry point.
+- **`EchoCanceller.swift`** — speaker echo cancelled out of the Me *audio*
+  after the call, with participants.wav (what the speakers were fed) as the
+  reference; `Pipeline.transcribeMerge` writes `me.echo-cancelled.wav` beside
+  the session's WAVs, transcribes that, and deletes it — the recording is
+  never touched, and a track with < `minUsefulReductionDB` (1.5 dB) to take
+  is transcribed as recorded. Gated by `micEchoCancellation`. A
+  partitioned-block frequency-domain NLMS (16 × 256 taps, full step), with
+  the offline advantages used: a PHAT cross-correlation finds the echo path
+  and both tracks are delayed so it sits `centreMs` (96 ms) into the filter
+  (the raw tap's echo arrives ~37 ms *before* its reference — a causal-only
+  canceller misses it entirely), and a warm-up pass over the first 5 minutes
+  means the call starts converged. Measured: raw RØDE with jack speakers −52 →
+  −67 dBFS of echo, no far-end window left above `activeThreshold`; a
+  VP-recorded call (the 10-05 one, AGC making the path non-linear) only −7 dB;
+  clean calls 0.00 dB change; 76 min in ~4 s. Two rails: a block the filter
+  made louder is passed through as recorded, and a runaway estimate (20 dB
+  over the mic *and* 10 dB over the reference — VP zeroes the mic while the
+  far end talks, so either alone fires on a healthy filter) resets it.
+  **No spectral residual suppressor, deliberately**: tried on the 10-05 call
+  it reached −60 dBFS and whisper wrote sentences nobody said out of its
+  artefacts while losing some double-talk words. The residue is
+  `EchoSuppressor`'s, which reads text and cannot invent.
+  **It fails on a non-linear room, and more tuning does not fix that.** The
+  2026-10-09 Meet call (raw RØDE, desk speakers on the jack) got 0.8 dB: the
+  tracks correlate at ~0.6, the echo arrives twice 26 ms apart with opposite
+  polarity, the lag drifts 0.26 ms/min. Even trained and scored on one
+  5-minute slice it reaches 4.4 dB; a full step made it worse, drift-correcting
+  the reference changed nothing, and a 512 ms filter diverged (1 371 resets).
+  That call is what `EchoGate` is for.
+- **`EchoGate.swift`** — the echo the canceller found and could not remove
+  (`hadEcho && !worthApplying`), judged by *level*: whatever a room does to
+  the far end, it comes back into the mic a roughly fixed number of dB down
+  (10-09 call: 25 dB at 250 ms block peaks, 90% of echo blocks within 6 dB),
+  while the user peaks far above it. The echo gain is calibrated on the call
+  itself (median over loud far-end blocks, re-measured ±2 min so a volume
+  change is followed) and the canceller supplies the lag. A mic block within
+  `marginDB` (6) of its predicted echo is echo; while the far end is audible
+  the user must hold 2 blocks or clear it by 15 dB, and **where the far end is
+  silent nothing is ever echo**. Two uses in `Pipeline.transcribeMerge`:
+  `masking` zeroes echo-only blocks out of the Me envelope the code-switch
+  decode splices by (`CodeSwitchTranscriber.transcribeBoth(meVoice:)`), so
+  whisper never hears them — the 10-09 Me decode went from 68 to 32 min of
+  audio; and `isEcho` drops a decoded Me segment the user occupies ≤ 20% of,
+  counting only the blocks the masked decode heard (`EchoGate.hearing`) so a
+  spliced-out gap inside a segment's span never counts against it,
+  run *after* `EchoSuppressor` so the text guard still sees the full Me track
+  when deciding whether to engage (`Pipeline.keepingSpans` gives its output
+  whisper's `endMs` back). When the gate runs, the note's meta block carries
+  a ⚠️ line (`Pipeline.echoNotice`) saying some of the other side's words may
+  still be under the user's name; `Backlog.Meta.notices` keeps it across a
+  summary retry. Cost, accepted: the user speaking quietly *over* the far
+  end, within 6 dB of the echo, reads as echo.
 - **`EchoSuppressor.swift`** — the cross-track echo guard (text-level backstop
-  behind `MicCapture`'s AEC — Bluetooth latency can defeat AEC, and backlogged
+  behind `MicCapture`'s AEC and `EchoCanceller` — Bluetooth latency can defeat AEC, and backlogged
   pre-fix recordings re-process through it). Direction is known a priori:
   system audio can never contain the mic, so a ≥5-word run on Me that also
   appears on Participants within its time window is echo and only the Me copy
@@ -462,6 +534,19 @@ the same code drives the menu-bar app and the headless daemon.
   "121 min of run → 121 min of speech (1% less audio to decode)" on the
   2026-09-08 call; the envelope keeps 71% of the Me track and 53% of
   Participants on the same audio.
+  **Map a decoded segment back with `OffsetTable.span`, never
+  start-plus-duration.** Whisper starts a segment where the previous one
+  ended, so the segment after a splice usually begins in the tail of the span
+  before it: `toOriginal(start)` then lands it on the *previous* span's time
+  and an end shifted by the same delta puts its span on removed audio. With
+  echo stretches masked out of the Me decode (`EchoGate`) that put "there's a
+  cost component with atoms" (said at 60:25) at 58:45 on the 2026-10-09 call,
+  and the far end's "invented siesta" line 15 s early even without masking.
+  Mapping the two ends separately is no better — the span then covers the
+  removed stretch, and the cleaner's silence gate dropped five real far-end
+  lines as "decoded from silence". `span` maps the segment onto the one
+  splice it overlaps most, clipped to it, so a span is always audio whisper
+  heard. Selftest pins it (`span:` checks).
 - **Which LID you get decides how long a call takes.** Per-segment detection is
   the pipeline's most expensive stage under the whisper LIDs (~1.2 s/segment:
   measured 2026-08-28, 20 min of a 30 min run on a 56-minute call). Install the

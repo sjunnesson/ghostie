@@ -37,6 +37,57 @@ struct AudioStitcher {
             }
             return nil
         }
+
+        /// Maps a decoded segment back to the original track: onto the one
+        /// splice that holds most of it, start *and* end.
+        ///
+        /// A segment is a stretch of the *stitched* audio, and when it crosses
+        /// a splice no single span of the original track is that audio. The
+        /// old mapping took the start where it fell and shifted the end by the
+        /// same amount, which is wrong in the common case: whisper starts a
+        /// segment where the previous one ended, so the one after a splice
+        /// usually *begins* in the last few hundred milliseconds of the span
+        /// before it. On the 2026-10-09 call, with echo-only stretches spliced
+        /// out of the Me decode (`EchoGate`), "there's a cost component with
+        /// atoms" — said at 60:25 — was stamped 58:45, at the end of the
+        /// previous kept span, and its span sat on removed audio. The same
+        /// happens over the silences every speech-bounded decode removes:
+        /// that call's "I realized why southern Europe invented siesta" was
+        /// put 15 s early, before the reply it prompted.
+        ///
+        /// Mapping the two ends separately is no better: the span then covers
+        /// the removed stretch between them, and the stages that read spans
+        /// (the cleaner's silence gate, the echo gate, diarization) judge
+        /// audio whisper never heard — five real lines of that call's far end
+        /// were dropped as "decoded from silence" that way. So the segment
+        /// goes to the splice it overlaps most, clipped to it: its span is
+        /// always audio whisper heard, and the words that spill over a splice
+        /// are the minority. nil when it overlaps no splice at all — boundary
+        /// noise in a pad between runs, dropped as before.
+        func span(stitchedStartMs ss: Int, stitchedEndMs se: Int?)
+            -> (startMs: Int, endMs: Int?)? {
+            guard let se, se > ss else {
+                return toOriginal(ss).map { ($0, nil) }
+            }
+            // First entry ending after the start.
+            var lo = 0, hi = entries.count
+            while lo < hi {
+                let mid = (lo + hi) / 2
+                if entries[mid].stitchedEndMs <= ss { lo = mid + 1 } else { hi = mid }
+            }
+            var best: OffsetEntry?, bestOverlap = 0
+            var i = lo
+            while i < entries.count && entries[i].stitchedStartMs < se {
+                let e = entries[i]
+                let overlap = min(se, e.stitchedEndMs) - max(ss, e.stitchedStartMs)
+                if overlap > bestOverlap { best = e; bestOverlap = overlap }
+                i += 1
+            }
+            guard let e = best else { return nil }
+            let from = max(ss, e.stitchedStartMs), to = min(se, e.stitchedEndMs)
+            return (e.originalStartMs + (from - e.stitchedStartMs),
+                    e.originalStartMs + (to - e.stitchedStartMs))
+        }
     }
 
     struct Stitched {

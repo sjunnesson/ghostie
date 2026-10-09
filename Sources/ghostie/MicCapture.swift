@@ -9,7 +9,9 @@ import AVFoundation
 /// Apple's voice-processing I/O (the FaceTime stack) cancels the *device
 /// output* — every app's audio, Teams included — from the mic signal, so this
 /// capture path records only the local voice. `EchoSuppressor` stays on as the
-/// text-level backstop (Bluetooth latency can defeat AEC).
+/// text-level backstop (Bluetooth latency can defeat AEC). Through the built-in
+/// headphone jack it cancels nothing and boosts the echo, so the recorder does
+/// not use it there — see `OutputRoute` and `EchoCanceller`.
 ///
 /// Emits 16 kHz mono Int16 chunks plus a host-clock PTS in seconds — the same
 /// shape `AudioChunkConverter` produces for the SCK taps — so `AudioRecorder`

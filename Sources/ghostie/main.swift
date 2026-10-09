@@ -1283,6 +1283,35 @@ case "mic-probe":
     cmdMicProbe(config, seconds: Double(args.count > 1 ? args[1] : "") ?? 6,
                 mode: args.count > 2 ? args[2] : "both",
                 mode2: args.count > 3 ? args[3] : "")
+case "echo-probe":
+    // Hidden: run the after-the-call echo canceller on a session folder's
+    // me.wav against its participants.wav, and say what it did.
+    guard args.count > 1 else { Log.error("Usage: ghostie echo-probe <session-dir> [out.wav]"); exit(1) }
+    let dir = URL(fileURLWithPath: args[1])
+    let out = URL(fileURLWithPath: args.count > 2 ? args[2]
+                  : dir.appendingPathComponent("me.echo-cancelled.wav").path)
+    let started = Date()
+    guard let stats = EchoCanceller.process(mic: dir.appendingPathComponent("me.wav"),
+                                            reference: dir.appendingPathComponent("participants.wav"),
+                                            to: out) else {
+        Log.error("Could not read me.wav and participants.wav in \(dir.path)."); exit(1)
+    }
+    let verdict = stats.worthApplying ? "the pipeline would transcribe the cancelled track"
+        : stats.hadEcho ? "echo left audible — the pipeline would transcribe the recording"
+        : "no echo — the pipeline would transcribe the recording"
+    print(String(format: "%@; %.1fs. Verdict: %@. → %@",
+                 EchoCanceller.describe(stats), Date().timeIntervalSince(started), verdict, out.path))
+    // What the echo gate would make of it, on the calls that reach it.
+    if stats.hadEcho, !stats.worthApplying, let lag = stats.lagMs,
+       let me = WavLevel.envelope(dir.appendingPathComponent("me.wav")),
+       let far = WavLevel.envelope(dir.appendingPathComponent("participants.wav")) {
+        if let gate = EchoGate.profile(me: me, reference: far, lagMs: Int(lag.rounded())) {
+            print(String(format: "Echo gate: echo %.0f dB under the far end; %.1f min of 'Me' is that echo alone, %.1f min is you.",
+                         -gate.echoGainDB, gate.echoSeconds / 60, gate.ownSeconds / 60))
+        } else {
+            print("Echo gate: off — too little loud far end to calibrate on.")
+        }
+    }
 case "roster-probe":
     // Hidden: read the meeting roster out of every running browser, once.
     // Run it during a real call to see what the AX rules find.
@@ -1347,8 +1376,13 @@ case "selftest":
     let mcpOK = runMCPSetupSelfTest()
     print("")
     let micRouteOK = runMicRouteSelfTest()
+    print("")
+    let cancellerOK = runEchoCancellerSelfTest()
+    print("")
+    let gateOK = runEchoGateSelfTest()
     exit(cleanerOK && echoOK && refinerOK && codeSwitchOK && updaterOK && detectorOK
-         && micOK && wavOK && speakerOK && indexOK && mcpOK && micRouteOK ? 0 : 1)
+         && micOK && wavOK && speakerOK && indexOK && mcpOK && micRouteOK
+         && cancellerOK && gateOK ? 0 : 1)
 case "mcp":
     GhostieMCPServer.runBlocking(config: config)
 case "index":

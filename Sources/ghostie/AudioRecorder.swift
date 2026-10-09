@@ -547,10 +547,21 @@ final class AudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
         // right one first (chosen in Settings, or not the lid-closed built-in).
         routeMic()
 
+        // Through the built-in headphone jack voice processing cancels no echo
+        // and turns up what the mic hears — desk speakers on the jack came
+        // back 14 dB louder than the raw mic (see `OutputRoute`). Record the
+        // raw mic there; `EchoCanceller` takes the echo out after the call.
+        var voiceProcessingHelps = true
+        if config.micEchoCancellation, let out = MicRouter.defaultOutput(),
+           !out.voiceProcessingCancelsEcho {
+            voiceProcessingHelps = false
+            Log.info("Mic capture: sound is going to \(out.name) (the headphone jack), where voice processing cancels no echo — recording the raw microphone; speaker echo is cancelled after the call.")
+        }
+
         // Prefer the echo-cancelled mic path (see MicCapture). Routed through
         // micQueue so the drain fences in stop() cover it exactly like the
         // SCK tap they replace. Falls back to the raw tap on any VP failure.
-        if config.micEchoCancellation && micOK {
+        if config.micEchoCancellation && micOK && voiceProcessingHelps {
             let cap = MicCapture { [weak self] samples, pts in
                 guard let self else { return }
                 self.micQueue.async { self.ingestMic(samples, pts: pts) }

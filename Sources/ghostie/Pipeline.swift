@@ -61,8 +61,10 @@ struct Pipeline {
         Self.markPending(rec.sessionDir, source: source)
 
         let lines: [Line]
+        let notices: [String]
         do {
-            lines = try transcribeMerge(mic: rec.micWav, sys: rec.systemWav, roster: roster)
+            let t = try transcribeMerge(mic: rec.micWav, sys: rec.systemWav, roster: roster)
+            (lines, notices) = (t.lines, t.notices)
         } catch {
             // Killed by a quit: leave the session (and its pending marker)
             // for the next launch's sweep.
@@ -97,7 +99,8 @@ struct Pipeline {
 
         let transcript = render(lines)
         let meta = metaBlock(startedAt, durationMins,
-                             mic: rec.micWav, sys: rec.systemWav, source: source)
+                             mic: rec.micWav, sys: rec.systemWav, source: source,
+                             notices: notices)
 
         if lines.isEmpty {
             let url = writeNote(meta: meta,
@@ -109,7 +112,7 @@ struct Pipeline {
 
         let url = finishWithSummary(startedAt: startedAt, durationMins: durationMins,
                                     meta: meta, transcript: transcript, source: source,
-                                    roster: roster)
+                                    roster: roster, notices: notices)
         if url == nil && ChildProcesses.isQuitting { return nil }   // see above
         cleanup(rec.sessionDir)
         return url
@@ -121,7 +124,8 @@ struct Pipeline {
     private func finishWithSummary(startedAt: Date, durationMins: String,
                                    meta: String, transcript: String,
                                    source: String,
-                                   roster: MeetingRoster = MeetingRoster()) -> URL? {
+                                   roster: MeetingRoster = MeetingRoster(),
+                                   notices: [String] = []) -> URL? {
         let summarizer = Summarizer(config: config)
         do {
             guard summarizer.isConfigured else {
@@ -138,7 +142,7 @@ struct Pipeline {
             Log.error("Summary unavailable: \(error.localizedDescription) — queued to backlog")
             Backlog.enqueueTranscript(startedAt: startedAt,
                                       durationMins: durationMins, transcript: transcript,
-                                      source: source, roster: roster)
+                                      source: source, roster: roster, notices: notices)
             let banner = "> ⏳ **Summary queued.** Claude Code wasn't available (\(error.localizedDescription)). Ghostie will add the analysis automatically once it can run again — the full transcript below is already complete."
             return writeNote(meta: meta, summary: banner,
                              transcript: transcript, startedAt: startedAt,
@@ -176,7 +180,8 @@ struct Pipeline {
                               mic: entry.micWav, sys: entry.systemWav,
                               source: entry.meta.source ?? "Call")
                 : p.metaBlock(startedAt, entry.meta.durationMins,
-                              source: entry.meta.source ?? "Call")
+                              source: entry.meta.source ?? "Call",
+                              notices: entry.meta.notices ?? [])
             // Pre-source entries default to "Teams" — the label their queued
             // note was originally written under, so the note name re-derives
             // identically and the upgrade lands in place.
@@ -189,22 +194,30 @@ struct Pipeline {
 
             switch entry.meta.stage {
             case "transcribe":
-                guard let lines = try? p.transcribeMerge(mic: entry.micWav,
-                                                         sys: entry.systemWav,
-                                                         roster: entry.meta.meetingRoster) else {
+                guard let t = try? p.transcribeMerge(mic: entry.micWav,
+                                                     sys: entry.systemWav,
+                                                     roster: entry.meta.meetingRoster) else {
                     Backlog.bump(entry)            // whisper still unavailable
                     continue
                 }
+                let lines = t.lines
                 let transcript = p.render(lines)
+                // What the audio taught the transcription goes into the meta;
+                // it is carried into the entry below if the summary waits, as
+                // the audio is deleted then.
+                let noteMeta = t.notices.isEmpty ? meta
+                    : p.metaBlock(startedAt, entry.meta.durationMins,
+                                  mic: entry.micWav, sys: entry.systemWav,
+                                  source: entry.meta.source ?? "Call", notices: t.notices)
                 if lines.isEmpty {
-                    _ = p.writeNote(meta: meta,
+                    _ = p.writeNote(meta: noteMeta,
                         summary: "_No speech detected on either track._",
                         transcript: transcript, startedAt: startedAt, source: source)
                     Backlog.remove(entry); completed += 1
                     continue
                 }
-                if let summary = p.trySummary(transcript: transcript, meta: meta) {
-                    _ = p.writeNote(meta: meta, summary: summary,
+                if let summary = p.trySummary(transcript: transcript, meta: noteMeta) {
+                    _ = p.writeNote(meta: noteMeta, summary: summary,
                                     transcript: transcript, startedAt: startedAt,
                                     source: source)
                     Backlog.remove(entry); completed += 1
@@ -213,8 +226,9 @@ struct Pipeline {
                 } else {
                     // Transcribed OK but summary still down: keep the
                     // transcript so we never re-transcribe this one again.
-                    Backlog.convertToSummarize(entry, transcript: transcript)
-                    _ = p.writeNote(meta: meta,
+                    Backlog.convertToSummarize(entry, transcript: transcript,
+                                               notices: t.notices)
+                    _ = p.writeNote(meta: noteMeta,
                         summary: "> ⏳ **Summary queued.** Transcript is ready; the AI analysis will be added automatically when Claude Code is available.",
                         transcript: transcript, startedAt: startedAt, source: source)
                 }
@@ -383,15 +397,21 @@ struct Pipeline {
         Log.info("Dumped \(segments.count) post-clean segments → \(url.lastPathComponent)")
     }
 
+    /// What `transcribeMerge` hands back: the transcript, and anything about
+    /// how it was made that a reader of the note needs to be told (they go
+    /// into the meta block, which the summarizer reads too).
+    struct Transcription {
+        var lines: [Line]
+        var notices: [String] = []
+    }
+
+    /// The meta-block line for a call `EchoGate` worked on. Honest about what
+    /// is left: the gate removes what it can tell apart by level, and the
+    /// rest is the other person's words written under the user's name.
+    static let echoNotice = "**Your speakers' sound reached your microphone, and Ghostie could not cancel it from the recording.** Where your microphone heard only the other side, those lines were left out of yours, but a few of their words may still appear under your name. Headphones avoid this."
+
     private func transcribeMerge(mic: URL, sys: URL,
-                                 roster: MeetingRoster = MeetingRoster()) throws -> [Line] {
-        // One streamed pass per track, so the cleaner can ask whether a
-        // segment's own span of the recording carried any audio at all. Only
-        // built when the guard is on — it is the only thing that reads it.
-        func envelope(_ wav: URL) -> WavLevel.Envelope? {
-            guard config.cleanTranscript else { return nil }
-            return WavLevel.envelope(wav)
-        }
+                                 roster: MeetingRoster = MeetingRoster()) throws -> Transcription {
 
         // Whisper's own `endMs` rides along: diarization embeds these spans,
         // and rebuilding them from the next segment's start swallows the
@@ -428,6 +448,45 @@ struct Pipeline {
         let mic = haveMic ? mic : Self.silentStub(beside: mic)
         let sys = haveSys ? sys : Self.silentStub(beside: sys)
 
+        // Speaker echo is taken out of the audio before whisper hears it,
+        // against what the speakers were fed; the recording itself is never
+        // touched. Gated with the live canceller it backs up.
+        let canceller = haveMic && haveSys && config.micEchoCancellation
+            ? cancelEcho(mic: mic, reference: sys) : nil
+        let echoFree = canceller?.cancelled
+        defer { if let echoFree { try? FileManager.default.removeItem(at: echoFree) } }
+        let heard = echoFree ?? mic
+
+        // One streamed pass per track: the cleaner asks whether a segment's
+        // own span of the recording carried any audio at all, and the echo
+        // gate compares the two tracks block by block. Built only when one of
+        // them will read it.
+        let gateWanted = canceller?.stats.map { $0.hadEcho && !$0.worthApplying } ?? false
+        let wantLevels = config.cleanTranscript || gateWanted
+        let heardLevels = wantLevels ? WavLevel.envelope(heard) : nil
+        let sysLevels = wantLevels ? WavLevel.envelope(sys) : nil
+        let cleanerLevels = { (levels: WavLevel.Envelope?) in
+            config.cleanTranscript ? levels : nil
+        }
+
+        // Echo the canceller found and could not remove: judge it by level
+        // instead (`EchoGate`). `heard` is the recording itself here — the
+        // cancelled track is only ever used when it worked.
+        var gate: EchoGate.Profile?
+        if gateWanted, let lag = canceller?.stats?.lagMs,
+           let meLevels = heardLevels, let farLevels = sysLevels {
+            gate = EchoGate.profile(me: meLevels, reference: farLevels,
+                                    lagMs: Int(lag.rounded()))
+            if let gate {
+                Log.info(String(format: "Echo gate: on — 'Me' carries the far end %.0f dB down; "
+                    + "%.1f min of it is that echo alone, %.1f min is you.",
+                    -gate.echoGainDB, gate.echoSeconds / 60, gate.ownSeconds / 60))
+            } else {
+                Log.info("Echo gate: off — too little loud far end to calibrate on; "
+                    + "the echo guard handles 'Me' alone.")
+            }
+        }
+
         // Codeswitch is taken whenever ≥2 per-language whisper models are
         // installed on disk. With one model, the single-language path runs
         // exactly as it did pre-v2. Users control behaviour by what they
@@ -435,22 +494,33 @@ struct Pipeline {
         let cs = config.codeSwitch
         let installed = Models.installed(preferredKBVariant: cs.kbWhisperVariant)
         let active = cs.effectiveLanguages(installed: installed)
+        // Whether the gate takes anything out: the code-switch decode leaves
+        // echo-only stretches unheard (with `decodeSpeechOnly`), and the
+        // transcript guard drops what was decoded from them anyway.
+        let gateMasks = gate != nil && active.count >= 2 && cs.decodeSpeechOnly
+        let gateActs = gate != nil && (gateMasks || config.cleanTranscript)
+        // The segment rule then judges only what the masked decode heard.
+        if gateMasks, let g = gate, let levels = heardLevels {
+            gate = EchoGate.hearing(g, masked: EchoGate.masking(levels, with: g))
+        }
         if active.count >= 2 {
             Log.info("Code-switching transcription on (languages: "
                 + active.joined(separator: "+") + ").")
             let cst = CodeSwitchTranscriber(config: config, installed: installed)
-            let (meSegs, partSegs) = try cst.transcribeBoth(me: mic, participants: sys)
-            me = cleaned(meSegs, "Me", wav: mic, audio: envelope(mic))
-            part = cleaned(partSegs, "Participants", wav: sys, audio: envelope(sys))
+            let (meSegs, partSegs) = try cst.transcribeBoth(
+                me: heard, participants: sys,
+                meVoice: gate.map { g in { EchoGate.masking($0, with: g) } })
+            me = cleaned(meSegs, "Me", wav: mic, audio: cleanerLevels(heardLevels))
+            part = cleaned(partSegs, "Participants", wav: sys, audio: cleanerLevels(sysLevels))
         } else {
             let transcriber = Transcriber(config: config)
             me = haveMic
-                ? cleaned(try transcriber.transcribe(mic, speaker: "Me"),
-                          "Me", wav: mic, audio: envelope(mic))
+                ? cleaned(try transcriber.transcribe(heard, speaker: "Me"),
+                          "Me", wav: mic, audio: cleanerLevels(heardLevels))
                 : []
             part = haveSys
                 ? cleaned(try transcriber.transcribe(sys, speaker: "Participants"),
-                          "Participants", wav: sys, audio: envelope(sys))
+                          "Participants", wav: sys, audio: cleanerLevels(sysLevels))
                 : []
         }
 
@@ -469,7 +539,20 @@ struct Pipeline {
                 participants: part.map { (startMs: $0.startMs, text: $0.text) })
             if stats.engaged {
                 Log.info(stats.summary)
-                me = deEchoed.map { Transcriber.Segment(startMs: $0.startMs, text: $0.text) }
+                me = Self.keepingSpans(deEchoed, from: me)
+            }
+            // Then by level, for what the decode still heard and the text
+            // guard could not match: echo too garbled to repeat five words.
+            if let gate {
+                let before = me
+                me = me.filter { !EchoGate.isEcho(startMs: $0.startMs, endMs: $0.endMs, in: gate) }
+                if me.count < before.count {
+                    let words = { (s: [Transcriber.Segment]) in
+                        s.reduce(0) { $0 + $1.text.split(separator: " ").count }
+                    }
+                    Log.info("Echo gate: dropped \(before.count - me.count) of \(before.count) "
+                        + "'Me' segments (\(words(before) - words(me)) words) that were the far end's echo alone.")
+                }
             }
         }
 
@@ -480,7 +563,55 @@ struct Pipeline {
         // into turns, then put the punctuation back if whisper dropped into
         // its unpunctuated register. Both run before naming so the naming
         // prompt — and the summary built on it — see the readable transcript.
-        return named(refined(Self.merge(lines)), roster: roster)
+        return Transcription(lines: named(refined(Self.merge(lines)), roster: roster),
+                             notices: gateActs ? [Self.echoNotice] : [])
+    }
+
+    /// `EchoSuppressor` reads text and start times only, so its output comes
+    /// back without whisper's `endMs`, which the echo gate needs. Its segments
+    /// are `original`'s in order, some dropped and some trimmed, each keeping
+    /// its start: walk the two together and give each survivor its span back.
+    static func keepingSpans(_ kept: [(startMs: Int, text: String)],
+                             from original: [Transcriber.Segment]) -> [Transcriber.Segment] {
+        var out: [Transcriber.Segment] = []
+        out.reserveCapacity(kept.count)
+        var j = 0
+        for k in kept {
+            while j < original.count && original[j].startMs != k.startMs { j += 1 }
+            let endMs = j < original.count ? original[j].endMs : nil
+            out.append(Transcriber.Segment(startMs: k.startMs, text: k.text, endMs: endMs))
+            if j < original.count { j += 1 }
+        }
+        return out
+    }
+
+    /// Writes `me.echo-cancelled.wav` beside the mic track (see
+    /// `EchoCanceller`) and returns it, or nil to transcribe the track as
+    /// recorded — nothing to cancel, or the tracks could not be read.
+    ///
+    /// Beside the session's own WAVs rather than in the code-switch scratch
+    /// folder: that folder is named by the session and removed after each
+    /// track's decode, which would delete this input from under the next one.
+    private func cancelEcho(mic: URL, reference: URL)
+        -> (cancelled: URL?, stats: EchoCanceller.Stats?) {
+        let out = mic.deletingPathExtension().appendingPathExtension("echo-cancelled.wav")
+        let started = Date()
+        guard let stats = EchoCanceller.process(mic: mic, reference: reference, to: out) else {
+            Log.warn("Echo canceller: could not read the tracks — transcribing 'Me' as recorded.")
+            try? FileManager.default.removeItem(at: out)
+            return (nil, nil)
+        }
+        let took = String(format: "%.0fs", Date().timeIntervalSince(started))
+        let detail = EchoCanceller.describe(stats) + " (\(took))"
+        guard stats.worthApplying else {
+            Log.info(stats.hadEcho
+                ? "Echo canceller: could not make the speaker echo on 'Me' inaudible — \(detail). Transcribing it as recorded; the echo gate and guard take it from there."
+                : "Echo canceller: no speaker echo on 'Me' — transcribing it as recorded (\(took)).")
+            try? FileManager.default.removeItem(at: out)
+            return (nil, stats)
+        }
+        Log.info("Echo canceller: speaker echo taken out of 'Me' — \(detail).")
+        return (out, stats)
     }
 
     /// A 1.5 s silent 16 kHz mono WAV written next to a track that does not
@@ -621,7 +752,7 @@ struct Pipeline {
 
     private func metaBlock(_ startedAt: Date, _ durationMins: String,
                            mic: URL? = nil, sys: URL? = nil,
-                           source: String = "Call") -> String {
+                           source: String = "Call", notices: [String] = []) -> String {
         // An imported file was never captured by Ghostie; saying it was
         // would be the meta block's first lie, and the summarizer reads it.
         let origin = source == Self.importedSource
@@ -635,6 +766,7 @@ struct Pipeline {
         if let warning = Self.trackHealthWarning(mic: mic, sys: sys) {
             block += "\n- ⚠️ \(warning)"
         }
+        for notice in notices { block += "\n- ⚠️ \(notice)" }
         return block
     }
 
