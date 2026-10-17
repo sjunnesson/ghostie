@@ -62,9 +62,10 @@ struct Pipeline {
 
         let lines: [Line]
         let notices: [String]
+        let reader: String?
         do {
             let t = try transcribeMerge(mic: rec.micWav, sys: rec.systemWav, roster: roster)
-            (lines, notices) = (t.lines, t.notices)
+            (lines, notices, reader) = (t.lines, t.notices, t.reader)
         } catch {
             // Killed by a quit: leave the session (and its pending marker)
             // for the next launch's sweep.
@@ -112,7 +113,7 @@ struct Pipeline {
 
         let url = finishWithSummary(startedAt: startedAt, durationMins: durationMins,
                                     meta: meta, transcript: transcript, source: source,
-                                    roster: roster, notices: notices)
+                                    roster: roster, notices: notices, reader: reader)
         if url == nil && ChildProcesses.isQuitting { return nil }   // see above
         cleanup(rec.sessionDir)
         return url
@@ -125,14 +126,16 @@ struct Pipeline {
                                    meta: String, transcript: String,
                                    source: String,
                                    roster: MeetingRoster = MeetingRoster(),
-                                   notices: [String] = []) -> URL? {
+                                   notices: [String] = [],
+                                   reader: String? = nil) -> URL? {
         let summarizer = Summarizer(config: config)
         do {
             guard summarizer.isConfigured else {
                 throw NSError(domain: "ghostie", code: 8, userInfo: [
                     NSLocalizedDescriptionKey: "Claude Code CLI not found / not logged in"])
             }
-            let summary = try summarizer.summarize(transcript: transcript, meta: meta)
+            let summary = try summarizer.summarize(transcript: transcript, meta: meta,
+                                                   reader: reader)
             Log.ok("Summary generated.")
             return writeNote(meta: meta, summary: summary,
                              transcript: transcript, startedAt: startedAt,
@@ -142,7 +145,8 @@ struct Pipeline {
             Log.error("Summary unavailable: \(error.localizedDescription) — queued to backlog")
             Backlog.enqueueTranscript(startedAt: startedAt,
                                       durationMins: durationMins, transcript: transcript,
-                                      source: source, roster: roster, notices: notices)
+                                      source: source, roster: roster, notices: notices,
+                                      reader: reader)
             let banner = "> ⏳ **Summary queued.** Claude Code wasn't available (\(error.localizedDescription)). Ghostie will add the analysis automatically once it can run again — the full transcript below is already complete."
             return writeNote(meta: meta, summary: banner,
                              transcript: transcript, startedAt: startedAt,
@@ -216,7 +220,8 @@ struct Pipeline {
                     Backlog.remove(entry); completed += 1
                     continue
                 }
-                if let summary = p.trySummary(transcript: transcript, meta: noteMeta) {
+                if let summary = p.trySummary(transcript: transcript, meta: noteMeta,
+                                              reader: t.reader) {
                     _ = p.writeNote(meta: noteMeta, summary: summary,
                                     transcript: transcript, startedAt: startedAt,
                                     source: source)
@@ -227,7 +232,7 @@ struct Pipeline {
                     // Transcribed OK but summary still down: keep the
                     // transcript so we never re-transcribe this one again.
                     Backlog.convertToSummarize(entry, transcript: transcript,
-                                               notices: t.notices)
+                                               notices: t.notices, reader: t.reader)
                     _ = p.writeNote(meta: noteMeta,
                         summary: "> ⏳ **Summary queued.** Transcript is ready; the AI analysis will be added automatically when Claude Code is available.",
                         transcript: transcript, startedAt: startedAt, source: source)
@@ -242,7 +247,8 @@ struct Pipeline {
                     Backlog.bump(entry)
                     continue
                 }
-                if let summary = p.trySummary(transcript: transcript, meta: meta) {
+                if let summary = p.trySummary(transcript: transcript, meta: meta,
+                                              reader: entry.meta.reader) {
                     _ = p.writeNote(meta: meta, summary: summary,
                                     transcript: transcript, startedAt: startedAt,
                                     source: source)
@@ -260,10 +266,11 @@ struct Pipeline {
         return completed
     }
 
-    private func trySummary(transcript: String, meta: String) -> String? {
+    private func trySummary(transcript: String, meta: String,
+                            reader: String? = nil) -> String? {
         let s = Summarizer(config: config)
         guard s.isConfigured else { return nil }
-        return try? s.summarize(transcript: transcript, meta: meta)
+        return try? s.summarize(transcript: transcript, meta: meta, reader: reader)
     }
 
     /// After too many attempts, stop retrying but lose nothing: the entry is
@@ -403,6 +410,8 @@ struct Pipeline {
     struct Transcription {
         var lines: [Line]
         var notices: [String] = []
+        /// What "Me" was renamed to, if anything: who the note is for.
+        var reader: String? = nil
     }
 
     /// The meta-block line for a call `EchoGate` worked on. Honest about what
@@ -563,8 +572,9 @@ struct Pipeline {
         // into turns, then put the punctuation back if whisper dropped into
         // its unpunctuated register. Both run before naming so the naming
         // prompt — and the summary built on it — see the readable transcript.
-        return Transcription(lines: named(refined(Self.merge(lines)), roster: roster),
-                             notices: gateActs ? [Self.echoNotice] : [])
+        let (final, reader) = named(refined(Self.merge(lines)), roster: roster)
+        return Transcription(lines: final, notices: gateActs ? [Self.echoNotice] : [],
+                             reader: reader)
     }
 
     /// `EchoSuppressor` reads text and start times only, so its output comes
@@ -729,18 +739,19 @@ struct Pipeline {
 
     /// Replaces placeholder labels with real names, when they can be
     /// established from the conversation. Anything that cannot be named keeps
-    /// its placeholder.
-    private func named(_ lines: [Line], roster: MeetingRoster = MeetingRoster()) -> [Line] {
+    /// its placeholder. `reader` is the name "Me" got, for the summary.
+    private func named(_ lines: [Line], roster: MeetingRoster = MeetingRoster())
+        -> (lines: [Line], reader: String?) {
         var labels: [String] = []
         for l in lines where !labels.contains(l.speaker) { labels.append(l.speaker) }
         guard let naming = SpeakerNamer(config: config)
                 .name(labels: labels, transcript: render(lines), roster: roster),
-              !naming.names.isEmpty else { return lines }
+              !naming.names.isEmpty else { return (lines, nil) }
         Log.info(naming.summary)
-        return lines.map {
+        return (lines.map {
             guard let name = naming.names[$0.speaker] else { return $0 }
             return Line(startMs: $0.startMs, speaker: name, text: $0.text)
-        }
+        }, naming.names["Me"])
     }
 
     func render(_ lines: [Line]) -> String {

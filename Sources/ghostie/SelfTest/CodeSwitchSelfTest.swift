@@ -1560,6 +1560,62 @@ func runCodeSwitchSelfTest() -> Bool {
                 Data(#"{"error":"model not found"}"#.utf8)))
     }
 
+    // ---- The summary is told who the note is for (2026-10-16: it wasn't,
+    // and the note was written to the other person)
+    do {
+        let user = SummarizerPrompt.userContent(transcript: "T", meta: "- Date: x",
+                                                reader: "David")
+        check("reader: the renamed Me is named as the reader",
+              user.contains("The reader of this note is David")
+              && user.contains("speaker labelled \"David\""), user)
+        check("reader: it sits in the metadata, before the transcript",
+              (user.range(of: "reader of this note")?.lowerBound ?? user.endIndex)
+                < (user.range(of: "Transcript:")?.lowerBound ?? user.startIndex))
+        check("reader: no name, no line",
+              SummarizerPrompt.readerLine(nil).isEmpty
+              && SummarizerPrompt.readerLine("  ").isEmpty
+              && !SummarizerPrompt.userContent(transcript: "T", meta: "M")
+                    .contains("reader of this note"))
+        check("reader: the long-call passes carry it too",
+              SummarizerPrompt.segmentUser(part: 1, of: 2, transcript: "T", meta: "M",
+                                           reader: "David").contains("reader of this note is David")
+              && SummarizerPrompt.mergeUser(digest: "D", meta: "M", reader: "David")
+                    .contains("reader of this note is David"))
+    }
+
+    // ---- `claude -p`: the user's hooks stay out, and the CLI's own refusal
+    // reaches the log (2026-10-16: a session limit on stdout, hook noise on
+    // stderr, and only the noise was logged)
+    do {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ghostie-claude-stub-\(getpid())")
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        func stub(_ name: String, _ body: String) -> ClaudeSummarizationProvider {
+            let url = dir.appendingPathComponent(name)
+            try? "#!/bin/sh\ncat >/dev/null\n\(body)\n".write(to: url, atomically: true,
+                                                              encoding: .utf8)
+            chmod(url.path, 0o755)
+            var c = Config()
+            c.claudeBinary = url.path
+            return ClaudeSummarizationProvider(config: c)
+        }
+        let args = (try? stub("echo-args", #"echo "$@""#)
+            .complete(system: "S", user: "U")) ?? ""
+        check("claude: hooks are disabled for every request",
+              args.contains(#"--settings {"disableAllHooks":true}"#), args)
+        var message = ""
+        do {
+            _ = try stub("limit", """
+                echo "You've hit your session limit · resets 7:10pm (Europe/Stockholm)"
+                echo 'SessionEnd hook failed: /bin/sh: node: command not found' >&2
+                exit 1
+                """).complete(system: "S", user: "U")
+        } catch { message = error.localizedDescription }
+        check("claude: a refusal on stdout is reported, not just stderr",
+              message.contains("session limit") && message.contains("exited 1"), message)
+    }
+
     // ---- probeSummary: what the fast path saw, in the log
     do {
         func probe(_ top: String, _ margin: Double) -> LanguageDetection {

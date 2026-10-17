@@ -53,10 +53,11 @@ struct Summarizer {
     /// otherwise two-level map-reduce: per-segment working notes, then the
     /// normal analyst document over the notes. A multi-hour call used to
     /// blow the model's context window and fail the whole summary.
-    func summarize(transcript: String, meta: String) throws -> String {
+    /// `reader` is what "Me" was renamed to — see `SummarizerPrompt.readerLine`.
+    func summarize(transcript: String, meta: String, reader: String? = nil) throws -> String {
         let p = provider
         guard transcript.count > p.maxTranscriptChars else {
-            return try p.summarize(transcript: transcript, meta: meta)
+            return try p.summarize(transcript: transcript, meta: meta, reader: reader)
         }
         let chunks = SummarizerPrompt.splitOnLines(transcript, budget: p.maxTranscriptChars)
         Log.warn("Transcript is \(transcript.count) chars — over the \(config.summaryProvider) provider's \(p.maxTranscriptChars)-char budget; summarizing in \(chunks.count) segments.")
@@ -66,12 +67,13 @@ struct Summarizer {
             let n = try p.complete(
                 system: SummarizerPrompt.segmentSystem,
                 user: SummarizerPrompt.segmentUser(part: i + 1, of: chunks.count,
-                                                   transcript: chunk, meta: meta))
+                                                   transcript: chunk, meta: meta,
+                                                   reader: reader))
             notes.append("### Segment \(i + 1) of \(chunks.count)\n\(n)")
         }
         return try p.complete(
             system: SummarizerPrompt.system,
             user: SummarizerPrompt.mergeUser(digest: notes.joined(separator: "\n\n"),
-                                             meta: meta))
+                                             meta: meta, reader: reader))
     }
 }

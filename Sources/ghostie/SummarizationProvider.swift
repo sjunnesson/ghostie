@@ -41,8 +41,9 @@ extension SummarizationProvider {
 
     /// Single-shot analyst summary; `Summarizer` calls this when the
     /// transcript fits `maxTranscriptChars`.
-    func summarize(transcript: String, meta: String) throws -> String {
+    func summarize(transcript: String, meta: String, reader: String? = nil) throws -> String {
         try complete(system: SummarizerPrompt.system,
-                     user: SummarizerPrompt.userContent(transcript: transcript, meta: meta))
+                     user: SummarizerPrompt.userContent(transcript: transcript, meta: meta,
+                                                        reader: reader))
     }
 }

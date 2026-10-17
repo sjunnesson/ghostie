@@ -53,12 +53,24 @@ enum SummarizerPrompt {
     Start directly with "## Context".
     """
 
-    static func userContent(transcript: String, meta: String) -> String {
+    /// Who the note is for, once naming has replaced "Me" with a real name.
+    /// The system prompt's rule — "Me" is the reader — points at nobody after
+    /// that, and the model has to guess from the conversation which name is
+    /// the user's. On the 2026-10-16 Zoom call it guessed wrong: the other
+    /// person says "thanks so much, David", and the note was written to her,
+    /// with David as "co-founder or adviser". Empty when there is no one to
+    /// name (an imported file, or "Me" left unnamed).
+    static func readerLine(_ reader: String?) -> String {
+        guard let r = reader?.trimmingCharacters(in: .whitespaces), !r.isEmpty else { return "" }
+        return "\n- The reader of this note is \(r): the speaker labelled \"\(r)\" is the user running this tool (the one your instructions call \"Me\"). Write about \(r) in the second person and about everyone else in the third."
+    }
+
+    static func userContent(transcript: String, meta: String, reader: String? = nil) -> String {
         """
         Analyze the following Microsoft Teams call.
 
         Call metadata:
-        \(meta)
+        \(meta)\(readerLine(reader))
 
         Transcript:
         \(transcript)
@@ -89,12 +101,13 @@ enum SummarizerPrompt {
     """
 
     static func segmentUser(part: Int, of total: Int,
-                            transcript: String, meta: String) -> String {
+                            transcript: String, meta: String,
+                            reader: String? = nil) -> String {
         """
         This is segment \(part) of \(total) of one Microsoft Teams call.
 
         Call metadata:
-        \(meta)
+        \(meta)\(readerLine(reader))
 
         Transcript segment:
         \(transcript)
@@ -103,7 +116,7 @@ enum SummarizerPrompt {
 
     /// Final pass: the normal analyst document, produced from the per-segment
     /// notes instead of the raw transcript.
-    static func mergeUser(digest: String, meta: String) -> String {
+    static func mergeUser(digest: String, meta: String, reader: String? = nil) -> String {
         """
         Analyze the following Microsoft Teams call. The call was too long to \
         read in one pass, so instead of the raw transcript you receive an \
@@ -111,7 +124,7 @@ enum SummarizerPrompt {
         them as one continuous call.
 
         Call metadata:
-        \(meta)
+        \(meta)\(readerLine(reader))
 
         Segment notes:
         \(digest)

@@ -44,6 +44,13 @@ struct ClaudeSummarizationProvider: SummarizationProvider {
             "-p",
             "--output-format", "text",
             "--model", config.summaryModel,
+            // The user's own hooks and plugins have no business in a
+            // transcript pass. Launched from Finder, Ghostie's PATH lacks
+            // Homebrew, so a plugin hook that runs `node` fails on every
+            // request and its error is all that reaches stderr — on
+            // 2026-10-16 it was the only thing logged while the real failure
+            // (a session limit) sat unread on stdout.
+            "--settings", #"{"disableAllHooks":true}"#,
             // Replace Claude Code's agentic system prompt with our analyst one.
             "--system-prompt", system
         ]
@@ -138,9 +145,14 @@ struct ClaudeSummarizationProvider: SummarizationProvider {
         guard proc.terminationStatus == 0, !out.isEmpty else {
             let err = String(data: errData, encoding: .utf8)?
                 .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            // The CLI reports its own refusals — "You've hit your session
+            // limit · resets 7:10pm", an expired login — on stdout, where a
+            // result would go. stderr alone hides them.
+            let reason = [String(out.prefix(500)), err].filter { !$0.isEmpty }
+                .joined(separator: " — ")
             throw NSError(domain: "ghostie", code: 7, userInfo: [
                 NSLocalizedDescriptionKey:
-                    "claude exited \(proc.terminationStatus). \(err.isEmpty ? "Are you logged in? Run `claude` once interactively." : err)"
+                    "claude exited \(proc.terminationStatus). \(reason.isEmpty ? "Are you logged in? Run `claude` once interactively." : reason)"
             ])
         }
         return out

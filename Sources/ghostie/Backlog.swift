@@ -49,6 +49,10 @@ enum Backlog {
         /// kept so a summarize-stage retry — which has only the transcript —
         /// writes the same meta block. Optional: older entries decode to nil.
         var notices: [String]?
+        /// What "Me" was renamed to, so a summarize-stage retry — which has
+        /// only the rendered transcript — still tells the summary who the
+        /// note is for. Optional: older entries decode to nil.
+        var reader: String?
 
         var meetingRoster: MeetingRoster {
             MeetingRoster(others: roster ?? [], selfName: rosterSelf)
@@ -203,7 +207,7 @@ enum Backlog {
     static func enqueueTranscript(startedAt: Date, durationMins: String,
                                   transcript: String, source: String,
                                   roster: MeetingRoster = MeetingRoster(),
-                                  notices: [String] = []) {
+                                  notices: [String] = [], reader: String? = nil) {
         ensureRoot()
         let dir = URL(fileURLWithPath: root)
             .appendingPathComponent(stamp.string(from: startedAt))
@@ -215,7 +219,8 @@ enum Backlog {
                        attempts: 0, source: source,
                        roster: roster.others.isEmpty ? nil : roster.others,
                        rosterSelf: roster.selfName,
-                       notices: notices.isEmpty ? nil : notices), to: dir)
+                       notices: notices.isEmpty ? nil : notices,
+                       reader: reader), to: dir)
         Log.info("Queued transcript to backlog (summary pending): \(dir.lastPathComponent)")
     }
 
@@ -228,11 +233,12 @@ enum Backlog {
     /// note with "No speech detected". If either write fails the audio stays
     /// and the entry simply re-transcribes.
     static func convertToSummarize(_ entry: Entry, transcript: String,
-                                   notices: [String] = []) {
+                                   notices: [String] = [], reader: String? = nil) {
         guard (try? transcript.write(to: entry.transcriptFile, atomically: true,
                                      encoding: .utf8)) != nil else { return }
         var m = entry.meta; m.stage = "summarize"; m.attempts = 0; m.lastAttemptAt = nil
         m.notices = notices.isEmpty ? nil : notices
+        m.reader = reader
         guard writeMeta(m, to: entry.dir) else { return }
         try? FileManager.default.removeItem(at: entry.micWav)
         try? FileManager.default.removeItem(at: entry.systemWav)
