@@ -14,7 +14,10 @@ import Foundation
 /// `~/.ghostie/backlog/given-up/<yyyy-MM-dd_HH-mm-ss>/` — same shape; retries
 ///   exhausted, skipped by `entries()` and `isEmpty`, kept for manual retry.
 enum Backlog {
-    static let root = "\(NSHomeDirectory())/.ghostie/backlog"
+    /// `GHOSTIE_BACKLOG_DIR` points a one-off run (`process`, `process-backlog`)
+    /// at a scratch queue, so a test never shares one with the running app.
+    static let root = ProcessInfo.processInfo.environment["GHOSTIE_BACKLOG_DIR"]
+        .flatMap { $0.isEmpty ? nil : $0 } ?? "\(NSHomeDirectory())/.ghostie/backlog"
     static let givenUpDirName = "given-up"
     static let quarantineDirName = "quarantine"
     /// Entries whose meta.json is missing/undecodable are moved here — visibly,
@@ -30,7 +33,7 @@ enum Backlog {
     struct Meta: Codable {
         var startedAt: Double          // epoch seconds
         var durationMins: String
-        var stage: String              // "transcribe" | "summarize"
+        var stage: String              // "transcribe" | "refine" | "summarize"
         var attempts: Int
         /// Which app the call came from ("Teams" / "Zoom" / "Meet" / "Call").
         /// Optional so pre-source meta.json decodes to nil — drains then fall
@@ -53,6 +56,9 @@ enum Backlog {
         /// only the rendered transcript — still tells the summary who the
         /// note is for. Optional: older entries decode to nil.
         var reader: String?
+        /// `refine` stage only: punctuation already ran, and only naming and
+        /// the summary are waiting. Optional: older entries decode to nil.
+        var refined: Bool?
 
         var meetingRoster: MeetingRoster {
             MeetingRoster(others: roster ?? [], selfName: rosterSelf)
@@ -66,6 +72,8 @@ enum Backlog {
         var micWav: URL { dir.appendingPathComponent("me.wav") }
         var systemWav: URL { dir.appendingPathComponent("participants.wav") }
         var transcriptFile: URL { dir.appendingPathComponent("transcript.md") }
+        /// `refine` stage: the turns to punctuate and name, as JSON.
+        var linesFile: URL { dir.appendingPathComponent("lines.json") }
     }
 
     private static let stamp: DateFormatter = {
@@ -224,6 +232,59 @@ enum Backlog {
         Log.info("Queued transcript to backlog (summary pending): \(dir.lastPathComponent)")
     }
 
+    /// Queue a transcribed call whose punctuation or naming a usage limit
+    /// stopped (`Pipeline.Deferred`). The turns are kept to redo the rest
+    /// from, and the rendered transcript beside them for the given-up path;
+    /// no audio, since transcription is done.
+    static func enqueueRefine(startedAt: Date, durationMins: String,
+                              lines: [Pipeline.Line], refined: Bool,
+                              transcript: String, source: String,
+                              roster: MeetingRoster = MeetingRoster(),
+                              notices: [String] = []) {
+        ensureRoot()
+        let dir = URL(fileURLWithPath: root)
+            .appendingPathComponent(stamp.string(from: startedAt))
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        guard let data = try? JSONEncoder().encode(lines),
+              (try? data.write(to: dir.appendingPathComponent("lines.json"),
+                               options: .atomic)) != nil else {
+            // Without the turns there is nothing to redo from; fall back to
+            // what a summary failure queues, so the call is not lost.
+            enqueueTranscript(startedAt: startedAt, durationMins: durationMins,
+                              transcript: transcript, source: source,
+                              roster: roster, notices: notices)
+            return
+        }
+        try? transcript.write(to: dir.appendingPathComponent("transcript.md"),
+                              atomically: true, encoding: .utf8)
+        writeMeta(Meta(startedAt: startedAt.timeIntervalSince1970,
+                       durationMins: durationMins, stage: "refine",
+                       attempts: 0, source: source,
+                       roster: roster.others.isEmpty ? nil : roster.others,
+                       rosterSelf: roster.selfName,
+                       notices: notices.isEmpty ? nil : notices,
+                       refined: refined ? true : nil), to: dir)
+        Log.info("Queued transcript to backlog (punctuation/naming pending): \(dir.lastPathComponent)")
+    }
+
+    /// A `transcribe` entry whose language-model stages a usage limit
+    /// stopped, or a `refine` entry that got further before the next one:
+    /// keep the turns, drop the audio. Same write order as
+    /// `convertToSummarize` — the audio goes last, and only once the turns
+    /// and meta are safely on disk.
+    static func convertToRefine(_ entry: Entry, lines: [Pipeline.Line], refined: Bool,
+                                transcript: String, notices: [String] = []) {
+        guard let data = try? JSONEncoder().encode(lines),
+              (try? data.write(to: entry.linesFile, options: .atomic)) != nil else { return }
+        try? transcript.write(to: entry.transcriptFile, atomically: true, encoding: .utf8)
+        var m = entry.meta; m.stage = "refine"; m.attempts = 0; m.lastAttemptAt = nil
+        m.notices = notices.isEmpty ? nil : notices
+        m.refined = refined ? true : nil
+        guard writeMeta(m, to: entry.dir) else { return }
+        try? FileManager.default.removeItem(at: entry.micWav)
+        try? FileManager.default.removeItem(at: entry.systemWav)
+    }
+
     /// Transcription succeeded later but summary still can't run: keep the
     /// transcript, drop the audio, so we never re-transcribe this one again.
     ///
@@ -239,9 +300,11 @@ enum Backlog {
         var m = entry.meta; m.stage = "summarize"; m.attempts = 0; m.lastAttemptAt = nil
         m.notices = notices.isEmpty ? nil : notices
         m.reader = reader
+        m.refined = nil
         guard writeMeta(m, to: entry.dir) else { return }
         try? FileManager.default.removeItem(at: entry.micWav)
         try? FileManager.default.removeItem(at: entry.systemWav)
+        try? FileManager.default.removeItem(at: entry.linesFile)
     }
 
     /// Count a failed attempt — at most once per `countInterval`. Drains fire

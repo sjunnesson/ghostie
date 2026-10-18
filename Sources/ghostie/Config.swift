@@ -453,6 +453,7 @@ struct Config: Codable {
                || !FileManager.default.isExecutableFile(atPath: cfg.whisperServerBinary) {
             cfg.whisperServerBinary = Config.findWhisperServerBinary()
         }
+        if let c = env["GHOSTIE_CLAUDE_BINARY"], !c.isEmpty { cfg.claudeBinary = c }
         if cfg.claudeBinary.isEmpty
            || !FileManager.default.isExecutableFile(atPath: cfg.claudeBinary) {
             cfg.claudeBinary = Config.findClaudeBinary()

@@ -27,6 +27,11 @@ struct ClaudeSummarizationProvider: SummarizationProvider {
 
     private var timeout: TimeInterval { max(60, config.summaryTimeoutSeconds) }
 
+    /// Longest successful reply still checked for a usage-limit refusal. The
+    /// CLI's refusal is one line; every real answer here is a JSON array or a
+    /// whole note.
+    static let refusalMaxChars = 300
+
     func complete(system: String, user userContent: String,
                   purpose: String = "Summarizing") throws -> String {
         let binary = claudeBinary
@@ -148,12 +153,22 @@ struct ClaudeSummarizationProvider: SummarizationProvider {
             // The CLI reports its own refusals — "You've hit your session
             // limit · resets 7:10pm", an expired login — on stdout, where a
             // result would go. stderr alone hides them.
+            if let limit = ProviderLimitReached.detect(out + "\n" + err) { throw limit }
             let reason = [String(out.prefix(500)), err].filter { !$0.isEmpty }
                 .joined(separator: " — ")
             throw NSError(domain: "ghostie", code: 7, userInfo: [
                 NSLocalizedDescriptionKey:
                     "claude exited \(proc.terminationStatus). \(reason.isEmpty ? "Are you logged in? Run `claude` once interactively." : reason)"
             ])
+        }
+        // A refusal that exits 0 would otherwise come back as the "answer":
+        // a one-line summary, or a punctuation reply that fails to align.
+        // Only a short reply that isn't JSON is judged, so a note — or a
+        // punctuated sentence — that discusses usage limits is never
+        // mistaken for one.
+        if out.count < Self.refusalMaxChars, !out.hasPrefix("["), !out.hasPrefix("{"),
+           let limit = ProviderLimitReached.detect(out) {
+            throw limit
         }
         return out
     }

@@ -22,7 +22,7 @@ struct Pipeline {
     /// so `sweepOrphanedRecordings` can use it to find stranded sessions.
     static let pendingMarker = ".ghostie-pending"
 
-    struct Line {
+    struct Line: Codable {
         let startMs: Int
         let speaker: String
         let text: String
@@ -63,9 +63,10 @@ struct Pipeline {
         let lines: [Line]
         let notices: [String]
         let reader: String?
+        let deferred: Deferred?
         do {
             let t = try transcribeMerge(mic: rec.micWav, sys: rec.systemWav, roster: roster)
-            (lines, notices, reader) = (t.lines, t.notices, t.reader)
+            (lines, notices, reader, deferred) = (t.lines, t.notices, t.reader, t.deferred)
         } catch {
             // Killed by a quit: leave the session (and its pending marker)
             // for the next launch's sweep.
@@ -107,6 +108,21 @@ struct Pipeline {
             let url = writeNote(meta: meta,
                 summary: "_No speech detected on either track, so there is nothing to summarize._",
                 transcript: transcript, startedAt: startedAt, source: source)
+            cleanup(rec.sessionDir)
+            return url
+        }
+
+        if let deferred {
+            // The summary would be refused too, and it should be written from
+            // the punctuated, named transcript anyway — so it waits with them.
+            Log.warn("Claude's usage limit is reached — \(deferred.whatWaits) "
+                + "will be added after it resets (\"\(deferred.limit.message)\"). Queued to backlog.")
+            Backlog.enqueueRefine(startedAt: startedAt, durationMins: durationMins,
+                                  lines: deferred.lines, refined: deferred.refined,
+                                  transcript: transcript, source: source,
+                                  roster: roster, notices: notices)
+            let url = writeNote(meta: meta, summary: Self.limitBanner(deferred),
+                                transcript: transcript, startedAt: startedAt, source: source)
             cleanup(rec.sessionDir)
             return url
         }
@@ -220,8 +236,18 @@ struct Pipeline {
                     Backlog.remove(entry); completed += 1
                     continue
                 }
-                if let summary = p.trySummary(transcript: transcript, meta: noteMeta,
-                                              reader: t.reader) {
+                if let d = t.deferred {
+                    // Transcription is done and must not be redone: keep the
+                    // lines, drop the audio, wait for the limit.
+                    Backlog.convertToRefine(entry, lines: d.lines, refined: d.refined,
+                                            transcript: transcript, notices: t.notices)
+                    _ = p.writeNote(meta: noteMeta, summary: Self.limitBanner(d),
+                                    transcript: transcript, startedAt: startedAt, source: source)
+                    continue
+                }
+                let attempt = p.trySummary(transcript: transcript, meta: noteMeta,
+                                           reader: t.reader)
+                if case .done(let summary) = attempt {
                     _ = p.writeNote(meta: noteMeta, summary: summary,
                                     transcript: transcript, startedAt: startedAt,
                                     source: source)
@@ -247,14 +273,57 @@ struct Pipeline {
                     Backlog.bump(entry)
                     continue
                 }
-                if let summary = p.trySummary(transcript: transcript, meta: meta,
-                                              reader: entry.meta.reader) {
+                switch p.trySummary(transcript: transcript, meta: meta,
+                                    reader: entry.meta.reader) {
+                case .done(let summary):
                     _ = p.writeNote(meta: meta, summary: summary,
                                     transcript: transcript, startedAt: startedAt,
                                     source: source)
                     Backlog.remove(entry); completed += 1
-                } else {
+                case .limited:
+                    continue          // not the entry's failure; see `Deferred`
+                case .failed:
                     Backlog.bump(entry)
+                }
+
+            case "refine":
+                guard let data = try? Data(contentsOf: entry.linesFile),
+                      let lines = try? JSONDecoder().decode([Line].self, from: data) else {
+                    Log.warn("Backlog: could not read \(entry.linesFile.path) — will retry.")
+                    Backlog.bump(entry)
+                    continue
+                }
+                let t = p.finish(lines, refined: entry.meta.refined ?? false,
+                                 roster: entry.meta.meetingRoster)
+                let transcript = p.render(t.lines)
+                if let d = t.deferred {
+                    // Still refused. Keep whatever this pass finished — the
+                    // punctuation, if only naming was refused — and never
+                    // count it: a session limit outlasts the give-up window.
+                    if d.refined && !(entry.meta.refined ?? false) {
+                        Backlog.convertToRefine(entry, lines: d.lines, refined: true,
+                                                transcript: transcript,
+                                                notices: entry.meta.notices ?? [])
+                        _ = p.writeNote(meta: meta, summary: Self.limitBanner(d),
+                                        transcript: transcript, startedAt: startedAt,
+                                        source: source)
+                    }
+                    continue
+                }
+                switch p.trySummary(transcript: transcript, meta: meta, reader: t.reader) {
+                case .done(let summary):
+                    _ = p.writeNote(meta: meta, summary: summary,
+                                    transcript: transcript, startedAt: startedAt,
+                                    source: source)
+                    Backlog.remove(entry); completed += 1
+                case .limited, .failed:
+                    if ChildProcesses.isQuitting { continue }
+                    Backlog.convertToSummarize(entry, transcript: transcript,
+                                               notices: entry.meta.notices ?? [],
+                                               reader: t.reader)
+                    _ = p.writeNote(meta: meta,
+                        summary: "> ⏳ **Summary queued.** Transcript is ready; the AI analysis will be added automatically when Claude Code is available.",
+                        transcript: transcript, startedAt: startedAt, source: source)
                 }
 
             default:
@@ -266,11 +335,20 @@ struct Pipeline {
         return completed
     }
 
+    enum SummaryAttempt {
+        case done(String)
+        /// Refused for a usage limit: not counted against the entry.
+        case limited(ProviderLimitReached)
+        case failed
+    }
+
     private func trySummary(transcript: String, meta: String,
-                            reader: String? = nil) -> String? {
+                            reader: String? = nil) -> SummaryAttempt {
         let s = Summarizer(config: config)
-        guard s.isConfigured else { return nil }
-        return try? s.summarize(transcript: transcript, meta: meta, reader: reader)
+        guard s.isConfigured else { return .failed }
+        do { return .done(try s.summarize(transcript: transcript, meta: meta, reader: reader)) }
+        catch let limit as ProviderLimitReached { return .limited(limit) }
+        catch { return .failed }
     }
 
     /// After too many attempts, stop retrying but lose nothing: the entry is
@@ -280,10 +358,11 @@ struct Pipeline {
     private func finalizeGivenUp(_ entry: Backlog.Entry, meta: String,
                                  source: String) -> Bool {
         // Read before the move below relocates the file.
-        let transcript = entry.meta.stage == "summarize"
+        let hasTranscript = entry.meta.stage == "summarize" || entry.meta.stage == "refine"
+        let transcript = hasTranscript
             ? (try? String(contentsOf: entry.transcriptFile, encoding: .utf8)) : nil
         guard let preserved = Backlog.giveUp(entry) else { return false }
-        if entry.meta.stage == "summarize" {
+        if hasTranscript {
             _ = writeNote(meta: meta,
                 summary: "> ⚠️ Summary could not be generated after several retries. The full transcript below is complete; run `claude` once to log in and future calls will summarize automatically. (The transcript is also preserved at `\(preserved.path)`.)",
                 transcript: transcript ?? "_(Transcript file could not be read — preserved at `\(preserved.path)`.)_",
@@ -412,6 +491,39 @@ struct Pipeline {
         var notices: [String] = []
         /// What "Me" was renamed to, if anything: who the note is for.
         var reader: String? = nil
+        /// Set when a usage limit stopped punctuation or naming part-way.
+        /// `lines` is still what can be shown now; this is what to redo.
+        var deferred: Deferred? = nil
+    }
+
+    /// Work a usage limit postponed. A limit is not a failure — every
+    /// request until the reset is refused the same way, and nothing about
+    /// the call is wrong — so the backlog runs it again afterwards instead of
+    /// keeping what the refusal left. Before this, only the summary was ever
+    /// retried: the 2026-10-16 call kept whisper's run-on text (29% of turns
+    /// ending a sentence; 81% on a re-run) and "Participant 1" for good.
+    struct Deferred {
+        /// What to redo from: the merged turns if punctuation did not finish,
+        /// the punctuated ones if only naming was refused.
+        let lines: [Line]
+        /// Punctuation is done; only naming (and the summary) remain.
+        let refined: Bool
+        let limit: ProviderLimitReached
+
+        var whatWaits: String {
+            refined ? "speaker names and the summary"
+                    : "punctuation, speaker names and the summary"
+        }
+    }
+
+    /// The note's banner while a usage limit holds the rest of the work.
+    static func limitBanner(_ d: Deferred) -> String {
+        let when = d.limit.resetsAt.map { " (it resets \($0))" } ?? ""
+        let state = d.refined
+            ? "The transcript below is complete and punctuated"
+            : "The transcript below is complete, as transcription wrote it"
+        return "> ⏳ **Waiting for Claude.** Claude's usage limit is reached\(when). "
+            + "\(state); \(d.whatWaits) will be added automatically once it lifts."
     }
 
     /// The meta-block line for a call `EchoGate` worked on. Honest about what
@@ -572,9 +684,27 @@ struct Pipeline {
         // into turns, then put the punctuation back if whisper dropped into
         // its unpunctuated register. Both run before naming so the naming
         // prompt — and the summary built on it — see the readable transcript.
-        let (final, reader) = named(refined(Self.merge(lines)), roster: roster)
-        return Transcription(lines: final, notices: gateActs ? [Self.echoNotice] : [],
-                             reader: reader)
+        var t = finish(Self.merge(lines), refined: false, roster: roster)
+        t.notices = gateActs ? [Self.echoNotice] : []
+        return t
+    }
+
+    /// Punctuation and naming over merged turns — the part of a call that
+    /// needs the language model. Shared by a live call and the backlog's
+    /// `refine` stage, which runs it again once a usage limit lifts.
+    /// `refined` skips punctuation that already ran.
+    func finish(_ lines: [Line], refined alreadyRefined: Bool,
+                roster: MeetingRoster = MeetingRoster()) -> Transcription {
+        var readable = lines
+        var limit: ProviderLimitReached?
+        if !alreadyRefined { (readable, limit) = refined(lines) }
+        let naming = named(readable, roster: roster, knownLimit: limit)
+        var t = Transcription(lines: naming.lines, reader: naming.reader)
+        if let hit = limit ?? naming.limit {
+            t.deferred = Deferred(lines: limit == nil ? readable : lines,
+                                  refined: limit == nil, limit: hit)
+        }
+        return t
     }
 
     /// `EchoSuppressor` reads text and start times only, so its output comes
@@ -650,14 +780,14 @@ struct Pipeline {
     /// Coalesce segments into turns, then repunctuate when the transcript
     /// needs it. Skipped entirely by `cleanTranscript: false`, which is the
     /// existing "give me exactly what whisper said" switch.
-    private func refined(_ lines: [Line]) -> [Line] {
-        guard config.cleanTranscript else { return lines }
+    private func refined(_ lines: [Line]) -> (lines: [Line], limit: ProviderLimitReached?) {
+        guard config.cleanTranscript else { return (lines, nil) }
         let turns = TranscriptRefiner.coalesce(lines)
         if turns.count != lines.count {
             Log.info("Turn merge: \(lines.count) → \(turns.count) turns.")
         }
         guard config.restorePunctuation,
-              TranscriptRefiner.needsRestoration(turns) else { return turns }
+              TranscriptRefiner.needsRestoration(turns) else { return (turns, nil) }
 
         // Punctuation is the only thing that makes a sentence boundary
         // visible, so the model is shown blocks several turns long rather
@@ -673,7 +803,7 @@ struct Pipeline {
         let ended = Int(TranscriptRefiner.terminalFraction(out) * 100)
         Log.info("Turn split: \(blocks.count) blocks → \(out.count) turns "
             + "(\(ended)% end a sentence).")
-        return out
+        return (out, stats.limit)
     }
 
     /// Splits the Participants track into individual speakers.
@@ -740,18 +870,20 @@ struct Pipeline {
     /// Replaces placeholder labels with real names, when they can be
     /// established from the conversation. Anything that cannot be named keeps
     /// its placeholder. `reader` is the name "Me" got, for the summary.
-    private func named(_ lines: [Line], roster: MeetingRoster = MeetingRoster())
-        -> (lines: [Line], reader: String?) {
+    private func named(_ lines: [Line], roster: MeetingRoster = MeetingRoster(),
+                       knownLimit: ProviderLimitReached? = nil)
+        -> (lines: [Line], reader: String?, limit: ProviderLimitReached?) {
         var labels: [String] = []
         for l in lines where !labels.contains(l.speaker) { labels.append(l.speaker) }
         guard let naming = SpeakerNamer(config: config)
-                .name(labels: labels, transcript: render(lines), roster: roster),
-              !naming.names.isEmpty else { return (lines, nil) }
-        Log.info(naming.summary)
+                .name(labels: labels, transcript: render(lines), roster: roster,
+                      knownLimit: knownLimit)
+        else { return (lines, nil, nil) }
+        if !naming.names.isEmpty || naming.limit != nil { Log.info(naming.summary) }
         return (lines.map {
             guard let name = naming.names[$0.speaker] else { return $0 }
             return Line(startMs: $0.startMs, speaker: name, text: $0.text)
-        }, naming.names["Me"])
+        }, naming.names["Me"], naming.limit)
     }
 
     func render(_ lines: [Line]) -> String {

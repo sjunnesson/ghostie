@@ -1613,7 +1613,86 @@ func runCodeSwitchSelfTest() -> Bool {
                 """).complete(system: "S", user: "U")
         } catch { message = error.localizedDescription }
         check("claude: a refusal on stdout is reported, not just stderr",
-              message.contains("session limit") && message.contains("exited 1"), message)
+              message.contains("session limit"), message)
+
+        // ---- Usage limits: recognised, and the call's LLM work waits for the reset
+        let real = "You've hit your session limit · resets 7:10pm (Europe/Stockholm)"
+        check("limit: the CLI's session-limit line is recognised, with its reset time",
+              ProviderLimitReached.detect(real)?.resetsAt == "7:10pm (Europe/Stockholm)",
+              ProviderLimitReached.detect(real)?.resetsAt ?? "nil")
+        check("limit: other wordings of a spent allowance are recognised",
+              ProviderLimitReached.detect("Claude AI usage limit reached|1760000000") != nil
+              && ProviderLimitReached.detect("You've hit your weekly limit") != nil)
+        check("limit: context-length and timeout errors are not limits",
+              ProviderLimitReached.detect("Prompt is too long: context limit exceeded") == nil
+              && ProviderLimitReached.detect("claude produced no result within 300 s") == nil
+              && ProviderLimitReached.detect("API Error: 529 Overloaded") == nil)
+        check("limit: no reset time, no guess",
+              ProviderLimitReached.detect("You've hit your usage limit")?.resetsAt == nil)
+
+        func throwsLimit(_ p: ClaudeSummarizationProvider) -> Bool {
+            do { _ = try p.complete(system: "S", user: "U"); return false }
+            catch { return error is ProviderLimitReached }
+        }
+        check("claude: a refusal with a non-zero exit is a usage limit",
+              throwsLimit(stub("limit-exit1", "echo \"\(real)\"; exit 1")))
+        check("claude: a refusal that exits 0 is a usage limit, not an answer",
+              throwsLimit(stub("limit-exit0", "echo \"\(real)\"")))
+        check("claude: a JSON reply that mentions a usage limit is an answer",
+              (try? stub("json", #"echo '["We hit your usage limit, she said."]'"#)
+                .complete(system: "S", user: "U")) == #"["We hit your usage limit, she said."]"#)
+
+        // `Pipeline.finish` against a CLI that refuses everything: punctuation
+        // stops, naming is not asked, the turns to redo come back untouched,
+        // and the name that needs no model is still applied for the note.
+        let calls = dir.appendingPathComponent("calls")
+        func limitedConfig() -> Config {
+            var c = Config()
+            c.claudeBinary = stub("refuse", "echo x >> '\(calls.path)'; echo \"\(real)\"; exit 1")
+                .config.claudeBinary
+            c.userName = "David"
+            return c
+        }
+        func count() -> Int {
+            ((try? String(contentsOf: calls, encoding: .utf8)) ?? "")
+                .split(separator: "\n").count
+        }
+        let rough = (0..<40).map {
+            Pipeline.Line(startMs: $0 * 4_000, speaker: $0 % 2 == 0 ? "Me" : "Participant 1",
+                          text: "so yeah i don't know what to say about this one")
+        }
+        let t = Pipeline(config: limitedConfig()).finish(rough, refined: false)
+        check("finish: a usage limit during punctuation defers the rest",
+              t.deferred?.refined == false
+              && t.deferred?.lines.map(\.text) == rough.map(\.text)
+              && t.deferred?.lines.map(\.speaker) == rough.map(\.speaker))
+        check("finish: naming is not asked once the limit is known",
+              count() <= TranscriptRefiner.maxConcurrentBatches, "\(count()) requests")
+        check("finish: the note still names you while it waits",
+              t.lines.first?.speaker == "David" && t.reader == "David")
+
+        try? FileManager.default.removeItem(at: calls)
+        let punctuated = rough.map {
+            Pipeline.Line(startMs: $0.startMs, speaker: $0.speaker,
+                          text: "So yeah, I don't know what to say about this one.")
+        }
+        let named = Pipeline(config: limitedConfig()).finish(punctuated, refined: true)
+        check("finish: a limit at naming keeps the punctuation and defers only the names",
+              named.deferred?.refined == true && count() == 1
+              && named.deferred?.lines.map(\.text) == punctuated.map(\.text),
+              "\(count()) requests")
+
+        if let d = t.deferred {
+            let banner = Pipeline.limitBanner(d)
+            check("limit banner: says when, and what is still to come",
+                  banner.contains("resets 7:10pm (Europe/Stockholm)")
+                  && banner.contains("punctuation, speaker names and the summary"), banner)
+        }
+        let back = (try? JSONEncoder().encode(rough))
+            .flatMap { try? JSONDecoder().decode([Pipeline.Line].self, from: $0) }
+        check("refine stage: turns survive the backlog's JSON round trip",
+              back?.map(\.text) == rough.map(\.text)
+              && back?.map(\.startMs) == rough.map(\.startMs))
     }
 
     // ---- probeSummary: what the fast path saw, in the log

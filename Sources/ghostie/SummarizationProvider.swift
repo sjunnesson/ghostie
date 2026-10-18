@@ -47,3 +47,52 @@ extension SummarizationProvider {
                                                         reader: reader))
     }
 }
+
+/// The provider answered, and the answer was "not now": the user's own usage
+/// allowance is spent. Nothing is wrong with the request or the transcript, so
+/// this is not a failure to count against a call. Every further request until
+/// the reset is refused the same way, which makes "try the next batch" waste.
+///
+/// On 2026-10-16 a 105-minute call hit a session limit after recording. Seven
+/// punctuation batches were each sent twice, naming once, the summary twice,
+/// and all were refused. The note kept whisper's run-on text and
+/// "Participant 1" for good, because only the summary was ever retried.
+struct ProviderLimitReached: LocalizedError {
+    /// The provider's own words, e.g. "You've hit your session limit ·
+    /// resets 7:10pm (Europe/Stockholm)".
+    let message: String
+
+    var errorDescription: String? { message }
+
+    /// When the provider said the limit lifts, as it said it ("7:10pm
+    /// (Europe/Stockholm)"). Shown to the user, never parsed into a date:
+    /// the CLI's wording is not a contract, and the backlog retries on its
+    /// own timer regardless.
+    var resetsAt: String? {
+        guard let r = message.range(of: #"resets\s+(at\s+)?"#, options: [.regularExpression, .caseInsensitive])
+        else { return nil }
+        let rest = message[r.upperBound...]
+            .prefix { $0 != "\n" && $0 != "·" && $0 != "|" }
+            .trimmingCharacters(in: .whitespacesAndNewlines.union(.init(charactersIn: ".")))
+        return rest.isEmpty ? nil : rest
+    }
+
+    /// A usage limit in a provider's reply. Deliberately narrow: "limit" alone
+    /// also appears in context-length and timeout errors, which are real
+    /// failures and must keep counting.
+    static func detect(_ text: String) -> ProviderLimitReached? {
+        let patterns = [
+            #"hit your (session |usage |weekly |daily |monthly )?limit"#,
+            #"(session|usage|weekly|daily|monthly|5-hour) limit (reached|exceeded)"#,
+            #"usage limit"#,
+            #"out of (extra )?usage"#,
+        ]
+        func matches(_ s: some StringProtocol) -> Bool {
+            patterns.contains { s.range(of: $0, options: [.regularExpression, .caseInsensitive]) != nil }
+        }
+        guard matches(text) else { return nil }
+        let line = text.split(separator: "\n").first { matches($0) }
+        return ProviderLimitReached(
+            message: String(line ?? Substring(text)).trimmingCharacters(in: .whitespaces))
+    }
+}

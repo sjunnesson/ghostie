@@ -615,9 +615,18 @@ the same code drives the menu-bar app and the headless daemon.
   a slow transcript for an unpunctuated one. A batch that fails now also warns
   *when it happens* rather than only in the end-of-pass tally, which is how a
   slow provider shows itself while the pass is still running.
-- **`Backlog.swift`** — durable retry queue at `~/.ghostie/backlog/`. Two
-  stages: `transcribe` (audio kept) and `summarize` (transcript kept, audio
-  dropped so it's never re-transcribed). A note is always written immediately
+- **`Backlog.swift`** — durable retry queue at `~/.ghostie/backlog/`. Three
+  stages: `transcribe` (audio kept), `refine` (the merged turns kept as
+  `lines.json`, audio dropped) and `summarize` (transcript kept, audio
+  dropped so it's never re-transcribed). `refine` exists for **usage
+  limits**: `ClaudeSummarizationProvider` turns the CLI's "You've hit your
+  session limit · resets …" into `ProviderLimitReached`, punctuation and
+  naming stop at the first one, and `Pipeline.Deferred` queues the call to
+  be punctuated, named and summarized after the reset (`Pipeline.finish`
+  runs both live and from the backlog). A limit is **never counted** as a
+  failed attempt — a five-hour session limit outlasts the ~5 h give-up
+  window. Before this only the summary was retried, and the 2026-10-16 call
+  kept whisper's run-on text and "Participant 1" for good. A note is always written immediately
   with a "queued" banner and upgraded in place once processing succeeds. Drains
   on launch, after each call, on settings change, and every 10 min — coalesced
   in `Engine`, and under a cross-process `flock` (`Backlog.DrainLock`) so the
@@ -703,7 +712,10 @@ the same code drives the menu-bar app and the headless daemon.
   that is a `.build` directory — a client pointed at a deleted binary fails
   with nothing more useful than "server disconnected".
 - **`Config.swift`** — `~/.ghostie/config.json` + env overrides
-  (`GHOSTIE_NOTES_FOLDER`, `GHOSTIE_WHISPER_MODEL`, `GHOSTIE_SUMMARY_MODEL`).
+  (`GHOSTIE_NOTES_FOLDER`, `GHOSTIE_WHISPER_MODEL`, `GHOSTIE_SUMMARY_MODEL`,
+  `GHOSTIE_CLAUDE_BINARY`; `Backlog.root` reads `GHOSTIE_BACKLOG_DIR`). The
+  last two let a scratch run use a stub `claude` and its own queue — the
+  running app drains `~/.ghostie/backlog` on its own and would race it.
   Binary/model paths are **never persisted** so resolution (including
   `.app`-bundled resources for the self-contained `.dmg`) re-runs on every
   machine and self-heals stale paths. The single-language `whisperModel` is

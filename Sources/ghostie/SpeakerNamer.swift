@@ -38,8 +38,18 @@ struct SpeakerNamer {
     struct Naming {
         /// label → display name, only for labels that got a real name.
         let names: [String: String]
+        /// Set when the model refused for a usage limit, so the labels it
+        /// would have named are still open and naming should run again after
+        /// the reset — unlike "no names established", which is an answer.
+        var limit: ProviderLimitReached? = nil
         var summary: String {
-            names.isEmpty
+            if let limit {
+                return "speaker naming: postponed — the provider's usage limit is reached "
+                    + "(\"\(limit.message)\")"
+                    + (names.isEmpty ? "" : "; for now " + names.sorted { $0.key < $1.key }
+                        .map { "\($0.key) → \($0.value)" }.joined(separator: ", "))
+            }
+            return names.isEmpty
                 ? "speaker naming: no names established — keeping generic labels"
                 : "speaker naming: " + names.sorted { $0.key < $1.key }
                     .map { "\($0.key) → \($0.value)" }.joined(separator: ", ")
@@ -52,8 +62,13 @@ struct SpeakerNamer {
     /// `roster`, when the meeting window gave us one, turns this from an open
     /// question into a closed one: the answer has to come from the list of
     /// people actually in the call, spelled the way the meeting spelled it.
+    ///
+    /// `knownLimit` is a usage limit an earlier stage of this run already hit:
+    /// the model is not asked, since it would refuse too, and only the names
+    /// that need no model are applied.
     func name(labels: [String], transcript: String,
-              roster: MeetingRoster = MeetingRoster()) -> Naming? {
+              roster: MeetingRoster = MeetingRoster(),
+              knownLimit: ProviderLimitReached? = nil) -> Naming? {
         guard config.nameSpeakers, !labels.isEmpty else { return nil }
 
         // A configured name for the local speaker is a fact, not a guess — it
@@ -72,6 +87,7 @@ struct SpeakerNamer {
             ask.removeAll { $0 == me }
         }
         guard !ask.isEmpty else { return Naming(names: resolved) }
+        if let knownLimit { return Naming(names: resolved, limit: knownLimit) }
 
         let provider = Summarizer(config: config).provider
         guard provider.isConfigured else {
@@ -80,19 +96,28 @@ struct SpeakerNamer {
         let prompt = Self.user(labels: ask, transcript: transcript,
                                knownSelf: resolved["Me"], roster: roster,
                                budget: max(Self.promptBudget, provider.maxTranscriptChars))
-        func request() -> String? { try? provider.complete(system: Self.system, user: prompt) }
+        var limit: ProviderLimitReached?
+        func request() -> String? {
+            do { return try provider.complete(system: Self.system, user: prompt) }
+            catch let l as ProviderLimitReached { limit = l; return nil }
+            catch { return nil }
+        }
         // One retry, as the punctuation batches get — but only after a fast
         // failure. Naming runs straight after that burst of concurrent
         // requests, where a transient refusal is most likely, and unlike the
         // summary a failure here is never backlogged: the note keeps
-        // "Participant N" for good. A request that failed by timing out is
+        // "Participant N" for good. (A usage limit is the exception — it is
+        // returned as `Naming.limit`, and `Pipeline` queues the call to be
+        // named after the reset.) A request that failed by timing out is
         // not asked twice; that would double the wait for the same answer.
         let started = Date()
         var reply = request()
+        if let limit { return Naming(names: resolved, limit: limit) }
         if reply == nil, Date().timeIntervalSince(started) < Self.retryIfFailedWithin {
             Thread.sleep(forTimeInterval: TranscriptRefiner.batchRetryDelay)
             reply = request()
         }
+        if let limit { return Naming(names: resolved, limit: limit) }
         guard let reply else {
             Log.info("Speaker naming skipped: the summarization model could not be reached.")
             return resolved.isEmpty ? nil : Naming(names: resolved)

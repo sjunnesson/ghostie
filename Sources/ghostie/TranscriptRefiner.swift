@@ -323,8 +323,16 @@ enum TranscriptRefiner {
         /// Blocks that already read as punctuated and were never sent.
         var skipped = 0
         var total = 0
+        /// Set when the provider refused for a usage limit. The pass stopped
+        /// there, so whatever it returned is partial and the caller should
+        /// run it again after the reset rather than keep it.
+        var limit: ProviderLimitReached?
         var summary: String {
             guard attempted else { return "punctuation: not needed" }
+            if let limit {
+                return "punctuation: stopped — the provider's usage limit is reached "
+                    + "(\"\(limit.message)\"); \(restored)/\(total) turns done before it"
+            }
             var s = "punctuation: \(restored)/\(total) turns repunctuated "
                 + "(\(densityBefore) → \(densityAfter) marks per 100 words)"
             if skipped > 0 { s += ", \(skipped) already punctuated" }
@@ -479,12 +487,19 @@ enum TranscriptRefiner {
                             return nil
                         }
                         return parsed
+                    } catch let limit as ProviderLimitReached {
+                        sink.limitReached(limit)
+                        why = limit.message
+                        return nil
                     } catch {
                         why = error.localizedDescription
                         return nil
                     }
                 }
                 var restored = attempt(label)
+                // A limit is not a batch failure: it isn't counted, and the
+                // batches still to start never will.
+                if restored == nil, sink.limit != nil { return }
                 if restored == nil {
                     // Say so now, not only in the end-of-pass tally: a batch
                     // that fails and then succeeds on retry leaves no trace
@@ -544,10 +559,15 @@ enum TranscriptRefiner {
                     // nothing else, so it is not counted against
                     // `maxBatchFailures` — the batch pass already decided
                     // whether the provider is up.
-                    guard let reply = try? provider.complete(
+                    let reply: String
+                    do {
+                        reply = try provider.complete(
                             system: system, user: user,
-                            purpose: "Repunctuating rejected block \(n + 1)/\(solo.count)"),
-                          let candidate = parse(reply, expecting: 1)?.first,
+                            purpose: "Repunctuating rejected block \(n + 1)/\(solo.count)")
+                    } catch let limit as ProviderLimitReached {
+                        sink.limitReached(limit); return
+                    } catch { return }
+                    guard let candidate = parse(reply, expecting: 1)?.first,
                           preservesWording(original.text, candidate),
                           candidate != original.text
                     else { return }
@@ -572,6 +592,7 @@ enum TranscriptRefiner {
         stats.recovered = sink.recovered
         stats.failedBatches = sink.failures
         stats.totalBatches = batches.count
+        stats.limit = sink.limit
         stats.densityAfter = punctuationDensity(out)
         return (out, stats)
     }
@@ -632,6 +653,14 @@ enum TranscriptRefiner {
 
         var result: [Pipeline.Line] { lock.lock(); defer { lock.unlock() }; return lines }
         var providerIsDown: Bool { lock.lock(); defer { lock.unlock() }; return down }
+        private var refusal: ProviderLimitReached?
+        var limit: ProviderLimitReached? { lock.lock(); defer { lock.unlock() }; return refusal }
+        /// The provider refused for a usage limit: stop at once. Every request
+        /// until the reset gets the same answer, so neither a retry nor the
+        /// next batch can help.
+        func limitReached(_ l: ProviderLimitReached) {
+            lock.lock(); if refusal == nil { refusal = l }; down = true; lock.unlock()
+        }
         /// Records a batch that failed twice; `max` of them stops the run.
         func batchFailed(max: Int, why: String) {
             lock.lock()

@@ -273,6 +273,34 @@ func runTranscriptRefinerSelfTest() -> Bool {
     check("restore: an unreachable provider changes nothing",
           dead.lines.map(\.text) == rough.map(\.text) && dead.stats.restored == 0)
 
+    // Usage limit: the pass stops at the first refusal. No retry, nothing
+    // counted as a failed batch, and the stats say a limit, not a failure —
+    // that is what tells Pipeline to run it again after the reset.
+    final class LimitedProvider: SummarizationProvider, @unchecked Sendable {
+        var isConfigured = true
+        var displayStatus = "limited"
+        var maxTranscriptChars = 1 << 20
+        private let lock = NSLock()
+        private(set) var calls = 0
+        func complete(system: String, user: String, purpose: String) throws -> String {
+            lock.lock(); calls += 1; lock.unlock()
+            throw ProviderLimitReached(
+                message: "You've hit your session limit · resets 7:10pm (Europe/Stockholm)")
+        }
+    }
+    let many = (0..<400).map { line($0 * 1_000, $0 % 2 == 0 ? "Me" : "Participant 1",
+                                    "so yeah i don't know what to say about this one") }
+    let limited = LimitedProvider()
+    let refused = TranscriptRefiner.restore(many, provider: limited, batchSize: 10)
+    check("restore: a usage limit stops the pass instead of spending every batch",
+          limited.calls <= TranscriptRefiner.maxConcurrentBatches,
+          "\(limited.calls) requests")
+    check("restore: a usage limit is reported, and not as failed batches",
+          refused.stats.limit != nil && refused.stats.failedBatches == 0
+          && refused.stats.summary.contains("usage limit"), refused.stats.summary)
+    check("restore: a refused pass changes nothing",
+          refused.lines.map(\.text) == many.map(\.text))
+
     // The request carries the turns as a JSON array, in order.
     var seen = ""
     let recording = StubProvider(transform: { user in
