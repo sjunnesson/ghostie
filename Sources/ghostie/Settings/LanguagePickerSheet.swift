@@ -199,8 +199,15 @@ enum LanguagePickerSheet {
                 // The model's own label already carries its size, so don't
                 // quote a second (differently-rounded) figure next to it —
                 // say what will actually happen instead.
+                let standsBehind: Bool = {
+                    switch TransducerPresentation.state(language: code, config: Config.load()) {
+                    case .active, .downloading: return true
+                    default: return false
+                    }
+                }()
                 note.stringValue = selectedIsOnDisk()
-                    ? "Already downloaded — Ghostie will use it as it is."
+                    ? (standsBehind ? "Already downloaded — Ghostie keeps it as the fallback."
+                                    : "Already downloaded — Ghostie will use it as it is.")
                     : "Ghostie downloads this once and then runs it locally."
             }
         }
@@ -260,7 +267,9 @@ enum LanguagePickerSheet {
         a.messageText = title
         a.informativeText = fixedLanguage == nil
             ? "Ghostie detects which of your languages each speaker is using and sends it to that language's model. Everything runs locally."
-            : "Which model should decode this language."
+            : TransducerPresentation.pickerLead(
+                TransducerPresentation.state(language: fixedLanguage!, config: Config.load()),
+                languageName: WhisperLanguages.displayName(fixedLanguage!))
         a.accessoryView = container
         a.addButton(withTitle: confirm)
         a.addButton(withTitle: "Cancel")

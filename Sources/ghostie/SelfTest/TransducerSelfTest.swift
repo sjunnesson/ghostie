@@ -320,6 +320,67 @@ func runTransducerSelfTest() -> Bool {
           TranscriptionPane.transducerStatus(languages: ["en"], installed: [], available: ["en"],
                                              runtime: false).contains("Not available in this build"))
 
+    // MARK: What Settings says
+    typealias Shown = TransducerPresentation
+    let onDisk = ["sv": "/m/pianissimo-sv-onnx", "en": "/m/parakeet-tdt-0.6b-v3-en-onnx", "fi": "/m/pianissimo-fi-onnx"]
+    func shown(_ language: String, enabled: Bool = true, runtime: Bool = true,
+               installed: [String: String] = onDisk) -> Shown.State {
+        Shown.state(language: language, enabled: enabled, runtime: runtime, installed: installed)
+    }
+    check("an installed model in use is named", shown("sv") == .active("Klang Pianissimo")
+          && shown("en") == .active("NVIDIA Parakeet"))
+    check("a later Klang language is named the same way", shown("fi") == .active("Klang Pianissimo"))
+    check("a known model not yet on disk is downloading",
+          shown("da") == .downloading("Klang Pianissimo"))
+    check("a language with no fast model says nothing", shown("de") == .none)
+    check("switched off, an installed model is said to be idle",
+          shown("sv", enabled: false) == .off("Klang Pianissimo")
+              && shown("da", enabled: false) == .none)
+    check("a build that cannot run it says so", shown("sv", runtime: false) == .unavailable("Klang Pianissimo")
+          && shown("da", runtime: false) == .none)
+    let roles = "KB-Whisper-large (standard) · ~1.1 GB · fallback when detection is unsure"
+    func rowLine(_ state: Shown.State) -> String {
+        Shown.rowSubtitle(state, whisper: "KB-Whisper-large (standard)", roles: roles)
+    }
+    check("the row says who transcribes, then who stands behind — and nothing else",
+          rowLine(shown("sv")) == "Transcribed by Klang Pianissimo · KB-Whisper-large (standard) is the fallback")
+    check("whisper's old roles are not claimed while another model does the work",
+          !rowLine(shown("sv")).contains("detection"))
+    check("the row says a download is under way, whisper still doing the job",
+          rowLine(shown("da")).hasPrefix(roles) && rowLine(shown("da")).contains("Klang Pianissimo is downloading"))
+    check("a row with no fast model reads exactly as before", rowLine(.none) == roles)
+    check("only a model at work earns the Fast badge",
+          Shown.rowBadge(shown("sv")) == "Fast" && Shown.rowBadge(shown("da")) == nil
+              && Shown.rowBadge(shown("sv", enabled: false)) == nil)
+    let lead = Shown.pickerLead(shown("sv"), languageName: "Swedish")
+    check("the model picker opens by saying who transcribes the language",
+          lead.hasPrefix("Klang Pianissimo transcribes Swedish.") && lead.contains("Whisper fallback"), lead)
+    check("…and asks its old question when nothing else does",
+          Shown.pickerLead(.none, languageName: "German") == "Which model should decode this language.")
+    let english: (String) -> String = { ["sv": "Swedish", "en": "English", "da": "Danish", "de": "German"][$0] ?? $0 }
+    let both = Shown.mode(languages: ["en", "sv"], states: ["en": shown("en"), "sv": shown("sv")],
+                          displayName: english)
+    check("the summary says languages are told apart by what was said, not detected",
+          both?.title == "2 languages, told apart by what was said"
+              && both?.detail.contains("detect") == false, "\(String(describing: both))")
+    check("…in few enough words to fit its two lines", (both?.detail.count ?? 999) <= 120)
+    let withGerman = Shown.mode(languages: ["en", "de"], states: ["en": shown("en"), "de": .none],
+                                displayName: english)
+    check("…and says which language still goes to Whisper",
+          withGerman?.detail.contains("German goes to Whisper") == true, "\(String(describing: withGerman))")
+    let nordicPair = Shown.mode(languages: ["sv", "da"],
+                                states: ["sv": shown("sv"), "da": .active("Klang Pianissimo")],
+                                displayName: english)
+    check("look-alike languages are said to be told apart by ear",
+          nordicPair?.title == "2 languages, told apart by ear"
+              && nordicPair?.detail.contains("Swedish and Danish") == true, "\(String(describing: nordicPair))")
+    check("one language is said to be transcribed fast",
+          Shown.mode(languages: ["en"], states: ["en": shown("en")], displayName: english)?.title
+              == "One language — English, transcribed fast")
+    check("with no fast model at work the old wording stands",
+          Shown.mode(languages: ["en", "sv"], states: ["en": .none, "sv": .downloading("Klang Pianissimo")],
+                     displayName: english) == nil)
+
     // MARK: Download verification
     check("a git-stored file is verified by its git blob id",
           ModelDownloader.gitBlobID(Data()) == "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"

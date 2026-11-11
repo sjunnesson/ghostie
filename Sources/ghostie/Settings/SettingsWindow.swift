@@ -46,6 +46,13 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
     /// than hunting for the right button. Subsequent missing models keep
     /// their manual Download buttons (the downloader processes one at a time
     /// and the per-row UI tracks inflight by key).
+    /// Open on a named pane (`ghostie settings transcription`) — for looking
+    /// at one pane of a build without clicking through to it.
+    func show(paneNamed name: String) {
+        if let id = PaneId(rawValue: name) { currentPaneId = id }
+        show()
+    }
+
     func showOnTranscriptionForMissingModels() {
         if window == nil {
             currentPaneId = .transcription

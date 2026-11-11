@@ -148,7 +148,8 @@ final class TranscriptionPane: NSView {
                 sub: "Add the languages you speak on calls. Ghostie downloads a model for each one and detects which is being spoken, per speaker."))
         } else {
             for r in setup.rows {
-                let row = LanguageRowView(row: r)
+                let row = LanguageRowView(
+                    row: r, fast: TransducerPresentation.state(language: r.code, config: cfg))
                 row.onSelect = { [weak self] in self?.select(r.code) }
                 row.onMenu = { [weak self] view in self?.showRowMenu(for: r, from: view) }
                 row.onAction = { [weak self] in
@@ -229,8 +230,10 @@ final class TranscriptionPane: NSView {
     private var modeTitle: String {
         switch setup.mode {
         case .unconfigured:      return "Nothing to transcribe with yet"
-        case .single(let l):     return "One language — \(WhisperLanguages.displayName(l))"
-        case .codeSwitch(let l): return "\(l.count) languages, detected per speaker"
+        case .single(let l):
+            return fastMode([l])?.title ?? "One language — \(WhisperLanguages.displayName(l))"
+        case .codeSwitch(let l):
+            return fastMode(l)?.title ?? "\(l.count) languages, detected per speaker"
         }
     }
 
@@ -239,11 +242,21 @@ final class TranscriptionPane: NSView {
         case .unconfigured:
             return "Add a language above and Ghostie will fetch the model it needs."
         case .single(let l):
+            if let fast = fastMode([l]) { return fast.detail }
             return "Everything is transcribed as \(WhisperLanguages.displayName(l)). Add a second language and Ghostie starts detecting which one each speaker is using."
-        case .codeSwitch:
+        case .codeSwitch(let langs):
+            if let fast = fastMode(langs) { return fast.detail }
             let driver = setup.detectionModelLabel ?? "—"
             return "Ghostie splits each track at the pauses, works out which language each stretch is, and sends it to that language's model. Detection runs on \(driver)."
         }
+    }
+
+    /// The summary line when fast models are doing the transcribing.
+    private func fastMode(_ languages: [String]) -> (title: String, detail: String)? {
+        var states: [String: TransducerPresentation.State] = [:]
+        for code in languages { states[code] = TransducerPresentation.state(language: code, config: cfg) }
+        return TransducerPresentation.mode(languages: languages, states: states,
+                                           displayName: WhisperLanguages.displayName)
     }
 
     private var modeSymbol: String {
@@ -393,7 +406,7 @@ final class TranscriptionPane: NSView {
 
         quality.addRow(buildToggleRow(
             label: "Tidy up the transcript",
-            sub: "Trims the things Whisper sometimes invents in silent stretches, like \"Thanks for watching.\"",
+            sub: "Trims the things a speech model sometimes invents in silent stretches, like \"Thanks for watching.\"",
             on: cfg.cleanTranscript) { [weak self] on in
                 self?.change { c in c.cleanTranscript = on }
             })
@@ -549,7 +562,8 @@ final class TranscriptionPane: NSView {
         func names(_ codes: [String]) -> String {
             ListFormatter.localizedString(byJoining: codes.map(WhisperLanguages.displayName))
         }
-        let lead = "Transcribes a call in a fraction of the time, with a second speech model per language (about 650 MB each, fetched in the background)."
+        // Two lines is all the row shows; the status sentence must fit in them.
+        let lead = "Klang Pianissimo and NVIDIA Parakeet transcribe a call in a fraction of the time (about 650 MB a language)."
         guard runtime else { return lead + " Not available in this build." }
         let ready = languages.filter(installed.contains)
         let coming = languages.filter { !installed.contains($0) && available.contains($0) }
@@ -596,10 +610,10 @@ private final class LanguageRowView: NSView {
     var onMenu: ((NSView) -> Void)?
     var onAction: (() -> Void)?
 
-    init(row r: LanguageSetup.Row) {
+    init(row r: LanguageSetup.Row, fast: TransducerPresentation.State = .none) {
         switch r.state {
         case .onDisk:
-            badge = StatusBadgeView(kind: .ok, label: "Ready")
+            badge = StatusBadgeView(kind: .ok, label: TransducerPresentation.rowBadge(fast) ?? "Ready")
             actionButton = nil
         case .missing:
             badge = StatusBadgeView(kind: .muted, label: "Not downloaded")
@@ -622,7 +636,14 @@ private final class LanguageRowView: NSView {
         title.translatesAutoresizingMaskIntoConstraints = false
         title.setContentHuggingPriority(.required, for: .horizontal)
 
-        subtitle.stringValue = Self.describe(r)
+        // Who actually transcribes this language comes first; the whisper
+        // model the row used to be all about is, with a fast model, the fallback.
+        subtitle.stringValue = r.modelLabel.map { label in
+            TransducerPresentation.rowSubtitle(
+                fast, whisper: label.components(separatedBy: " · ").first ?? label,
+                roles: Self.describe(r))
+        } ?? Self.describe(r)
+        subtitle.toolTip = subtitle.stringValue
         subtitle.font = .systemFont(ofSize: 11.5)
         subtitle.textColor = Theme.text2
         subtitle.lineBreakMode = .byTruncatingTail

@@ -194,3 +194,122 @@ enum TransducerAutoFetch {
                       freeBytes: (attrs?[.systemFreeSize] as? NSNumber)?.int64Value)
     }
 }
+
+/// How the transducer path is put into words in Settings. One place, pure, so
+/// the row, the summary line and the model picker cannot tell three stories —
+/// and so `selftest` can read them.
+///
+/// It exists because v1.14.0 shipped the path with a single toggle to show for
+/// it: the Swedish row still read "KB-Whisper-large", the model picker still
+/// asked "which model should decode this language", and the person who built
+/// the feature opened Settings and asked whether the update had installed.
+enum TransducerPresentation {
+
+    /// What the fast model is doing for one language.
+    enum State: Equatable {
+        /// Installed and in use; the associated value is the model's name.
+        case active(String)
+        /// Known, wanted, not on disk yet — the background fetch is on it.
+        case downloading(String)
+        /// On disk, but "Faster transcription" is off.
+        case off(String)
+        /// Installed and wanted, but this build cannot load the runtime.
+        case unavailable(String)
+        /// No fast model exists for this language.
+        case none
+    }
+
+    /// A model's short name: "Klang Pianissimo", "NVIDIA Parakeet".
+    static func name(language: String, directory: String?) -> String {
+        if let known = TransducerCatalog.known.first(where: { $0.language == language }),
+           directory == nil || (directory! as NSString).lastPathComponent == known.directory {
+            return language == "en" ? "NVIDIA Parakeet" : "Klang Pianissimo"
+        }
+        if let directory {
+            let folder = (directory as NSString).lastPathComponent
+            return folder.hasPrefix("pianissimo-") ? "Klang Pianissimo" : folder
+        }
+        return "Klang Pianissimo"
+    }
+
+    static func state(language: String, enabled: Bool, runtime: Bool,
+                      installed: [String: String]) -> State {
+        if let directory = installed[language] {
+            let model = name(language: language, directory: directory)
+            if !enabled { return .off(model) }
+            return runtime ? .active(model) : .unavailable(model)
+        }
+        guard enabled, runtime,
+              TransducerCatalog.known.contains(where: { $0.language == language }) else { return .none }
+        return .downloading(name(language: language, directory: nil))
+    }
+
+    /// `state` for this Mac as it is now.
+    static func state(language: String, config: Config) -> State {
+        state(language: language, enabled: config.codeSwitch.transducerDecode,
+              runtime: ORTRuntime.shared != nil, installed: TransducerCatalog.installed())
+    }
+
+    /// The language row's one line: who transcribes it, and who stands behind.
+    /// `whisper` is the row's whisper model by name alone; `roles` is what the
+    /// row used to say about it, which is only still true when whisper is the
+    /// one doing the work.
+    static func rowSubtitle(_ state: State, whisper: String, roles: String) -> String {
+        switch state {
+        case .active(let model):
+            return "Transcribed by \(model) · \(whisper) is the fallback"
+        case .downloading(let model):
+            return "\(roles) · \(model) is downloading and takes over when it arrives"
+        case .off(let model):
+            return "\(roles) · \(model) is installed, but Faster transcription is off"
+        case .unavailable(let model):
+            return "\(roles) · \(model) is installed, but this build cannot run it"
+        case .none:
+            return roles
+        }
+    }
+
+    /// The row's badge when the fast model is the one at work.
+    static func rowBadge(_ state: State) -> String? {
+        if case .active = state { return "Fast" }
+        return nil
+    }
+
+    /// The model picker's opening line for a language. The picker only ever
+    /// lists whisper models; when another model does the transcribing, that
+    /// has to be the first thing it says.
+    static func pickerLead(_ state: State, languageName: String) -> String {
+        switch state {
+        case .active(let model):
+            return "\(model) transcribes \(languageName). The model chosen here is the Whisper fallback: used if \(model) cannot run, and when Faster transcription is off."
+        case .downloading(let model):
+            return "\(model) is downloading and will transcribe \(languageName) once it arrives. Until then, and as the fallback after, Ghostie uses the Whisper model chosen here."
+        case .off, .unavailable, .none:
+            return "Which model should decode this language."
+        }
+    }
+
+    /// How the whole setup transcribes, for the summary line under the
+    /// languages: a title and one or two short sentences. nil leaves the
+    /// caller's own (acoustic) wording in place. The rows above already name
+    /// each model, so this says only *how* — it has two lines to do it in.
+    static func mode(languages: [String], states: [String: State],
+                     displayName: (String) -> String) -> (title: String, detail: String)? {
+        let fast = languages.filter { if case .active? = states[$0] { return true }; return false }
+        guard !fast.isEmpty else { return nil }
+        func list(_ items: [String]) -> String { ListFormatter.localizedString(byJoining: items) }
+        if languages.count == 1 {
+            let name = displayName(languages[0])
+            return ("One language — \(name), transcribed fast",
+                    "Whisper takes over if a call turns out not to be in \(name).")
+        }
+        if let pair = TranscriptRouter.lookalikes(in: languages) {
+            return ("\(languages.count) languages, told apart by ear",
+                    "\(displayName(pair.0)) and \(displayName(pair.1)) read too alike on paper, so Ghostie listens for the language first. The fast models still do the transcribing.")
+        }
+        let rest = languages.filter { !fast.contains($0) }
+        let tail = rest.isEmpty ? "" : " \(list(rest.map(displayName))) \(rest.count == 1 ? "goes" : "go") to Whisper."
+        return ("\(languages.count) languages, told apart by what was said",
+                "Each track is transcribed first, and the words show where the language changes.\(tail)")
+    }
+}

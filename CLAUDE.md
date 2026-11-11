@@ -565,6 +565,21 @@ the same code drives the menu-bar app and the headless daemon.
   "Faster transcription" is the same key, with a line saying what is ready,
   downloading, or has no model (`TranscriptionPane.transducerStatus`, pure).
   The headless daemon does not auto-fetch — `fetch-models --transducer`.
+  **Settings has to say which model is doing the work, everywhere a model
+  is named** (`TransducerPresentation`, pure, one source for the language
+  row, the summary line and the model picker). v1.14.0 shipped with only
+  the toggle: the Swedish row still read "KB-Whisper-large", the picker
+  still asked "which model should decode this language" over a list of
+  whisper models, and the first question after release was whether the
+  update had installed at all. Now an active row reads "Transcribed by
+  Klang Pianissimo · KB-Whisper-large (standard) is the fallback" with a
+  "Fast" badge, and drops whisper's old roles ("also tells your languages
+  apart") because they are not true while another model does the work; the
+  summary says "told apart by what was said"; the picker opens with who
+  transcribes the language and calls its own choice the fallback. Every
+  one of those subtitles is cut at two lines by the row — the first draft
+  of each was truncated mid-sentence — so **look at the window**:
+  `ghostie settings transcription` opens that pane directly.
   **A one-language install uses it too** (`Pipeline` calls
   `transcribeDecodeFirst` before falling back to `Transcriber`), behind one
   extra check: unless `config.language` names that language outright, ten

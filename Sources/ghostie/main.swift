@@ -852,7 +852,7 @@ func launchMenuBar(_ config: Config) {
 
 /// Opens just the Settings window (used by `ghostie settings`, and a handy
 /// way to edit config without the menu bar running).
-func launchSettingsOnly() {
+func launchSettingsOnly(pane: String? = nil) {
     let app = NSApplication.shared
     app.setActivationPolicy(.regular)
     let win = SettingsWindow { newCfg in
@@ -860,7 +860,7 @@ func launchSettingsOnly() {
         _ = newCfg
     }
     win.onClose = { NSApp.terminate(nil) }
-    win.show()
+    if let pane { win.show(paneNamed: pane) } else { win.show() }
     app.run()
 }
 
@@ -1463,7 +1463,7 @@ case "index":
 case "connect":
     cmdConnect(config, args: Array(args.dropFirst()))
 case "settings":
-    launchSettingsOnly()
+    launchSettingsOnly(pane: args.count > 1 ? args[1] : nil)
 case "install-service":
     cmdInstallService(config)
 case "uninstall-service":
