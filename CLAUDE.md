@@ -26,6 +26,7 @@ swift build -c release            # release build (what the scripts use)
 .build/release/ghostie process <dir>       # re-run pipeline on a recording dir (one track is enough)
 .build/release/ghostie import <file>…      # external m4a/mp3/wav/mov → session dir → pipeline
 .build/release/ghostie fetch-models [v]    # download codeswitch models (KB v + large-v3 + VAD)
+.build/release/ghostie fetch-models --transducer [code…]  # transducer models: Klang Pianissimo (sv, da, or a later language by name) and NVIDIA Parakeet v3 (en); ONNX int8, ~660 MB each
 .build/release/ghostie mic-probe [secs]   # is voice-processed mic capture working on this OS?
 .build/release/ghostie echo-probe <dir> [out.wav]  # run the after-call echo canceller (and echo gate) on a session
 .build/release/ghostie punctuate-probe <md>  # run the punctuation pass alone, timed
@@ -67,7 +68,10 @@ plus the never-engage guards for headphone/solo calls), `runEchoCancellerSelfTes
 the reference, ≥20 dB removed including the opening seconds, the user's
 voice intact under double-talk, a no-op without echo, no block ever louder
 than the mic — and the `OutputRoute` jack rule; **no audio or device
-needed**), `runEchoGateSelfTest()` (exercises `EchoGate` over synthetic
+needed**), `runTransducerSelfTest()` (exercises the transducer path around the
+model — tokens into words and segments, audio into pieces, `TranscriptRouter`'s
+text routing with a stub recognizer, the sample verdict, config back-compat
+and the git-blob download check; **no model or runtime needed**), `runEchoGateSelfTest()` (exercises `EchoGate` over synthetic
 envelopes — echo-only stretches judged and masked, the user into silence,
 over the far end and as a one-block "yeah" kept, a lone hot echo peak still
 echo, a mid-call volume change followed, stand-down without a loud far end —
@@ -547,6 +551,158 @@ the same code drives the menu-bar app and the headless daemon.
   lines as "decoded from silence". `span` maps the segment onto the one
   splice it overlaps most, clipped to it, so a span is always audio whisper
   heard. Selftest pins it (`span:` checks).
+- **Transducer decode (`codeSwitch.transducerDecode`, default off)** — a
+  second decoder beside whisper.cpp, and a different order of work: decode
+  first, then read the language off the text. `TransducerDecoder.swift` runs a
+  NeMo FastConformer-TDT export (Klang Pianissimo — Swedish and Danish —
+  fetched by `ghostie fetch-models --transducer [code…]` into
+  `~/.ghostie/models/pianissimo-<code>-onnx/`, CC BY 4.0) under the ONNX Runtime diarization already loads:
+  `nemo128.onnx` (waveform → log-mel, so no DSP is ported), an encoder, and a
+  joint decoder stepped per token in a greedy TDT loop. `ORTSession.run(inputs:outputs:)`
+  is the typed many-in/many-out call that needs. `CodeSwitchTranscriber.transcribeDecodeFirst`
+  decodes each whole track with it (speech spans from the loudness envelope —
+  **no whisper VAD pass, no per-segment language pass**), `TranscriptRouter`
+  labels the result by language, and only the stretches in another language
+  go back through the existing `decode(runs:)` whisper path. Returning nil
+  means "not available" and the acoustic path runs unchanged; a transducer
+  failure must never cost the call.
+  Measured 2026-11-11 on the 2026-11-10 10:42 Meet call (30.4 min, Swedish):
+  the acoustic path spent 17.6 min on language ID and 3.9 on decode (23 min
+  for the call); decode-first transcribes both tracks in 58 s and the whole
+  pipeline in 1 min 52 s. On the all-English 13:00 call the sample check
+  costs 4 s and whisper decodes the rest as before.
+  **Why routing reads text.** Acoustic language ID had called runs like "Ja.
+  Mm. Gick det bra för henne den veckan eller?" English on that call (651 s
+  of the Participants track) and sent them to the English model. The same
+  audio decoded by Pianissimo and classified with `NLLanguageRecognizer`
+  restricted to the call's languages: 35/35 sentences of an English slice
+  read English, and nothing longer than a phrase on the Swedish track did.
+  Two rules, both from real failures, both pinned in `runTransducerSelfTest()`:
+  **only a full sentence is evidence** (`decidedWords`, 5) — on the English
+  call the Swedish model wrote "Thank you so much." as "Tack så mycket." and
+  "No." as "Nej.", so a short line's text reads confidently as the *model's*
+  language whatever was said; and **everything shorter takes the language of
+  the conversation around it, on either track** (`contextMs`, word-weighted),
+  which is the acoustic smoother's cross-track prior applied to words. The
+  first version routed each track alone and kept every short reply in
+  Swedish. A track whose ten spread-out samples all read as one other
+  language skips the first decode entirely (`foreignVerdict`,
+  unanimous-or-nothing) and its samples still inform the other track.
+  **Which models, and the next ones** — `TransducerCatalog.swift`. Swedish
+  and Danish are `known` (fetched and run here); everything else is Klang's
+  naming convention, `KlangAI/pianissimo-<code>-onnx` with the same four file
+  names, so a language Klang ships later needs no Ghostie release:
+  `fetch-models --transducer <code>` tries that repo (an unpublished one
+  answers HTTP 401 — the command says "not published" and removes the empty
+  folder), and `installed()` treats any `<name>-<code>-onnx` folder holding
+  the four files as a model for `<code>`. Unverified entries claim no file
+  sizes, so the downloader never skips on a guess. A model is only ever used
+  for a language the call is already set up for — Danish needs adding in
+  Settings ▸ Transcription (large-v3 is its whisper fallback), and `doctor`
+  lists models that are installed but idle. `home(languages:dominant:installed:)`
+  picks the first decode: the dominant language's model when it has one.
+  A routed stretch is decoded again by **its own language's transducer when
+  one is installed**, else by whisper, one language at a time so only one
+  model is loaded.
+  **Text routing does not work between look-alike languages**
+  (`TranscriptRouter.lookalikeGroups`, sv/da/no today). Measured on LibriVox
+  Danish spliced after Swedish: the Swedish model wrote "Men det kedelige ved
+  det var, at der sjældent eller aldrig…" as "Men det kedlige vid det var,
+  att det kjällen eller aldrig…", which the recognizer reads as Swedish, and
+  3 minutes of Danish kept 19 s of it. With two of a group configured,
+  `transcribeDecodeFirst` stands down and the acoustic path runs — where
+  `decode(runs:)` still hands each language to its transducer
+  (`transducerDecode`), so the decode is fast and only the language pass is
+  paid for. On that splice the boundary came back at 179 s against a true
+  180 and each half was decoded by its own model. **When adding a language,
+  ask whether a relative of it is already supported, and add the group
+  before trusting the text.** `recognizerCode` maps Ghostie's codes to
+  `NLLanguage`'s (`no` → `nb`): a constraint the recognizer does not know is
+  silently no constraint.
+  A sentence right at a switch can stay with the first model: on the
+  Danish/English splice "Øh IDO og like academier to when you started with
+  IKEA" read as Danish and kept the Danish model's text.
+  **English is NVIDIA Parakeet TDT v3 itself** (`TransducerCatalog.parakeetEnglish`,
+  `fetch-models --transducer en`) — the model Klang's are fine-tuned from, so
+  the same four files and the same decoder. Scored with
+  `scripts/score-transcript.py` against the Wispr references (candidate % /
+  reference %): 2026-09-11 morning, 34 min, transcription stage only —
+  whisper large-v3 86.9 / 90.9 in 205 s, Parakeet 88.1 / 91.8 in 43 s;
+  whole pipeline against the shipped notes — 2026-09-11 evening (110 min,
+  five people) 84.5 / 81.1 → 89.1 / 85.6, worst bucket 0.89 → 0.88, in
+  3 min 33 s; 2026-09-08 (126 min) 82.9 / 80.9 → 88.9 / 87.8, worst bucket
+  0.91 → 0.94, speakers 99.8 → 100.0%, in 3 min 9 s (that call was 55 min
+  originally, 30 after v1.8). Those runs had a stub for `claude`, so no
+  punctuation pass, naming or summary is in the time. **Read those gains
+  with one caution: the reference is another recogniser's output, not a
+  person's**, and a recogniser from the same family would agree with
+  Parakeet for reasons other than being right. Nobody knows what Wispr
+  runs. The claim the numbers support is "not worse", by the repo's own bar
+  (≤1.5 points down, no bucket under 0.85).
+  **Parakeet is verbatim and whisper is not**: before
+  `TransducerText.withoutHesitations` it scored 82.1% of its own words
+  against whisper's 86.9% — failing that bar — purely on "uh" ×198 and "um"
+  ×118 the reference does not hold. The list is per model language and
+  holds only sounds that are never a word and never an answer; "mm", "hmm"
+  and "yeah" are replies and stay. Dropping them is a register choice
+  (whisper makes the same one silently), not an accuracy fix: with those
+  sounds set aside on both sides the two decoders were within a point.
+  **The first decode is chosen per track from samples, not from
+  `dominantLanguage`** (`TranscriptRouter.plan`). Dominant is a guess about
+  the user; with English dominant and a Swedish call, Parakeet decoded all
+  of it, the text said Swedish, and Pianissimo decoded it all again (115 s
+  against 54). Ten spread-out pieces through the home model now decide:
+  unanimous for one other language → the whole track is that language's;
+  mostly another language *that has its own model* → that model decodes
+  first; otherwise home. `route(tracks:homes:…)` then reads each track
+  against the language of the model that wrote it. Parakeet works as a home
+  model for another reason too: it is multilingual underneath, so it writes
+  Swedish speech down as Swedish and the text still routes. An English-only
+  export (v2) would not, and must not be made `known` for `en`.
+  **The silence guard matters more on this path, not less.** On the 110-min
+  call it dropped 132 Me segments, 116 as decoded from silence — 108 of
+  them one or two words ("Yeah." ×35, "Okay." ×29) at a median peak of
+  −49 dBFS, between the −54 dBFS floor that decides what is decoded and the
+  −42 dBFS one that decides what is believed. Nothing the user said into a
+  microphone peaks there; it is the far end's residue or the model filling
+  in. Don't "fix" the count by lowering `activeThreshold`.
+  `GHOSTIE_INDEX_DIR` (new, beside `GHOSTIE_BACKLOG_DIR`) is what makes
+  `ghostie process` on a copy of a kept session a real scratch run.
+  **Dead ends, so nobody retries them:** the model's own token confidence
+  does not separate languages (median 0.981 on English, 0.977 on Swedish);
+  and the parked VoxLingua ONNX LID fails with its fine pass off too — coarse
+  only, it put 764 s of an all-English Me track in Swedish (worse than with
+  the fine pass, 247 s), so the fine pass was never the whole problem.
+  **Pieces, not the whole track:** `TransducerText.chunks` hands the model
+  ≤15 s of contiguous audio cut at pauses. A whole track in two-minute pieces
+  came back 8% shorter; between 8 s and 30 s the difference is 1–2% with no
+  clear winner against KB-Whisper, so that number wants a reference to tune
+  (`GHOSTIE_TD_MAXMS` / `GHOSTIE_TD_JOINGAP` override it for a probe run).
+  **Segments are cut for the stages downstream**: per sentence, at a 700 ms
+  pause, never over 12 s — the diarizer embeds a segment's span as one voice
+  and `TranscriptCleaner.isStretchedOverQuiet` reads a ≥15 s span as
+  suspicious, both calibrated on whisper.
+  **Still open:** accuracy is unscored — the numbers above are speed and
+  agreement with KB-Whisper (81–90% of words), not correctness, which is why
+  the default is off; names and product terms are the visible weakness
+  ("Claude" → "klåd", "glad"), and the model's phrase boosting, which needs a
+  SentencePiece encoder, is not ported, so `LanguageSetting.prompt` does
+  nothing on this path; the single-language `Transcriber` path does not use
+  it (one installed language still means whisper); and it is CPU-only (the MLX build is ~3× faster on the GPU).
+  `ghostie transcribe-probe <session> --out <dir> [--routing-only]
+  [--set codeSwitch.<key>=<json>]` (hidden) runs the transcription stage
+  alone and writes detections, runs, segments and per-stage seconds, without
+  touching the notes folder, the index or `ghostie.log`;
+  `scripts/segments-to-transcript.py` turns its output into something
+  `score-transcript.py` reads. **`ghostie process` on a kept session is only
+  a scratch run with `GHOSTIE_INDEX_DIR` set** as well as the notes and
+  backlog overrides: without it the call's record in `~/.ghostie/index/` is
+  written under the note's name, which for a "…_Call" note is the real one's.
+  `GHOSTIE_TRANSDUCER_DECODE=1` turns the path on for one process.
+  `ModelDownloader.matches`: Hugging Face quotes a **git blob id** (SHA1),
+  not a SHA256, for files stored in git rather than LFS — `vocab.txt` was the
+  first such file and was rejected as corrupt until the length of the
+  checksum was used to tell the two apart.
 - **Which LID you get decides how long a call takes.** Per-segment detection is
   the pipeline's most expensive stage under the whisper LIDs (~1.2 s/segment:
   measured 2026-08-28, 20 min of a 30 min run on a 56-minute call). Install the
@@ -713,7 +869,7 @@ the same code drives the menu-bar app and the headless daemon.
   with nothing more useful than "server disconnected".
 - **`Config.swift`** — `~/.ghostie/config.json` + env overrides
   (`GHOSTIE_NOTES_FOLDER`, `GHOSTIE_WHISPER_MODEL`, `GHOSTIE_SUMMARY_MODEL`,
-  `GHOSTIE_CLAUDE_BINARY`; `Backlog.root` reads `GHOSTIE_BACKLOG_DIR`). The
+  `GHOSTIE_CLAUDE_BINARY`, `GHOSTIE_TRANSDUCER_DECODE`; `Backlog.root` reads `GHOSTIE_BACKLOG_DIR`, `TranscriptIndex.root` reads `GHOSTIE_INDEX_DIR`). The
   last two let a scratch run use a stub `claude` and its own queue — the
   running app drains `~/.ghostie/backlog` on its own and would race it.
   Binary/model paths are **never persisted** so resolution (including

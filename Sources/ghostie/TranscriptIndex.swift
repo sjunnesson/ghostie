@@ -24,7 +24,13 @@ import Foundation
 /// the summary is read from the note at the moment it is asked for.
 enum TranscriptIndex {
 
-    static let root = "\(NSHomeDirectory())/.ghostie/index"
+    /// `GHOSTIE_INDEX_DIR` points a one-off run at a scratch index, like
+    /// `GHOSTIE_BACKLOG_DIR` does the queue. Without it, `ghostie process` on
+    /// a kept recording writes that call's record here under the real name —
+    /// and a note named for an unknown source ("…_Call") is the same name the
+    /// real one has, so the scratch run replaces it.
+    static let root = ProcessInfo.processInfo.environment["GHOSTIE_INDEX_DIR"]
+        .flatMap { $0.isEmpty ? nil : $0 } ?? "\(NSHomeDirectory())/.ghostie/index"
 
     /// Bump when the meaning of a stored field changes. `load` drops records
     /// written under a different number, so a stale index degrades to "not

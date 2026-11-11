@@ -129,8 +129,11 @@ final class ORTRuntime {
         if let env { api.pointee.ReleaseEnv(env) }
     }
 
-    func makeSession(modelPath: String) throws -> ORTSession {
-        try ORTSession(api: api, env: env, modelPath: modelPath)
+    /// `threads` is the intra-op pool: 2 suits the small per-window models
+    /// (language ID, speaker embeddings); a speech encoder wants the
+    /// performance cores.
+    func makeSession(modelPath: String, threads: Int32 = 2) throws -> ORTSession {
+        try ORTSession(api: api, env: env, modelPath: modelPath, threads: threads)
     }
 }
 
@@ -151,7 +154,8 @@ final class ORTSession {
         }
     }
 
-    init(api: UnsafePointer<OrtApi>, env: OpaquePointer?, modelPath: String) throws {
+    init(api: UnsafePointer<OrtApi>, env: OpaquePointer?, modelPath: String,
+         threads: Int32 = 2) throws {
         self.api = api
 
         var options: OpaquePointer?
@@ -159,7 +163,7 @@ final class ORTSession {
             throw ORTError.failed("CreateSessionOptions failed")
         }
         defer { api.pointee.ReleaseSessionOptions(options) }
-        _ = check(api, api.pointee.SetIntraOpNumThreads(options, 2))
+        _ = check(api, api.pointee.SetIntraOpNumThreads(options, max(1, threads)))
 
         var session: OpaquePointer?
         let ok = modelPath.withCString { cPath in
@@ -272,6 +276,116 @@ final class ORTSession {
         }
         let logits = raw.bindMemory(to: Float.self, capacity: count)
         return Array(UnsafeBufferPointer(start: logits, count: count))
+    }
+
+    // MARK: Named, typed, many-in / many-out
+
+    /// One input tensor for `run(inputs:outputs:)`.
+    enum Input {
+        case float([Float], shape: [Int64])
+        case int64([Int64], shape: [Int64])
+        case int32([Int32], shape: [Int64])
+    }
+
+    /// One output tensor: its shape, and its values as whichever of the two
+    /// families the model produced.
+    struct Output {
+        let shape: [Int]
+        var floats: [Float] = []
+        var ints: [Int64] = []
+    }
+
+    /// Run a model with several named inputs and outputs — what a transducer
+    /// needs (features + lengths in, logits + two recurrent states out) and
+    /// the single-tensor `run(input:shape:)` cannot express.
+    func run(inputs: [(name: String, value: Input)], outputs names: [String]) throws -> [Output] {
+        var values: [OpaquePointer?] = []
+        defer { for v in values { api.pointee.ReleaseValue(v) } }
+        // ORT wraps the buffers without copying, so they must outlive `Run`:
+        // each is copied once into storage this call owns.
+        var storage: [UnsafeMutableRawPointer] = []
+        defer { for p in storage { p.deallocate() } }
+
+        func tensor<T>(_ data: [T], _ dims: [Int64], _ type: ONNXTensorElementDataType) throws {
+            guard dims.reduce(1, *) == Int64(data.count) else {
+                throw ORTError.failed("shape \(dims) does not describe \(data.count) values")
+            }
+            let bytes = max(1, data.count) * MemoryLayout<T>.stride
+            let raw = UnsafeMutableRawPointer.allocate(byteCount: bytes,
+                                                       alignment: MemoryLayout<T>.alignment)
+            storage.append(raw)
+            data.withUnsafeBytes { raw.copyMemory(from: $0.baseAddress!, byteCount: $0.count) }
+            var shape = dims
+            var value: OpaquePointer?
+            let ok = shape.withUnsafeMutableBufferPointer { d in
+                check(api, api.pointee.CreateTensorWithDataAsOrtValue(
+                    memoryInfo, raw, data.count * MemoryLayout<T>.stride,
+                    d.baseAddress, d.count, type, &value))
+            }
+            guard ok, value != nil else { throw ORTError.failed("could not create input tensor") }
+            values.append(value)
+        }
+        for input in inputs {
+            switch input.value {
+            case .float(let d, let s): try tensor(d, s, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT)
+            case .int64(let d, let s): try tensor(d, s, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64)
+            case .int32(let d, let s): try tensor(d, s, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32)
+            }
+        }
+
+        // C strings for every name, alive across the call.
+        let inC = inputs.map { strdup($0.name) }
+        let outC = names.map { strdup($0) }
+        defer { (inC + outC).forEach { free($0) } }
+        var inPtrs = inC.map { UnsafePointer<CChar>($0) }
+        var outPtrs = outC.map { UnsafePointer<CChar>($0) }
+        var results = [OpaquePointer?](repeating: nil, count: names.count)
+        defer { for r in results where r != nil { api.pointee.ReleaseValue(r) } }
+        let ran = values.withUnsafeMutableBufferPointer { vals in
+            results.withUnsafeMutableBufferPointer { outs in
+                check(api, api.pointee.Run(session, nil,
+                                           &inPtrs, vals.baseAddress, vals.count,
+                                           &outPtrs, outPtrs.count, outs.baseAddress))
+            }
+        }
+        guard ran else { throw ORTError.failed("Run failed") }
+
+        return try results.map { value -> Output in
+            guard let value else { throw ORTError.failed("missing output") }
+            var info: OpaquePointer?
+            guard check(api, api.pointee.GetTensorTypeAndShape(value, &info)) else {
+                throw ORTError.failed("GetTensorTypeAndShape failed")
+            }
+            defer { api.pointee.ReleaseTensorTypeAndShapeInfo(info) }
+            var rank = 0
+            _ = check(api, api.pointee.GetDimensionsCount(info, &rank))
+            var dims = [Int64](repeating: 0, count: rank)
+            _ = check(api, api.pointee.GetDimensions(info, &dims, rank))
+            var count = 0
+            _ = check(api, api.pointee.GetTensorShapeElementCount(info, &count))
+            var type = ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED
+            _ = check(api, api.pointee.GetTensorElementType(info, &type))
+            var out = Output(shape: dims.map(Int.init))
+            guard count > 0 else { return out }
+            var raw: UnsafeMutableRawPointer?
+            guard check(api, api.pointee.GetTensorMutableData(value, &raw)), let raw else {
+                throw ORTError.failed("GetTensorMutableData failed")
+            }
+            switch type {
+            case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT:
+                out.floats = Array(UnsafeBufferPointer(
+                    start: raw.bindMemory(to: Float.self, capacity: count), count: count))
+            case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64:
+                out.ints = Array(UnsafeBufferPointer(
+                    start: raw.bindMemory(to: Int64.self, capacity: count), count: count))
+            case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32:
+                out.ints = UnsafeBufferPointer(
+                    start: raw.bindMemory(to: Int32.self, capacity: count), count: count).map(Int64.init)
+            default:
+                throw ORTError.failed("unsupported output element type \(type.rawValue)")
+            }
+            return out
+        }
     }
 
     func close() {

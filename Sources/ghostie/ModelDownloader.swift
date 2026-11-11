@@ -383,7 +383,8 @@ final class ModelDownloader: NSObject, URLSessionDataDelegate {
                                           got: a.bytesWritten))
             return
         }
-        if !a.expectedEtag.isEmpty, gotHex.caseInsensitiveCompare(a.expectedEtag) != .orderedSame {
+        if !a.expectedEtag.isEmpty,
+           !Self.matches(expected: a.expectedEtag, sha256: gotHex, file: a.partial.path) {
             try? FileManager.default.removeItem(at: a.partial)
             complete(DLError.hashMismatch(label: a.label,
                                           expected: a.expectedEtag,
@@ -510,10 +511,11 @@ extension ModelDownloader {
             return .sizeWrong(onDisk: size, expected: expectedSize)
         }
         let got = hash(file: model.destPath)
-        if got.caseInsensitiveCompare(etag) != .orderedSame {
+        if !matches(expected: etag, sha256: got, file: model.destPath) {
             return .hashMismatch(onDisk: got, expected: etag)
         }
-        ModelSidecar(etag: etag, size: size, downloadedAt: Date())
+        // The sidecar always records the SHA256, whatever the server quoted.
+        ModelSidecar(etag: got, size: size, downloadedAt: Date())
             .write(to: model.sidecarPath)
         return .ok(etag: etag, size: size)
     }
@@ -567,6 +569,31 @@ extension ModelDownloader {
         _ = sem.wait(timeout: .now() + 20)
         session.invalidateAndCancel()
         return probe.etag.isEmpty ? nil : (probe.etag, probe.size)
+    }
+
+    /// Whether a downloaded file is the one the server described.
+    ///
+    /// Hugging Face quotes two different checksums in `x-linked-etag`. A
+    /// weights file lives in LFS and gets its SHA256. A small text file (a
+    /// vocabulary, a config) is stored in git itself and gets its **git blob
+    /// id** — SHA1 over `"blob <size>\0"` plus the content — which no SHA256
+    /// will ever equal: the first model with such a file (Pianissimo's
+    /// `vocab.txt`) downloaded intact and was thrown away as corrupt.
+    /// The length tells the two apart.
+    static func matches(expected: String, sha256: String, file path: String) -> Bool {
+        if expected.count == 40 {
+            guard let data = FileManager.default.contents(atPath: path) else { return false }
+            return gitBlobID(data).caseInsensitiveCompare(expected) == .orderedSame
+        }
+        return sha256.caseInsensitiveCompare(expected) == .orderedSame
+    }
+
+    /// Git's object id for a file's content. Only ever asked of small files.
+    static func gitBlobID(_ content: Data) -> String {
+        var sha = Insecure.SHA1()
+        sha.update(data: Data("blob \(content.count)\u{0}".utf8))
+        sha.update(data: content)
+        return sha.finalize().map { String(format: "%02x", $0) }.joined()
     }
 
     /// SHA256 in 1 MB chunks so we don't load 1 GB into RAM.

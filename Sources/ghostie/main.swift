@@ -392,6 +392,7 @@ func cmdFetchModels(_ config: Config, args: [String]) {
     let wantsCodeswitch = args.contains("--codeswitch")
     let wantsVAD = args.contains("--vad")
     let wantsDiarization = args.contains("--diarization")
+    let wantsTransducer = args.contains("--transducer")
     let explicitVariant = args.first { !$0.hasPrefix("--") }
     let variant = explicitVariant ?? config.codeSwitch.kbWhisperVariant
 
@@ -402,6 +403,34 @@ func cmdFetchModels(_ config: Config, args: [String]) {
         if let kb = Models.kbWhisperLarge(variant: variant) { models.insert(kb, at: 1) }
     } else if wantsDiarization {
         models = [Models.speakerEmbedding]
+    } else if wantsTransducer {
+        // `--transducer` alone: the model for each language this install is
+        // set up for that has one. `--transducer da no`: exactly those — a
+        // code Ghostie has never seen is tried under Klang's naming, so a
+        // language Klang publishes later installs without a new Ghostie.
+        let asked = args.filter { TransducerCatalog.isLanguageCode($0) }
+        let installed = Models.installed(preferredKBVariant: config.codeSwitch.kbWhisperVariant)
+        let configured = config.codeSwitch.effectiveLanguages(installed: installed)
+        let entries = asked.isEmpty
+            ? TransducerCatalog.known.filter { configured.contains($0.language) }
+            : asked.map(TransducerCatalog.entry(for:))
+        guard !entries.isEmpty else {
+            let have = TransducerCatalog.known.map(\.language).joined(separator: ", ")
+            Log.error("No transducer model for the languages set up here (\(configured.joined(separator: ", "))). "
+                + "Known: \(have). Name one — `ghostie fetch-models --transducer da` — and add that language in Settings ▸ Transcription.")
+            exit(1)
+        }
+        for entry in entries {
+            if !entry.verified {
+                Log.info("\(entry.language) is not a model Ghostie knows — trying \(entry.repo) by Klang's naming.")
+            }
+            if !configured.contains(entry.language) {
+                Log.info("Note: \(entry.language) is not one of this install's languages (\(configured.joined(separator: ", "))); the model is used once it is added in Settings ▸ Transcription.")
+            }
+            models += TransducerCatalog.models(for: entry)
+            try? FileManager.default.createDirectory(
+                atPath: "\(Config.modelsDir)/\(entry.directory)", withIntermediateDirectories: true)
+        }
     } else if wantsCodeswitch || explicitVariant != nil {
         guard let kb = Models.kbWhisperLarge(variant: variant) else {
             Log.error(ModelDownloader.DLError.subtitleUnavailable.localizedDescription)
@@ -426,6 +455,23 @@ func cmdFetchModels(_ config: Config, args: [String]) {
     }
     if let failure {
         Log.error("Download failed: \(failure.localizedDescription)")
+        if wantsTransducer {
+            // A language tried on Klang's naming alone may simply not exist
+            // yet; Hugging Face answers 401 for a repo that is not there.
+            // Say that, and leave no half-model folder behind for the next
+            // run to mistake for an install in progress.
+            let fm = FileManager.default
+            for code in args where TransducerCatalog.isLanguageCode(code) {
+                let entry = TransducerCatalog.entry(for: code)
+                let dir = "\(Config.modelsDir)/\(entry.directory)"
+                guard TransducerModel.files(at: dir) == nil else { continue }
+                if !entry.verified {
+                    Log.error("No transducer model for \(code): looked for \(entry.repo), which is not published. Known: "
+                        + TransducerCatalog.known.map(\.language).joined(separator: ", ") + ".")
+                    try? fm.removeItem(atPath: dir)
+                }
+            }
+        }
         exit(1)
     }
     Log.ok("Done. Run `ghostie doctor models` to re-verify on demand.")
@@ -637,7 +683,28 @@ func cmdDoctor(_ config: Config) {
         let lid = LanguageSegmenter.defaultIdentifier(config: config, installed: installed)
         row(true, "  language identifier (LID)", lid.description)
         row(setup.detectionModelLabel != nil, "  detection driver",
-            setup.detectionModelLabel ?? "none — no balanced multilingual model installed")
+            setup.detectionModelLabel ?? "none — no balanced multilingual model installed")        // The transducer path: which models, and whether they will actually run.
+        let transducers = TransducerCatalog.installed()
+        let usable = langs.filter { transducers[$0] != nil }
+        let names = usable.map { "\($0) (\((transducers[$0]! as NSString).lastPathComponent))" }
+            .joined(separator: ", ")
+        if usable.isEmpty {
+            if cs.transducerDecode {
+                row(false, "  transducer decode", "on, but no model installed for \(langs.joined(separator: "+")) — `ghostie fetch-models --transducer`")
+            }
+        } else if !cs.transducerDecode {
+            row(true, "  transducer decode", "installed for \(names), off — set codeSwitch.transducerDecode to use it")
+        } else if ORTRuntime.shared == nil {
+            row(false, "  transducer decode", "installed for \(names), but \(ORTRuntime.unavailableReason)")
+        } else {
+            let home = TransducerCatalog.home(languages: langs, dominant: cs.effectiveDominant(installed: installed),
+                                              installed: transducers) ?? usable[0]
+            row(true, "  transducer decode", "on — \(names); \(home) is decoded first and other languages are routed by what was said (no acoustic language pass)")
+        }
+        let idle = transducers.keys.filter { !langs.contains($0) }.sorted()
+        if !idle.isEmpty {
+            row(true, "  transducer models not in use", "\(idle.joined(separator: ", ")) — add the language in Settings ▸ Transcription to use it")
+        }
     }
     for r in setup.rows {
         let detail = [r.modelLabel, r.drivesDetection ? "drives detection" : nil,
@@ -820,7 +887,7 @@ func printHelp() {
       diagnose-detect [--duration N] [--json]
                           Live readout of the call detector. 30s default,
                           500ms refresh. --json emits line-delimited JSON.
-      fetch-models [variant] [--all|--codeswitch|--vad|--diarization]
+      fetch-models [variant] [--all|--codeswitch|--vad|--diarization|--transducer [lang…]]
                           Download the model set Ghostie needs. With no flag,
                           fetches exactly what current config requires (single
                           mode → base.en + VAD; codeswitch on → KB + large-v3
@@ -1345,6 +1412,10 @@ case "wav-probe":
         Log.error("Usage: ghostie wav-probe <session-dir|wav>"); exit(1)
     }
     cmdWavProbe(args[1])
+case "transcribe-probe":
+    // Hidden: run the transcription stage alone on a kept session and dump
+    // its routing, segments and per-stage timings as JSON.
+    cmdTranscribeProbe(config, args: Array(args.dropFirst()))
 case "lid-probe":
     // Hidden: run the active language identifier on a WAV (field debugging).
     guard args.count > 1 else { Log.error("Usage: ghostie lid-probe <wav>"); exit(1) }
@@ -1380,7 +1451,9 @@ case "selftest":
     let cancellerOK = runEchoCancellerSelfTest()
     print("")
     let gateOK = runEchoGateSelfTest()
-    exit(cleanerOK && echoOK && refinerOK && codeSwitchOK && updaterOK && detectorOK
+    print("")
+    let transducerOK = runTransducerSelfTest()
+    exit(transducerOK && cleanerOK && echoOK && refinerOK && codeSwitchOK && updaterOK && detectorOK
          && micOK && wavOK && speakerOK && indexOK && mcpOK && micRouteOK
          && cancellerOK && gateOK ? 0 : 1)
 case "mcp":

@@ -454,6 +454,11 @@ struct Config: Codable {
             cfg.whisperServerBinary = Config.findWhisperServerBinary()
         }
         if let c = env["GHOSTIE_CLAUDE_BINARY"], !c.isEmpty { cfg.claudeBinary = c }
+        // Scratch runs only: try the transducer path on a kept recording
+        // without flipping it on for the app that is recording real calls.
+        if let t = env["GHOSTIE_TRANSDUCER_DECODE"], !t.isEmpty {
+            cfg.codeSwitch.transducerDecode = (t == "1" || t == "true")
+        }
         if cfg.claudeBinary.isEmpty
            || !FileManager.default.isExecutableFile(atPath: cfg.claudeBinary) {
             cfg.claudeBinary = Config.findClaudeBinary()
@@ -737,6 +742,37 @@ struct CodeSwitchConfig: Codable {
     /// once a genuinely independent LID (VoxLingua107) backs the verifier.
     var verifyMarginDb: Double = 0
 
+    // MARK: Transducer decode
+
+    /// Decode first, then read the language off what was said.
+    ///
+    /// When a transducer speech model is installed for one of the call's
+    /// languages (Klang Pianissimo for Swedish or Danish, NVIDIA Parakeet
+    /// for English — `ghostie fetch-models --transducer [code…]`, see
+    /// `TransducerCatalog`), it
+    /// decodes the whole track, the *text* of each
+    /// sentence says which language it was in, and only the stretches in
+    /// another language are decoded again by that language's whisper model.
+    /// There is no per-segment acoustic language pass at all.
+    ///
+    /// Measured 2026-11-11 on a 30-minute Swedish call: that pass was 17.6 of
+    /// the 23 minutes the call took to process, and it sent stretches of
+    /// Swedish-with-English-terms to the English model. The same audio
+    /// decoded by Pianissimo and classified by text: every sentence of an
+    /// English control slice read as English (35/35), and 5 short phrases of
+    /// the Swedish track did.
+    ///
+    /// Languages too alike for that (Swedish beside Danish —
+    /// `TranscriptRouter.lookalikeGroups`) keep the acoustic language pass
+    /// and use the transducers only as the faster decoders.
+    ///
+    /// Off by default. English is scored (at or above whisper large-v3 on
+    /// three reference calls, by `scripts/score-transcript.py`); Swedish is
+    /// not yet — its speed is measured, its accuracy so far is only
+    /// agreement with KB-Whisper — and no real call has run on this path. Without an installed model this does
+    /// nothing either way.
+    var transducerDecode: Bool = false
+
     // MARK: Legacy per-language maps (decoded, never encoded)
     //
     // Pre-v3 these were first-class config. They now exist only as a *fallback
@@ -766,6 +802,7 @@ struct CodeSwitchConfig: Codable {
         case snapSearchMs, snapMinMs, snapEnergyDb
         case verifyMarginDb
         case monolingualFastPath
+        case transducerDecode
         // Removed in v2: `enabled` (now derived from installed-model count;
         // see Pipeline.swift). Removed in v3: `prompts`, `modelPerLanguage`
         // (folded into `languages` records). Old configs carrying any of them
@@ -819,6 +856,7 @@ struct CodeSwitchConfig: Codable {
         snapEnergyDb = g(.snapEnergyDb, d.snapEnergyDb)
         verifyMarginDb = g(.verifyMarginDb, d.verifyMarginDb)
         monolingualFastPath = g(.monolingualFastPath, d.monolingualFastPath)
+        transducerDecode = g(.transducerDecode, d.transducerDecode)
 
         // ---- v3 language records + migration -----------------------------
         //

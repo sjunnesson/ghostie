@@ -23,6 +23,12 @@ struct CodeSwitchTranscriber {
     /// without spinning up whisper-cli.
     let verifier: LanguageIdentifier?
 
+    /// Set by `ghostie transcribe-probe` only: collects what each stage saw
+    /// and how long it took, so a change to detection or decoding can be
+    /// measured on a kept recording instead of argued about. nil in every
+    /// production path — nothing is recorded and nothing is paid for.
+    var trace: CodeSwitchTrace? = nil
+
     init(config: Config,
          installed: InstalledModels? = nil,
          verifier: LanguageIdentifier? = nil) {
@@ -70,6 +76,10 @@ struct CodeSwitchTranscriber {
         throws -> (me: [Transcriber.Segment], participants: [Transcriber.Segment]) {
 
         try preflightModels()
+        if let done = transcribeDecodeFirst(me: me, participants: participants,
+                                            meVoice: meVoice) {
+            return done
+        }
         // ONE identifier for the whole call: when it's a ServerWhisperLID the
         // resident whisper-server stays loaded across BOTH tracks' detect
         // passes (and the verify pass below), and this defer tears it down
@@ -80,7 +90,10 @@ struct CodeSwitchTranscriber {
         defer { lid.shutdown() }
         let seg = LanguageSegmenter(config: config, installed: installed, identifier: lid)
 
-        let (meSegs, partSegs) = try segmentBoth(seg, me: me, participants: participants)
+        trace?.identifier = lid.description
+        let (meSegs, partSegs) = try trace.timed("vad") {
+            try segmentBoth(seg, me: me, participants: participants)
+        }
         if meSegs.isEmpty && partSegs.isEmpty { return ([], []) }
 
         // Read each track's PCM once here and thread it through detect → snap →
@@ -93,8 +106,10 @@ struct CodeSwitchTranscriber {
         let mePcm = try AudioStitcher.readPCM(me)
         let partPcm = try AudioStitcher.readPCM(participants)
 
-        let meDet = try seg.detect(meSegs, pcm: mePcm)
-        let partDet = try seg.detect(partSegs, pcm: partPcm)
+        let meDet = try trace.timed("detect") { try seg.detect(meSegs, pcm: mePcm) }
+        let partDet = try trace.timed("detect") { try seg.detect(partSegs, pcm: partPcm) }
+        trace?.detections["me"] = meDet
+        trace?.detections["participants"] = partDet
 
         // Build the smoother with the SAME effective whitelist the segmenter
         // labels against (not raw cs.languages) so it can't emit a run in a
@@ -141,11 +156,19 @@ struct CodeSwitchTranscriber {
         let partVerified = verifyRunLanguages(partSnapped, in: partPcm,
                                               tag: "participants", using: lid)
 
+        trace?.runs["me"] = meVerified
+        trace?.runs["participants"] = partVerified
+        if trace?.stopAfterRouting == true { return ([], []) }
+
         let callID = me.deletingLastPathComponent().lastPathComponent
-        let meOut = try decode(runs: meVerified, pcm: mePcm,
-                               callID: callID, tag: "me", voiceFilter: meVoice)
-        let partOut = try decode(runs: partVerified, pcm: partPcm,
-                                 callID: callID, tag: "participants")
+        let meOut = try trace.timed("decode") {
+            try decode(runs: meVerified, pcm: mePcm,
+                       callID: callID, tag: "me", voiceFilter: meVoice)
+        }
+        let partOut = try trace.timed("decode") {
+            try decode(runs: partVerified, pcm: partPcm,
+                       callID: callID, tag: "participants")
+        }
         return (meOut, partOut)
     }
 
@@ -274,11 +297,271 @@ struct CodeSwitchTranscriber {
         return out
     }
 
+    // MARK: Decode first, route by text
+
+    /// The whole call through installed transducer models, with the language
+    /// of each stretch read off the transcript (`TranscriptRouter`) and only
+    /// the stretches in another language decoded again — by that language's
+    /// own transducer when one is installed, else by whisper. No VAD pass and
+    /// no per-segment language pass.
+    ///
+    /// nil means "not available here" — the feature is off, no model is
+    /// installed for any of the call's languages, the ONNX Runtime is missing,
+    /// or a model failed — and the caller runs the acoustic path unchanged.
+    /// A transducer problem must never cost the call: whisper is still there.
+    private func transcribeDecodeFirst(
+        me: URL, participants: URL,
+        meVoice: ((WavLevel.Envelope) -> WavLevel.Envelope)?
+    ) -> (me: [Transcriber.Segment], participants: [Transcriber.Segment])? {
+        guard cs.transducerDecode else { return nil }
+        let models = TransducerCatalog.installed()
+        guard let home = TransducerCatalog.home(languages: languages, dominant: dominant,
+                                                installed: models) else { return nil }
+        if let pair = TranscriptRouter.lookalikes(in: languages) {
+            Log.info("\(pair.0) and \(pair.1) are too close to tell apart from a transcript — the language of each stretch is decided from the audio; installed transducer models still do the decoding.")
+            return nil
+        }
+        guard let runtime = ORTRuntime.shared else {
+            Log.warn("Transducer decode is on but unavailable — \(ORTRuntime.unavailableReason). Using whisper for every language.")
+            return nil
+        }
+        // One model in memory at a time, whichever stage asks.
+        var loaded: (language: String, model: TransducerModel)?
+        defer { loaded?.model.close() }
+        func model(for language: String) throws -> TransducerModel {
+            if let loaded, loaded.language == language { return loaded.model }
+            loaded?.model.close()
+            loaded = nil
+            guard let directory = models[language] else {
+                throw TransducerModel.ModelError.missing("no model for \(language)")
+            }
+            let fresh = try trace.timed("load") {
+                try TransducerModel(directory: directory, runtime: runtime)
+            }
+            loaded = (language, fresh)
+            return fresh
+        }
+        func name(_ language: String) -> String {
+            ((models[language] ?? language) as NSString).lastPathComponent
+        }
+
+        let whitelist = languages
+        let classify: (String) -> (language: String, confidence: Double)? = {
+            TranscriptRouter.language(of: $0, among: whitelist)
+        }
+        var tracks: [FirstPass]
+        do {
+            trace?.identifier = "transcript routing over \(name(home))"
+            // Sample each track with the home model to decide who decodes it…
+            let sampler = try model(for: home)
+            tracks = try trace.timed("transducer") {
+                [try prepare(me, tag: "me", home: home, model: sampler, installed: Set(models.keys),
+                             voiceFilter: meVoice, classify: classify),
+                 try prepare(participants, tag: "participants", home: home, model: sampler,
+                             installed: Set(models.keys), voiceFilter: nil, classify: classify)]
+            }
+            // …then decode, the home model's tracks first since it is loaded.
+            for language in [home] + whitelist.filter({ $0 != home }) {
+                for index in tracks.indices where tracks[index].plan == .decode(language) {
+                    guard !tracks[index].pieces.isEmpty else { continue }
+                    let decoder = try model(for: language)
+                    Log.info("\(tracks[index].tag): decoding \(tracks[index].heardMs / 60_000) min of speech with \(name(language)).")
+                    tracks[index].segments = try trace.timed("transducer") {
+                        TransducerText.segments(try transducerWords(
+                            tracks[index].pieces, pcm: tracks[index].pcm, model: decoder,
+                            cache: language == home ? tracks[index].sampled : [:],
+                            language: language))
+                    }
+                }
+            }
+        } catch {
+            Log.warn("Transducer decode failed (\(error.localizedDescription)) — using whisper for every language.")
+            return nil
+        }
+
+        // A track that sampled as one other language skipped its first pass:
+        // its samples still say what the conversation was in, and the whole
+        // of it is one stretch for that language's model.
+        func first(_ track: FirstPass) -> String? {
+            if case .decode(let language) = track.plan { return language }
+            return nil
+        }
+        let routed = TranscriptRouter.route(
+            tracks: tracks.map { first($0) == nil ? [] : $0.segments },
+            evidence: tracks.flatMap { first($0) == nil ? $0.samples : [] },
+            homes: tracks.map { first($0) ?? home },
+            languages: whitelist, classify: classify)
+
+        var kept: [[Transcriber.Segment]] = []
+        var redo: [[LanguageRun]] = []
+        for (index, track) in tracks.enumerated() {
+            if case .whole(let other) = track.plan {
+                kept.append([])
+                redo.append([LanguageRun(language: other, startMs: 0, endMs: track.durationMs, segments: [])])
+                Log.info("\(track.tag): every sample reads as \(other) — the whole track goes to the \(other) model.")
+            } else {
+                kept.append(routed[index].kept)
+                redo.append(routed[index].redo)
+                if !track.segments.isEmpty {
+                    let redoMs = routed[index].redo.reduce(0) { $0 + ($1.endMs - $1.startMs) }
+                    let language = first(track) ?? home
+                    Log.info("\(track.tag): \(track.segments.count) segments; "
+                        + (redoMs == 0 ? "all of it reads as \(language)."
+                           : "\(routed[index].redo.count) stretches (\(redoMs / 1000) s) read as another language and are decoded again."))
+                }
+            }
+            trace?.runs[track.tag] = redo[index]
+        }
+        if trace?.stopAfterRouting == true { return (kept[0], kept[1]) }
+
+        // Second decode: a stretch's own transducer where there is one…
+        var out = kept
+        let again = Set(redo.flatMap { $0.map(\.language) })
+        for language in whitelist where again.contains(language) && models[language] != nil {
+            do {
+                let decoder = try model(for: language)
+                var decoded: [[Transcriber.Segment]] = []
+                try trace.timed("transducer") {
+                    for (index, track) in tracks.enumerated() {
+                        let runs = redo[index].filter { $0.language == language }
+                        let spans = runs.flatMap {
+                            AudioStitcher.spans(for: $0, voice: cs.decodeSpeechOnly ? track.voice : nil)
+                        }
+                        decoded.append(TransducerText.segments(
+                            try transducerWords(chunks(spans, voice: track.voice), pcm: track.pcm,
+                                                model: decoder, cache: [:], language: language)))
+                    }
+                }
+                Log.info("Decoded the \(language) stretches with \(name(language)).")
+                for index in tracks.indices {
+                    out[index] += decoded[index]
+                    redo[index].removeAll { $0.language == language }
+                }
+            } catch {
+                // Its runs stay in `redo` and fall through to whisper below.
+                Log.warn("The \(language) transducer failed (\(error.localizedDescription)) — whisper decodes those stretches.")
+            }
+        }
+        loaded?.model.close()
+        loaded = nil
+        // …and whisper for the rest. From here a failure is whisper's, and
+        // fails the call like any other whisper failure does on the acoustic
+        // path: the caller falls back to that path, which throws and backlogs.
+        let callID = me.deletingLastPathComponent().lastPathComponent
+        for (index, track) in tracks.enumerated() where !redo[index].isEmpty {
+            do {
+                out[index] += try trace.timed("decode") {
+                    try decode(runs: redo[index], pcm: track.pcm, callID: callID, tag: track.tag,
+                               voiceFilter: track.tag == "me" ? meVoice : nil,
+                               transducers: false)
+                }
+            } catch {
+                Log.warn("Decoding the routed stretches failed (\(error.localizedDescription)) — using whisper for every language.")
+                return nil
+            }
+        }
+        return (out[0].sorted { $0.startMs < $1.startMs }, out[1].sorted { $0.startMs < $1.startMs })
+    }
+
+    /// One track on its way through the first decode.
+    private struct FirstPass {
+        let tag: String
+        let pcm: Data
+        let durationMs: Int
+        /// The track's loudness (echo-masked for Me), nil for a silent track.
+        var voice: WavLevel.Envelope? = nil
+        /// The pieces of speech to decode, and their total length.
+        var pieces: [(startMs: Int, endMs: Int)] = []
+        var heardMs = 0
+        /// Pieces the home model already decoded while sampling, by index.
+        var sampled: [Int: [TransducerText.Word]] = [:]
+        /// Those samples as text with their times — evidence for routing.
+        var samples: [Transcriber.Segment] = []
+        /// Who decodes the track first (or that nobody needs to).
+        var plan: TranscriptRouter.Plan
+        /// The first decode.
+        var segments: [Transcriber.Segment] = []
+    }
+
+    /// Speech spans → the pieces a transducer is handed.
+    private func chunks(_ spans: [(startMs: Int, endMs: Int)],
+                        voice: WavLevel.Envelope?) -> [(startMs: Int, endMs: Int)] {
+        let tune = ProcessInfo.processInfo.environment   // for scoring piece sizes against a reference
+        return TransducerText.chunks(
+            spans, voice: voice,
+            maxMs: tune["GHOSTIE_TD_MAXMS"].flatMap(Int.init) ?? TransducerText.chunkMaxMs,
+            joinGapMs: tune["GHOSTIE_TD_JOINGAP"].flatMap(Int.init) ?? TransducerText.chunkJoinGapMs)
+    }
+
+    /// Decode `chunks` of `pcm` into words on the track's clock. `cache`
+    /// holds pieces already decoded (the samples), by index.
+    private func transducerWords(_ chunks: [(startMs: Int, endMs: Int)], pcm: Data,
+                                 model: TransducerModel,
+                                 cache: [Int: [TransducerText.Word]],
+                                 language: String?) throws -> [TransducerText.Word] {
+        var all: [TransducerText.Word] = []
+        for (i, chunk) in chunks.enumerated() {
+            if let done = cache[i] { all += done; continue }
+            let lo = min(pcm.count, chunk.startMs * 32), hi = min(pcm.count, chunk.endMs * 32)
+            guard hi > lo else { continue }
+            let samples: [Float] = pcm.subdata(in: lo..<hi).withUnsafeBytes { raw in
+                raw.bindMemory(to: Int16.self).map { Float(Int16(littleEndian: $0)) / 32_768 }
+            }
+            all += TransducerText.words(try model.decode(samples: samples),
+                                        vocabulary: model.vocabulary, offsetMs: chunk.startMs)
+        }
+        return language.map { TransducerText.withoutHesitations(all, language: $0) } ?? all
+    }
+
+    /// Read a track, find its speech, and sample it with the home model to
+    /// decide which model decodes it first.
+    private func prepare(_ wav: URL, tag: String, home: String, model: TransducerModel,
+                         installed: Set<String>,
+                         voiceFilter: ((WavLevel.Envelope) -> WavLevel.Envelope)?,
+                         classify: (String) -> (language: String, confidence: Double)?)
+        throws -> FirstPass {
+        // A missing track (an imported recording has no me.wav) is silence.
+        guard FileManager.default.fileExists(atPath: wav.path) else {
+            return FirstPass(tag: tag, pcm: Data(), durationMs: 0, plan: .decode(home))
+        }
+        let pcm = try AudioStitcher.readPCM(wav)
+        var pass = FirstPass(tag: tag, pcm: pcm, durationMs: pcm.count / 32, plan: .decode(home))
+        var voice = WavLevel.envelope(pcm: pcm)
+        if let filter = voiceFilter, let v = voice { voice = filter(v) }
+        guard let voice, pass.durationMs > 0,
+              voice.peaks.contains(where: { $0 >= AudioStitcher.voiceThreshold }) else { return pass }
+        pass.voice = voice
+
+        let whole = LanguageRun(language: home, startMs: 0, endMs: pass.durationMs, segments: [])
+        pass.pieces = chunks(AudioStitcher.spans(for: whole, voice: cs.decodeSpeechOnly ? voice : nil),
+                             voice: voice)
+        pass.heardMs = pass.pieces.reduce(0) { $0 + ($1.endMs - $1.startMs) }
+
+        // Sample before committing: an all-English track through the Swedish
+        // model is two minutes spent on text that is all thrown away.
+        let whitelist = languages
+        guard whitelist.count > 1 else { return pass }
+        for i in TranscriptRouter.probeIndices(pass.pieces) {
+            // Unfiltered: these are cached as the home model's decode.
+            pass.sampled[i] = try transducerWords([pass.pieces[i]], pcm: pcm, model: model,
+                                                  cache: [:], language: nil)
+        }
+        pass.samples = pass.sampled.keys.sorted().map { i in
+            Transcriber.Segment(startMs: pass.pieces[i].startMs,
+                                text: pass.sampled[i]!.map(\.text).joined(separator: " "),
+                                endMs: pass.pieces[i].endMs)
+        }
+        pass.plan = TranscriptRouter.plan(pass.samples.map(\.text), home: home, languages: whitelist,
+                                          installed: installed, classify: classify)
+        return pass
+    }
+
     // MARK: Per-track decode
 
     private func decode(runs: [LanguageRun], pcm: Data,
                         callID: String, tag: String,
-                        voiceFilter: ((WavLevel.Envelope) -> WavLevel.Envelope)? = nil)
+                        voiceFilter: ((WavLevel.Envelope) -> WavLevel.Envelope)? = nil,
+                        transducers: Bool = true)
         throws -> [Transcriber.Segment] {
         guard !runs.isEmpty else { return [] }
         // The track's loudness over time, so each run is spliced down to the
@@ -309,6 +592,14 @@ struct CodeSwitchTranscriber {
         // Serial within a track keeps peak RAM at one model.
         for lang in active where byLang[lang] != nil {
             guard let langRuns = byLang[lang], !langRuns.isEmpty else { continue }
+            // A language with its own transducer model is decoded by it; the
+            // runs came from acoustic language ID, the decoder is the faster
+            // one. Any failure leaves the language to whisper, below.
+            if transducers, cs.transducerDecode,
+               let segs = transducerDecode(langRuns, language: lang, pcm: pcm, voice: voice, tag: tag) {
+                out += segs
+                continue
+            }
             let dest = scratch.appendingPathComponent("\(tag)-\(lang).wav")
             let stitched = try stitcher.stitch(pcm: pcm, runs: langRuns, to: dest,
                                                silencePadMs: cs.silencePadMs,
@@ -344,6 +635,32 @@ struct CodeSwitchTranscriber {
             }
         }
         return dedupeBoundaries(out.sorted { $0.startMs < $1.startMs })
+    }
+
+    /// `runs` of one language through its transducer model, or nil when
+    /// there is none, the runtime is missing, or it failed.
+    private func transducerDecode(_ runs: [LanguageRun], language: String, pcm: Data,
+                                  voice: WavLevel.Envelope?, tag: String) -> [Transcriber.Segment]? {
+        guard let directory = TransducerCatalog.installed()[language],
+              let runtime = ORTRuntime.shared else { return nil }
+        do {
+            let model = try trace.timed("load") {
+                try TransducerModel(directory: directory, runtime: runtime)
+            }
+            defer { model.close() }
+            // The envelope places the cuts even when the whole run is decoded.
+            let levels = voice ?? WavLevel.envelope(pcm: pcm)
+            let spans = runs.flatMap { AudioStitcher.spans(for: $0, voice: voice) }
+            Log.info("Decoding \(language) (\(tag)) with \((directory as NSString).lastPathComponent)…")
+            return try trace.timed("transducer") {
+                TransducerText.segments(try transducerWords(chunks(spans, voice: levels), pcm: pcm,
+                                                            model: model, cache: [:],
+                                                            language: language))
+            }
+        } catch {
+            Log.warn("The \(language) transducer failed (\(error.localizedDescription)) — whisper decodes \(language).")
+            return nil
+        }
     }
 
     /// Decode one stitched, single-language WAV with that language's model.
