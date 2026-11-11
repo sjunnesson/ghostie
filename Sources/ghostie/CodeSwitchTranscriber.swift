@@ -309,7 +309,11 @@ struct CodeSwitchTranscriber {
     /// installed for any of the call's languages, the ONNX Runtime is missing,
     /// or a model failed — and the caller runs the acoustic path unchanged.
     /// A transducer problem must never cost the call: whisper is still there.
-    private func transcribeDecodeFirst(
+    ///
+    /// Not private: `Pipeline` also calls it for a one-language install, where
+    /// there is nothing to route and it is simply the faster decoder — after
+    /// checking the audio really is in that language (see `confirms`).
+    func transcribeDecodeFirst(
         me: URL, participants: URL,
         meVoice: ((WavLevel.Envelope) -> WavLevel.Envelope)?
     ) -> (me: [Transcriber.Segment], participants: [Transcriber.Segment])? {
@@ -359,6 +363,17 @@ struct CodeSwitchTranscriber {
                              voiceFilter: meVoice, classify: classify),
                  try prepare(participants, tag: "participants", home: home, model: sampler,
                              installed: Set(models.keys), voiceFilter: nil, classify: classify)]
+            }
+            // One language set up, and not by name: make sure it is the
+            // one being spoken before trusting this model with the call.
+            if whitelist.count == 1, config.language.lowercased() != home {
+                let samples = tracks.flatMap { $0.samples.map(\.text) }
+                guard TranscriptRouter.confirms(samples, language: home, classify: {
+                    TranscriptRouter.language(of: $0, among: [])
+                }) else {
+                    Log.info("Could not confirm this call is in \(home) from \(samples.count) samples — whisper decodes it.")
+                    return nil
+                }
             }
             // …then decode, the home model's tracks first since it is loaded.
             for language in [home] + whitelist.filter({ $0 != home }) {
@@ -540,7 +555,6 @@ struct CodeSwitchTranscriber {
         // Sample before committing: an all-English track through the Swedish
         // model is two minutes spent on text that is all thrown away.
         let whitelist = languages
-        guard whitelist.count > 1 else { return pass }
         for i in TranscriptRouter.probeIndices(pass.pieces) {
             // Unfiltered: these are cached as the home model's decode.
             pass.sampled[i] = try transducerWords([pass.pieces[i]], pcm: pcm, model: model,
@@ -551,6 +565,7 @@ struct CodeSwitchTranscriber {
                                 text: pass.sampled[i]!.map(\.text).joined(separator: " "),
                                 endMs: pass.pieces[i].endMs)
         }
+        guard whitelist.count > 1 else { return pass }   // nothing to choose between
         pass.plan = TranscriptRouter.plan(pass.samples.map(\.text), home: home, languages: whitelist,
                                           installed: installed, classify: classify)
         return pass

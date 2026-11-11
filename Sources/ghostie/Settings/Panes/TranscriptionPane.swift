@@ -405,6 +405,12 @@ final class TranscriptionPane: NSView {
             control: StatusBadgeView(kind: vadOnDisk ? .ok : .muted,
                                      label: vadOnDisk ? "Active" : "Inactive")),
                        last: true)
+        quality.addRow(buildToggleRow(
+            label: "Faster transcription",
+            sub: Self.transducerStatus(cfg),
+            on: cfg.codeSwitch.transducerDecode) { [weak self] on in
+                self?.change { c in c.codeSwitch.transducerDecode = on }
+            })
         qualityContainer.addArrangedSubview(quality)
         quality.widthAnchor.constraint(equalTo: qualityContainer.widthAnchor).isActive = true
 
@@ -525,6 +531,34 @@ final class TranscriptionPane: NSView {
         for r in setup.rows where r.modelFilename == key {
             rows[r.code]?.setBusy(status: status)
         }
+    }
+
+    /// What the faster path is doing for this install, in a sentence.
+    private static func transducerStatus(_ cfg: Config) -> String {
+        let installed = Models.installed(preferredKBVariant: cfg.codeSwitch.kbWhisperVariant)
+        return transducerStatus(
+            languages: cfg.codeSwitch.effectiveLanguages(installed: installed),
+            installed: Set(TransducerCatalog.installed().keys),
+            available: Set(TransducerCatalog.known.map(\.language)),
+            runtime: ORTRuntime.shared != nil)
+    }
+
+    /// Pure, for the selftest.
+    static func transducerStatus(languages: [String], installed: Set<String>,
+                                 available: Set<String>, runtime: Bool) -> String {
+        func names(_ codes: [String]) -> String {
+            ListFormatter.localizedString(byJoining: codes.map(WhisperLanguages.displayName))
+        }
+        let lead = "Transcribes a call in a fraction of the time, with a second speech model per language (about 650 MB each, fetched in the background)."
+        guard runtime else { return lead + " Not available in this build." }
+        let ready = languages.filter(installed.contains)
+        let coming = languages.filter { !installed.contains($0) && available.contains($0) }
+        let never = languages.filter { !installed.contains($0) && !available.contains($0) }
+        var parts: [String] = []
+        if !ready.isEmpty { parts.append("Ready for \(names(ready)).") }
+        if !coming.isEmpty { parts.append("Downloading for \(names(coming)).") }
+        if !never.isEmpty { parts.append("\(names(never)) \(never.count == 1 ? "stays" : "stay") on Whisper — no faster model exists yet.") }
+        return ([lead] + parts).joined(separator: " ")
     }
 
     private func buildToggleRow(label: String, sub: String, on: Bool,

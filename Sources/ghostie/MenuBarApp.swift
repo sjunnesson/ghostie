@@ -26,6 +26,8 @@ final class MenuBarApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var notificationsAllowed = true
     private var tick: Timer?
     private var settings: SettingsWindow?
+    /// The background fetch of transducer models, while one is running.
+    private var transducerFetch: ModelDownloader?
     private let updater = Updater()
     private var updateTimer: DispatchSourceTimer?
     private var availableRelease: ReleaseInfo?
@@ -95,6 +97,14 @@ final class MenuBarApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // required model is already on disk.
         DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
             self?.openSettingsIfModelsMissing()
+        }
+
+        // The faster speech models for the languages in use, fetched quietly:
+        // nothing is required of the user and nothing changes until a model
+        // is whole on disk. Well after launch, so it never competes with the
+        // first-run download above for attention.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 45) { [weak self] in
+            self?.fetchTransducerModelsIfWanted()
         }
 
         // OTA: a delayed launch check + a daily timer (only on builds we can
@@ -471,9 +481,46 @@ final class MenuBarApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self.render(self.engine.state)
             self.refreshLastNote()
             self.notify("Ghostie", "Settings saved.")
+            // A language just added may have a faster model to fetch.
+            self.fetchTransducerModelsIfWanted()
         }
         settings = s
         return s
+    }
+
+    /// Download the transducer models this install should have, one language
+    /// after another, in the background. A model counts as installed only
+    /// once all its files are verified in place, so a call that ends halfway
+    /// through simply uses whisper as before.
+    private func fetchTransducerModelsIfWanted() {
+        guard transducerFetch == nil else { return }
+        let wanted = TransducerAutoFetch.wanted(config: Config.load())
+        guard let entry = wanted.first else { return }
+        let downloader = ModelDownloader()
+        transducerFetch = downloader
+        Log.info("Fetching \(entry.label) in the background for faster transcription.")
+        var lastLogged = Date.distantPast
+        downloader.start(models: TransducerCatalog.models(for: entry), status: { line in
+            // One line a minute is a record; one per chunk is noise.
+            if !line.hasPrefix("Downloading") || Date().timeIntervalSince(lastLogged) > 60 {
+                lastLogged = Date()
+                Log.info(line)
+            }
+        }, finish: { [weak self] error in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.transducerFetch = nil
+                if let error {
+                    // Not worth an alert: whisper is doing the job meanwhile,
+                    // and the next launch tries again from the partial file.
+                    Log.warn("Could not fetch \(entry.label): \(error.localizedDescription)")
+                    return
+                }
+                Log.ok("\(entry.label) installed — \(WhisperLanguages.displayName(entry.language)) calls now use it.")
+                self.notify("Ghostie", "Faster transcription is ready for \(WhisperLanguages.displayName(entry.language)).")
+                self.fetchTransducerModelsIfWanted()   // the next language, if any
+            }
+        })
     }
 
     private func openSettingsIfModelsMissing() {

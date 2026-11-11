@@ -551,7 +551,33 @@ the same code drives the menu-bar app and the headless daemon.
   lines as "decoded from silence". `span` maps the segment onto the one
   splice it overlaps most, clipped to it, so a span is always audio whisper
   heard. Selftest pins it (`span:` checks).
-- **Transducer decode (`codeSwitch.transducerDecode`, default off)** — a
+- **Transducer decode (`codeSwitch.transducerDecode`, default ON since
+  v1.14.0)** — on means "use a transducer model where one is installed", so
+  an install with none behaves exactly as before. `TransducerAutoFetch`
+  (driven from `MenuBarApp`, 45 s after launch and after every settings
+  save) downloads the `known` models for the languages in use, one language
+  at a time, in the background — no Settings window, a notification when a
+  language is ready. It fetches nothing when the key is off, when the ONNX
+  Runtime cannot load (650 MB this Mac could never run), for a language
+  reached only by naming convention, or when it would leave under 5 GB free.
+  A model is installed only when all four files are verified in place, so a
+  call that ends mid-download uses whisper. Settings ▸ Transcription ▸
+  "Faster transcription" is the same key, with a line saying what is ready,
+  downloading, or has no model (`TranscriptionPane.transducerStatus`, pure).
+  The headless daemon does not auto-fetch — `fetch-models --transducer`.
+  **A one-language install uses it too** (`Pipeline` calls
+  `transcribeDecodeFirst` before falling back to `Transcriber`), behind one
+  extra check: unless `config.language` names that language outright, ten
+  samples must all read as it to an *unconstrained* recognizer
+  (`TranscriptRouter.confirms`). "English" is often just what the installed
+  whisper model is filed under while `language` is `auto`; whisper would
+  follow a German speaker and Parakeet would not. On the Swedish call run as
+  an English-only install it declined in 6 s and whisper decoded as before;
+  on the 34-min English reference call the whole pipeline took 52 s and
+  scored 89.3 / 91.7 against the shipped note's 83.8 / 86.4.
+  `GHOSTIE_LANGUAGES=en` (scratch runs) sets the configured languages so
+  that path can be exercised on a Mac that has several.
+  What follows is how it works — a
   second decoder beside whisper.cpp, and a different order of work: decode
   first, then read the language off the text. `TransducerDecoder.swift` runs a
   NeMo FastConformer-TDT export (Klang Pianissimo — Swedish and Danish —
@@ -682,13 +708,13 @@ the same code drives the menu-bar app and the headless daemon.
   pause, never over 12 s — the diarizer embeds a segment's span as one voice
   and `TranscriptCleaner.isStretchedOverQuiet` reads a ≥15 s span as
   suspicious, both calibrated on whisper.
-  **Still open:** accuracy is unscored — the numbers above are speed and
-  agreement with KB-Whisper (81–90% of words), not correctness, which is why
-  the default is off; names and product terms are the visible weakness
+  **Still open:** Swedish and Danish accuracy is unscored — the numbers above
+  are speed and agreement with KB-Whisper (81–90% of words), not correctness
+  (the reference sheets to settle it are in `~/.ghostie/reference/`), and it
+  shipped on by default before any real call had run on it; names and product terms are the visible weakness
   ("Claude" → "klåd", "glad"), and the model's phrase boosting, which needs a
   SentencePiece encoder, is not ported, so `LanguageSetting.prompt` does
-  nothing on this path; the single-language `Transcriber` path does not use
-  it (one installed language still means whisper); and it is CPU-only (the MLX build is ~3× faster on the GPU).
+  nothing on this path; and it is CPU-only (the MLX build is ~3× faster on the GPU).
   `ghostie transcribe-probe <session> --out <dir> [--routing-only]
   [--set codeSwitch.<key>=<json>]` (hidden) runs the transcription stage
   alone and writes detections, runs, segments and per-stage seconds, without

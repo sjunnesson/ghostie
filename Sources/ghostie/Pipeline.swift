@@ -633,6 +633,12 @@ struct Pipeline {
                 meVoice: gate.map { g in { EchoGate.masking($0, with: g) } })
             me = cleaned(meSegs, "Me", wav: mic, audio: cleanerLevels(heardLevels))
             part = cleaned(partSegs, "Participants", wav: sys, audio: cleanerLevels(sysLevels))
+        } else if let fast = CodeSwitchTranscriber(config: config, installed: installed)
+                    .transcribeDecodeFirst(me: heard, participants: sys, meVoice: nil) {
+            // One language, and a transducer model installed for it.
+            me = haveMic ? cleaned(fast.me, "Me", wav: mic, audio: cleanerLevels(heardLevels)) : []
+            part = haveSys ? cleaned(fast.participants, "Participants", wav: sys,
+                                     audio: cleanerLevels(sysLevels)) : []
         } else {
             let transcriber = Transcriber(config: config)
             me = haveMic

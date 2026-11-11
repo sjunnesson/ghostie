@@ -456,6 +456,14 @@ struct Config: Codable {
         if let c = env["GHOSTIE_CLAUDE_BINARY"], !c.isEmpty { cfg.claudeBinary = c }
         // Scratch runs only: try the transducer path on a kept recording
         // without flipping it on for the app that is recording real calls.
+        // Scratch runs only: pretend this install is set up for these
+        // languages ("en" alone is how the one-language path gets exercised
+        // on a Mac that has several).
+        if let l = env["GHOSTIE_LANGUAGES"], !l.isEmpty {
+            cfg.codeSwitch.languages = l.split(separator: ",").map {
+                LanguageSetting(code: String($0).trimmingCharacters(in: .whitespaces))
+            }
+        }
         if let t = env["GHOSTIE_TRANSDUCER_DECODE"], !t.isEmpty {
             cfg.codeSwitch.transducerDecode = (t == "1" || t == "true")
         }
@@ -766,12 +774,16 @@ struct CodeSwitchConfig: Codable {
     /// `TranscriptRouter.lookalikeGroups`) keep the acoustic language pass
     /// and use the transducers only as the faster decoders.
     ///
-    /// Off by default. English is scored (at or above whisper large-v3 on
-    /// three reference calls, by `scripts/score-transcript.py`); Swedish is
-    /// not yet — its speed is measured, its accuracy so far is only
-    /// agreement with KB-Whisper — and no real call has run on this path. Without an installed model this does
-    /// nothing either way.
-    var transducerDecode: Bool = false
+    /// On by default since v1.14.0, and it means "use a transducer model
+    /// where one is installed": without a model for any of the call's
+    /// languages nothing changes, and the app fetches the models for the
+    /// languages in use in the background (`TransducerAutoFetch`). Turning it
+    /// off stops both and restores whisper for everything. English is scored
+    /// (at or above whisper large-v3 on three reference calls, by
+    /// `scripts/score-transcript.py`); Swedish and Danish are not — their
+    /// speed is measured, their accuracy so far is agreement with KB-Whisper
+    /// and a read of the output.
+    var transducerDecode: Bool = true
 
     // MARK: Legacy per-language maps (decoded, never encoded)
     //

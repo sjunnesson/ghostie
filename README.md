@@ -45,6 +45,15 @@ meeting** — automatically transcribes each call and writes a markdown summary
    people share it, and then given real **names** read off the conversation.
    See [Speaker labels](#speaker-labels).
 
+   Since v1.14, Swedish, Danish and English calls are first decoded by a
+   second, much faster speech model — [Klang Pianissimo](https://huggingface.co/KlangAI)
+   for Swedish and Danish, [NVIDIA Parakeet](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3)
+   for English — which Ghostie downloads in the background (about 650 MB per
+   language). A half-hour call transcribes in about a minute instead of many.
+   Whisper still handles every other language, and everything until a model
+   has arrived. Switch it off under Settings ▸ Transcription ▸ *Faster
+   transcription*.
+
 4. **Summarize.** The transcript is turned into a structured markdown note —
    Context, Participants, Discussion, Decisions, Action Items, Open Questions,
    Summary — by your chosen summarizer: the **Claude Code CLI** (`claude -p`,

@@ -150,3 +150,47 @@ enum TransducerCatalog {
         return languages.first { installed[$0] != nil }
     }
 }
+
+/// Which transducer models an install should have and does not — what the app
+/// fetches in the background so the faster path arrives without anyone
+/// opening Settings.
+enum TransducerAutoFetch {
+
+    /// Room to leave on the disk beyond the download itself.
+    static let headroomBytes: Int64 = 5_000_000_000
+
+    /// The known models to fetch for `languages`, in that order.
+    ///
+    /// Nothing when the feature is off, and nothing when the ONNX Runtime
+    /// cannot load — 650 MB that this Mac could never run is not a favour.
+    /// Only `known` models: a language reached by naming convention alone is
+    /// fetched when somebody asks for it by name, never on a guess. A model
+    /// that would leave the disk under `headroomBytes` waits.
+    static func wanted(enabled: Bool, runtimeAvailable: Bool, languages: [String],
+                       installed: [String: String], freeBytes: Int64?) -> [TransducerCatalog.Entry] {
+        guard enabled, runtimeAvailable else { return [] }
+        var free = freeBytes
+        var out: [TransducerCatalog.Entry] = []
+        for language in languages where installed[language] == nil {
+            guard let entry = TransducerCatalog.known.first(where: { $0.language == language }) else { continue }
+            let size = entry.sizes.values.reduce(0, +)
+            if let available = free {
+                guard available - size >= headroomBytes else { continue }
+                free = available - size
+            }
+            out.append(entry)
+        }
+        return out
+    }
+
+    /// `wanted` for this Mac as it is now.
+    static func wanted(config: Config) -> [TransducerCatalog.Entry] {
+        let installedModels = Models.installed(preferredKBVariant: config.codeSwitch.kbWhisperVariant)
+        let attrs = try? FileManager.default.attributesOfFileSystem(forPath: NSHomeDirectory())
+        return wanted(enabled: config.codeSwitch.transducerDecode,
+                      runtimeAvailable: ORTRuntime.shared != nil,
+                      languages: config.codeSwitch.effectiveLanguages(installed: installedModels),
+                      installed: TransducerCatalog.installed(),
+                      freeBytes: (attrs?[.systemFreeSize] as? NSNumber)?.int64Value)
+    }
+}

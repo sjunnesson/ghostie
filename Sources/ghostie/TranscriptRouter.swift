@@ -196,6 +196,23 @@ enum TranscriptRouter {
         return (0..<count).map { eligible[(2 * $0 + 1) * eligible.count / (2 * count)] }
     }
 
+    /// Whether a track's samples, written by `language`'s model, are really
+    /// in that language — asked of the recognizer with no shortlist.
+    ///
+    /// For the one-language install, where nothing else checks: "English" is
+    /// often just what the installed whisper model is filed under, the
+    /// language setting is "auto", and the person may be speaking German.
+    /// Whisper would have followed them; a transducer writes what it can and
+    /// the result reads as something else, or as nothing. Every sample that
+    /// says anything must say `language`, and enough of them must speak.
+    static func confirms(_ samples: [String], language: String,
+                         classify: (String) -> (language: String, confidence: Double)?) -> Bool {
+        let read = samples.filter { wordCount($0) >= decidedWords }.compactMap(classify)
+            .filter { $0.confidence >= minConfidence }
+        return read.count >= probeMinDecided
+            && read.allSatisfy { recognizerCode($0.language) == recognizerCode(language) }
+    }
+
     /// What to do with a track, decided from its samples.
     enum Plan: Equatable {
         /// Decode the whole track with this language's model, then route.

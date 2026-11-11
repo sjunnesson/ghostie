@@ -265,15 +265,60 @@ func runTransducerSelfTest() -> Bool {
               && TranscriptRouter.lookalikes(in: ["da", "en", "de", "fi"]) == nil)
 
     // MARK: Config
-    check("the transducer path is off unless asked for", CodeSwitchConfig().transducerDecode == false)
+    check("the transducer path is on by default", CodeSwitchConfig().transducerDecode == true)
     let old = try? JSONDecoder().decode(CodeSwitchConfig.self, from: Data(#"{"minSwitchMs":3000}"#.utf8))
-    check("a config written before the key existed still decodes, with it off",
-          old?.minSwitchMs == 3_000 && old?.transducerDecode == false)
+    check("a config written before the key existed decodes, and gets the new default",
+          old?.minSwitchMs == 3_000 && old?.transducerDecode == true)
+    let off = try? JSONDecoder().decode(CodeSwitchConfig.self, from: Data(#"{"transducerDecode":false}"#.utf8))
+    check("turning it off sticks", off?.transducerDecode == false)
     let on = try? JSONDecoder().decode(CodeSwitchConfig.self, from: Data(#"{"transducerDecode":true}"#.utf8))
     check("the key round-trips",
           on?.transducerDecode == true
               && (try? JSONEncoder().encode(on)).flatMap { String(data: $0, encoding: .utf8) }?
                   .contains("\"transducerDecode\":true") == true)
+
+    // MARK: Background fetch
+    func wanted(enabled: Bool = true, runtime: Bool = true, _ languages: [String],
+                installed: [String: String] = [:], free: Int64? = 100_000_000_000) -> [String] {
+        TransducerAutoFetch.wanted(enabled: enabled, runtimeAvailable: runtime, languages: languages,
+                                   installed: installed, freeBytes: free).map(\.language)
+    }
+    check("the models for the languages in use are fetched", wanted(["en", "sv"]) == ["en", "sv"])
+    check("a model already on disk is not fetched again", wanted(["en", "sv"], installed: ["sv": "/x"]) == ["en"])
+    check("a language with no known model fetches nothing", wanted(["de", "fi", "no"]) == [])
+    check("nothing is fetched with the feature off", wanted(enabled: false, ["en"]) == [])
+    check("nothing is fetched for a runtime that cannot load it", wanted(runtime: false, ["en"]) == [])
+    check("a nearly full disk is left alone", wanted(["en"], free: 5_300_000_000) == [])
+    check("…and room for one model is not spent on two",
+          wanted(["en", "sv"], free: 6_000_000_000) == ["en"])
+    check("an unknown amount of free space does not block the fetch", wanted(["en"], free: nil) == ["en"])
+
+    // MARK: One-language installs
+    func said(_ lang: String) -> (String) -> (language: String, confidence: Double)? { { _ in (lang, 0.99) } }
+    let talk = Array(repeating: "the thing about the product is clear", count: 8)
+    check("samples that all read as the model's language confirm it",
+          TranscriptRouter.confirms(talk, language: "en", classify: said("en")))
+    check("samples that read as another language do not",
+          !TranscriptRouter.confirms(talk, language: "en", classify: said("de")))
+    check("too little speech confirms nothing",
+          !TranscriptRouter.confirms(Array(talk.prefix(3)) + ["Yeah.", "Okay."], language: "en", classify: said("en")))
+    check("one sample in another language is enough to decline",
+          !TranscriptRouter.confirms(talk + ["ich glaube nicht dass das heute geht"], language: "en",
+                                     classify: { ($0.hasPrefix("ich") ? "de" : "en", 0.99) }))
+    check("the recognizer, unprompted, knows English from German",
+          TranscriptRouter.language(of: "I do not think we can ship this before the end of the week", among: [])?.language == "en"
+              && TranscriptRouter.language(of: "Ich glaube nicht, dass wir das vor Ende der Woche schaffen", among: [])?.language == "de")
+
+    // MARK: Settings line
+    let line = TranscriptionPane.transducerStatus(languages: ["en", "sv", "de"], installed: ["en"],
+                                                  available: ["en", "sv", "da"], runtime: true)
+    check("Settings says what is ready, what is coming and what has no model",
+          line.contains("Ready for \(WhisperLanguages.displayName("en"))")
+              && line.contains("Downloading for \(WhisperLanguages.displayName("sv"))")
+              && line.contains("\(WhisperLanguages.displayName("de")) stays on Whisper"), line)
+    check("…and when the build cannot run it at all",
+          TranscriptionPane.transducerStatus(languages: ["en"], installed: [], available: ["en"],
+                                             runtime: false).contains("Not available in this build"))
 
     // MARK: Download verification
     check("a git-stored file is verified by its git blob id",
